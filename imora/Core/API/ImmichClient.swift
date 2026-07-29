@@ -108,6 +108,69 @@ nonisolated final class ImmichClient: Sendable {
         _ = try? await send(path: "auth/logout", method: "POST") as Data
     }
 
+    // MARK: - oauth
+
+    /// unauthenticated fetch used by the login screen to pick the sign-in method.
+    static func publicFeatures(apiURL: URL) async throws -> ServerFeatures {
+        try await publicGet(apiURL.appending(path: "server/features"))
+    }
+
+    static func publicConfig(apiURL: URL) async throws -> ServerConfig {
+        try await publicGet(apiURL.appending(path: "server/config"))
+    }
+
+    static func oauthAuthorize(apiURL: URL, redirectUri: String, state: String, codeChallenge: String) async throws -> URL {
+        var request = URLRequest(url: apiURL.appending(path: "oauth/authorize"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode([
+            "redirectUri": redirectUri,
+            "state": state,
+            "codeChallenge": codeChallenge,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ImmichError.http(http.statusCode, serverMessage(from: data))
+        }
+        let parsed = try JSONDecoder().decode(OAuthAuthorizeResponse.self, from: data)
+        guard let url = URL(string: parsed.url) else { throw ImmichError.decoding("bad authorize url") }
+        return url
+    }
+
+    static func oauthCallback(apiURL: URL, callbackURL: String, state: String, codeVerifier: String) async throws -> LoginResponse {
+        var request = URLRequest(url: apiURL.appending(path: "oauth/callback"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("iOS", forHTTPHeaderField: "deviceType")
+        request.setValue(deviceModel(), forHTTPHeaderField: "deviceModel")
+        request.httpBody = try JSONEncoder().encode([
+            "url": callbackURL,
+            "state": state,
+            "codeVerifier": codeVerifier,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ImmichError.http(http.statusCode, serverMessage(from: data))
+        }
+        return try JSONDecoder().decode(LoginResponse.self, from: data)
+    }
+
+    private static func publicGet<T: Decodable>(_ url: URL) async throws -> T {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw ImmichError.unreachable
+        }
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw ImmichError.decoding("\(error)")
+        }
+    }
+
     private static func deviceModel() -> String {
         var systemInfo = utsname()
         uname(&systemInfo)

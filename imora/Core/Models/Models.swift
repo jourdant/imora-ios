@@ -104,6 +104,16 @@ nonisolated struct ServerFeatures: Codable {
     let passwordLogin: Bool
 }
 
+nonisolated struct ServerConfig: Codable {
+    let oauthButtonText: String?
+    let loginPageMessage: String?
+    let externalDomain: String?
+}
+
+nonisolated struct OAuthAuthorizeResponse: Codable {
+    let url: String
+}
+
 nonisolated struct ServerStorage: Codable {
     let diskAvailable: String
     let diskSize: String

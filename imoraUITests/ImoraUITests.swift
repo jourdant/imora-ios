@@ -117,6 +117,42 @@ final class ImoraUITests: XCTestCase {
     }
 
     @MainActor
+    func testOAuthLoginReachesIdentityProvider() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["IMORA_SERVER"] = "https://photos.vexcited.com"
+        app.launch()
+
+        let oauthButton = app.buttons["Login with Pocket ID"]
+        XCTAssertTrue(oauthButton.waitForExistence(timeout: 20), "oauth button did not appear")
+        sleep(3)
+        snap("oauth-step")
+
+        if !app.webViews.firstMatch.exists {
+            oauthButton.tap()
+        }
+
+        // the system consent dialog may come from the app or springboard.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for container in [app, springboard] {
+            let continueButton = container.alerts.buttons["Continue"].firstMatch
+            if continueButton.waitForExistence(timeout: 6) {
+                snap("oauth-consent")
+                continueButton.tap()
+                break
+            }
+        }
+
+        let web = app.webViews.firstMatch
+        if web.waitForExistence(timeout: 25) {
+            sleep(4)
+            snap("oauth-idp")
+        } else {
+            sleep(4)
+            snap("oauth-after-continue")
+        }
+    }
+
+    @MainActor
     private func snap(_ name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name

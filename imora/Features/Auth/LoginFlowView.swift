@@ -14,6 +14,9 @@ struct LoginFlowView: View {
     @State private var password = ""
     @State private var isBusy = false
     @State private var errorMessage: String?
+    @State private var features: ServerFeatures?
+    @State private var config: ServerConfig?
+    @State private var oauthAutoLaunched = false
     @Namespace private var glass
 
     var body: some View {
@@ -75,18 +78,18 @@ struct LoginFlowView: View {
     }
 
     /// lets ui tests and simulator runs log in from environment variables.
+    /// with only a server set, it resolves and stops on the credentials step.
     private func debugAutoLogin() async {
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
-        guard let server = env["IMORA_SERVER"],
-              let mail = env["IMORA_EMAIL"],
-              let pass = env["IMORA_PASSWORD"]
-        else { return }
+        guard let server = env["IMORA_SERVER"] else { return }
         serverInput = server
         await resolveServer()
-        email = mail
-        password = pass
-        await logIn()
+        if let mail = env["IMORA_EMAIL"], let pass = env["IMORA_PASSWORD"] {
+            email = mail
+            password = pass
+            await logIn()
+        }
         #endif
     }
 
@@ -119,32 +122,59 @@ struct LoginFlowView: View {
 
     // MARK: - step 2, credentials
 
+    private var passwordLoginAvailable: Bool { features?.passwordLogin ?? true }
+    private var oauthAvailable: Bool { features?.oauth ?? false }
+
     @ViewBuilder private var credentialsForm: some View {
-        GlassField(systemImage: "envelope", isSecure: false, placeholder: "Email", text: $email)
-            .keyboardType(.emailAddress)
-            .textContentType(.username)
-            .textInputAutocapitalization(.never)
-            .glassEffectID("field-1", in: glass)
+        if passwordLoginAvailable {
+            GlassField(systemImage: "envelope", isSecure: false, placeholder: "Email", text: $email)
+                .keyboardType(.emailAddress)
+                .textContentType(.username)
+                .textInputAutocapitalization(.never)
+                .glassEffectID("field-1", in: glass)
 
-        GlassField(systemImage: "lock", isSecure: true, placeholder: "Password", text: $password)
-            .textContentType(.password)
-            .onSubmit { Task { await logIn() } }
-            .glassEffectID("field-2", in: glass)
+            GlassField(systemImage: "lock", isSecure: true, placeholder: "Password", text: $password)
+                .textContentType(.password)
+                .onSubmit { Task { await logIn() } }
+                .glassEffectID("field-2", in: glass)
 
-        Button {
-            Task { await logIn() }
-        } label: {
-            busyLabel("Sign In")
+            Button {
+                Task { await logIn() }
+            } label: {
+                busyLabel("Sign In")
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.indigo)
+            .disabled(email.isEmpty || password.isEmpty || isBusy)
+            .glassEffectID("cta", in: glass)
         }
-        .buttonStyle(.glassProminent)
-        .tint(.indigo)
-        .disabled(email.isEmpty || password.isEmpty || isBusy)
-        .glassEffectID("cta", in: glass)
+
+        if oauthAvailable {
+            if passwordLoginAvailable {
+                Text("or")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+
+            if passwordLoginAvailable {
+                oauthButtonLabel
+                    .buttonStyle(.glass)
+                    .disabled(isBusy)
+                    .glassEffectID("oauth", in: glass)
+            } else {
+                oauthButtonLabel
+                    .buttonStyle(.glassProminent)
+                    .tint(.indigo)
+                    .disabled(isBusy)
+                    .glassEffectID("cta", in: glass)
+            }
+        }
 
         Button {
             withAnimation(.smooth) {
                 step = .server
                 errorMessage = nil
+                oauthAutoLaunched = false
             }
         } label: {
             Label("Different server", systemImage: "chevron.backward")
@@ -153,6 +183,24 @@ struct LoginFlowView: View {
                 .padding(.vertical, 6)
         }
         .buttonStyle(.plain)
+    }
+
+    private var oauthButtonLabel: some View {
+        Button {
+            Task { await startOAuth() }
+        } label: {
+            HStack(spacing: 8) {
+                if isBusy && !passwordLoginAvailable {
+                    ProgressView().tint(.white)
+                } else {
+                    Image(systemName: "person.badge.key.fill")
+                }
+                Text(config?.oauthButtonText?.isEmpty == false ? config!.oauthButtonText! : "Continue with OAuth")
+                    .font(.headline)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+        }
     }
 
     private func busyLabel(_ title: String) -> some View {
@@ -176,7 +224,38 @@ struct LoginFlowView: View {
         defer { isBusy = false }
         do {
             let apiURL = try await ImmichClient.resolveAPIURL(from: serverInput)
+            async let featuresTask = try? ImmichClient.publicFeatures(apiURL: apiURL)
+            async let configTask = try? ImmichClient.publicConfig(apiURL: apiURL)
+            features = await featuresTask
+            config = await configTask
+            oauthAutoLaunched = false
             withAnimation(.smooth) { step = .credentials(apiURL) }
+            await autoLaunchOAuthIfNeeded()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func autoLaunchOAuthIfNeeded() async {
+        guard oauthAvailable,
+              features?.oauthAutoLaunch == true,
+              !passwordLoginAvailable,
+              !oauthAutoLaunched
+        else { return }
+        oauthAutoLaunched = true
+        // let the step transition settle before the sheet slides in.
+        try? await Task.sleep(for: .milliseconds(450))
+        await startOAuth()
+    }
+
+    private func startOAuth() async {
+        guard case .credentials(let apiURL) = step, !isBusy else { return }
+        isBusy = true
+        errorMessage = nil
+        defer { isBusy = false }
+        do {
+            guard let response = try await OAuthService.shared.logIn(apiURL: apiURL) else { return }
+            await session.logIn(apiURL: apiURL, response: response)
         } catch {
             errorMessage = error.localizedDescription
         }
