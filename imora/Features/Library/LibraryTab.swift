@@ -55,7 +55,7 @@ struct LibraryTab: View {
                 case .favorites:
                     TimelineScreen(
                         title: "Favorites",
-                        filter: TimelineFilter(withPartners: true, isFavorite: true),
+                        filter: TimelineFilter(isFavorite: true),
                         emptyIcon: "heart",
                         emptyMessage: "No favorites yet",
                         showsLargeTitle: false

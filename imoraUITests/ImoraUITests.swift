@@ -26,9 +26,14 @@ final class ImoraUITests: XCTestCase {
         sleep(2)
         snap("timeline-scrolled")
 
+        // back to the top so the tab bar expands and the first tile is hittable.
+        app.swipeDown(velocity: .fast)
+        app.swipeDown(velocity: .fast)
+        sleep(2)
+
         // open the viewer.
         let tile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
-        if tile.exists {
+        if tile.exists && tile.isHittable {
             tile.tap()
             sleep(3)
             snap("viewer")
@@ -94,8 +99,14 @@ final class ImoraUITests: XCTestCase {
             snap("search-results")
         }
 
-        // settings sheet from photos tab.
-        app.tabBars.buttons["Photos"].tap()
+        // settings sheet from photos tab. a collapsed tab bar shows a single
+        // pill, so tap it first to expand before choosing the tab.
+        let photosTab = app.tabBars.buttons["Photos"]
+        if !photosTab.exists {
+            app.tabBars.buttons.firstMatch.tap()
+            sleep(1)
+        }
+        photosTab.tap()
         sleep(1)
         let avatar = app.navigationBars["Photos"].buttons.firstMatch
         if avatar.exists {

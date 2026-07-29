@@ -127,21 +127,23 @@ struct AlbumCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                if let thumbID = album.albumThumbnailAssetId, let client = session.client {
-                    RemoteImage(url: client.thumbnailURL(assetID: thumbID), targetPixelSize: 640)
-                } else {
-                    Rectangle()
-                        .fill(Color(.secondarySystemFill))
-                        .overlay {
-                            Image(systemName: "photo.on.rectangle")
-                                .font(.title)
-                                .foregroundStyle(.tertiary)
-                        }
+            // clear square keeps the fill image bounded to the grid cell.
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    if let thumbID = album.albumThumbnailAssetId, let client = session.client {
+                        RemoteImage(url: client.thumbnailURL(assetID: thumbID), targetPixelSize: 640)
+                    } else {
+                        Rectangle()
+                            .fill(Color(.secondarySystemFill))
+                            .overlay {
+                                Image(systemName: "photo.on.rectangle")
+                                    .font(.title)
+                                    .foregroundStyle(.tertiary)
+                            }
+                    }
                 }
-            }
-            .aspectRatio(1, contentMode: .fit)
-            .clipShape(.rect(cornerRadius: 14))
+                .clipShape(.rect(cornerRadius: 14))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(album.albumName)

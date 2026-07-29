@@ -108,12 +108,12 @@ struct AssetViewerScreen: View {
 
             Spacer()
 
-            GlassEffectContainer(spacing: 10) {
-                HStack(spacing: 6) {
+            GlassEffectContainer(spacing: 14) {
+                HStack(spacing: 14) {
                     chromeButton(current?.isFavorite == true ? "heart.fill" : "heart") {
                         Task { await toggleFavorite() }
                     }
-                    .foregroundStyle(current?.isFavorite == true ? .red : .primary)
+                    .tint(current?.isFavorite == true ? .red : nil)
 
                     chromeButton("info.circle") { showInfo = true }
                         .accessibilityIdentifier("viewer-info")
@@ -121,19 +121,17 @@ struct AssetViewerScreen: View {
                     if let current, let client = session.client {
                         ShareLink(item: SharedAssetFile(client: client, asset: current), preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))) {
                             Image(systemName: "square.and.arrow.up")
-                                .font(.body)
-                                .frame(width: 52, height: 44)
+                                .font(.body.weight(.medium))
+                                .frame(width: 44, height: 44)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.glass)
                     }
 
                     chromeButton("trash") {
                         Task { await trash() }
                     }
-                    .foregroundStyle(.red)
+                    .tint(.red)
                 }
-                .padding(.horizontal, 10)
-                .glassEffect(.regular, in: .capsule)
             }
             .padding(.bottom, 12)
         }
@@ -144,10 +142,10 @@ struct AssetViewerScreen: View {
     private func chromeButton(_ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.body)
-                .frame(width: 52, height: 44)
+                .font(.body.weight(.medium))
+                .frame(width: 44, height: 44)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.glass)
     }
 
     // MARK: - gestures
