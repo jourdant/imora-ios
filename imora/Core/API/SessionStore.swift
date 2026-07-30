@@ -14,6 +14,7 @@ final class SessionStore {
     private(set) var client: ImmichClient?
     private(set) var user: CurrentUser?
     private(set) var features: ServerFeatures?
+    private(set) var backup: BackupManager?
     var preferences: UserPreferences?
 
     private static let serverKey = "imora.serverURL"
@@ -25,6 +26,18 @@ final class SessionStore {
 
     func restore() async {
         guard state == .restoring else { return }
+        #if DEBUG
+        // ui test runs pin the server via env; a persisted session from a
+        // different server must not win over it.
+        if let envServer = ProcessInfo.processInfo.environment["IMORA_SERVER"],
+           let envHost = URL(string: envServer)?.host(),
+           let stored = serverURL, stored.host() != envHost {
+            UserDefaults.standard.removeObject(forKey: Self.serverKey)
+            KeychainStore.delete(Self.tokenKey)
+            state = .loggedOut
+            return
+        }
+        #endif
         guard let apiURL = serverURL, let token = KeychainStore.get(Self.tokenKey) else {
             state = .loggedOut
             return
@@ -55,6 +68,8 @@ final class SessionStore {
             await client.logout()
         }
         KeychainStore.delete(Self.tokenKey)
+        backup?.shutdown()
+        backup = nil
         client = nil
         user = nil
         features = nil
@@ -66,7 +81,10 @@ final class SessionStore {
         async let userTask = try? client.currentUser()
         async let featuresTask = try? client.serverFeatures()
         async let preferencesTask = try? client.preferences()
-        if let user = await userTask { self.user = user }
+        if let user = await userTask {
+            self.user = user
+            backup?.userId = user.id
+        }
         if let features = await featuresTask { self.features = features }
         if let preferences = await preferencesTask { self.preferences = preferences }
     }
@@ -75,7 +93,11 @@ final class SessionStore {
         self.client = client
         self.user = user
         ImageLoader.shared.configure(headers: client.authHeaders)
+        let backup = BackupManager(client: client)
+        backup.userId = user?.id
+        self.backup = backup
         state = .loggedIn
         Task { await refreshUser() }
+        backup.startIfIdle()
     }
 }

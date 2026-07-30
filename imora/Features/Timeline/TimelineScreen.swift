@@ -349,6 +349,9 @@ struct TimelineScreen<Header: View>: View {
             model.updateAssets(ids: [id]) { $0.isFavorite = value }
         case .removed(let id):
             model.removeAssets(ids: [id])
+        case .localDeleted:
+            // the server copy remains, so the timeline keeps the asset.
+            break
         }
     }
 
@@ -371,7 +374,26 @@ struct TimelineScreen<Header: View>: View {
 
     private func applyTrash() async {
         guard let client = session.client else { return }
-        try? await client.trashAssets(ids: Array(selection))
+        let ids = Array(selection)
+        // a server delete also removes device copies when they exist. declining
+        // the system dialog aborts the whole delete.
+        if let backup = session.backup {
+            var localIds: [String] = []
+            for id in ids {
+                if let localId = await backup.localIdentifier(forRemote: id) {
+                    localIds.append(localId)
+                }
+            }
+            if !localIds.isEmpty {
+                do {
+                    try await PhotoLibraryService.delete(localIdentifiers: localIds)
+                } catch {
+                    return
+                }
+                backup.noteLocalDeletion(localIds)
+            }
+        }
+        try? await client.trashAssets(ids: ids)
         model.removeAssets(ids: selection)
         exitSelection()
     }

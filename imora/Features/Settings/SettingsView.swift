@@ -70,6 +70,15 @@ struct SettingsView: View {
                     preferenceToggle("People", icon: "person.2", section: "people", isOn: session.preferences?.peopleEnabled ?? true)
                 }
 
+                Section("Backup") {
+                    NavigationLink {
+                        BackupScreen()
+                    } label: {
+                        Label("Backup", systemImage: "arrow.triangle.2.circlepath.icloud")
+                    }
+                    .accessibilityIdentifier("settings-backup")
+                }
+
                 Section("Server") {
                     LabeledContent("Address") {
                         Text(session.client?.apiURL.host() ?? "")
@@ -99,6 +108,7 @@ struct SettingsView: View {
                     } label: {
                         Image(systemName: "xmark")
                     }
+                    .accessibilityIdentifier("settings-close")
                 }
             }
             .task {

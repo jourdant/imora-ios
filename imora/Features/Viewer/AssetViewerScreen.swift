@@ -4,6 +4,8 @@ import AVKit
 nonisolated enum AssetChange {
     case favorite(String, Bool)
     case removed(String)
+    /// deleted from the device only - the server copy remains, so grids keep it.
+    case localDeleted(String)
 }
 
 struct AssetViewerScreen: View {
@@ -20,6 +22,10 @@ struct AssetViewerScreen: View {
     @State private var showInfo = false
     @State private var dragOffset: CGFloat = 0
     @State private var currentPageZoomed = false
+    /// device copy of the current asset, when the backup index proves one exists.
+    @State private var localIdentifier: String?
+    @State private var downloading = false
+    @State private var actionError: String?
 
     init(
         assets: [Asset],
@@ -95,6 +101,20 @@ struct AssetViewerScreen: View {
                     .presentationCornerRadius(28)
             }
         }
+        .task(id: current?.id) {
+            localIdentifier = nil
+            guard let asset = current, let backup = session.backup else { return }
+            localIdentifier = await backup.localIdentifier(forRemote: asset.id)
+        }
+        .alert(
+            actionError ?? "",
+            isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        }
     }
 
     // MARK: - chrome
@@ -130,10 +150,37 @@ struct AssetViewerScreen: View {
                     } label: {
                         Label("Archive", systemImage: "archivebox")
                     }
+                    if localIdentifier != nil {
+                        Button(role: .destructive) {
+                            Task { await deleteEverywhere() }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("viewer-delete")
+                        Button(role: .destructive) {
+                            Task { await deleteFromDevice() }
+                        } label: {
+                            Label("Delete from Device Only", systemImage: "iphone.slash")
+                        }
+                        .accessibilityIdentifier("viewer-delete-device")
+                    } else if downloading {
+                        Button {} label: {
+                            Label("Downloading...", systemImage: "arrow.down.circle.dotted")
+                        }
+                        .disabled(true)
+                    } else {
+                        Button {
+                            Task { await download() }
+                        } label: {
+                            Label("Download", systemImage: "arrow.down.circle")
+                        }
+                        .accessibilityIdentifier("viewer-download")
+                    }
                 } label: {
                     viewerButtonLabel("ellipsis")
                 }
                 .viewerControl()
+                .accessibilityIdentifier("viewer-menu")
             }
             .padding(.horizontal, 16)
 
@@ -160,6 +207,7 @@ struct AssetViewerScreen: View {
                         Task { await trash() }
                     }
                     .tint(.red)
+                    .accessibilityIdentifier("viewer-trash")
                 }
             }
             .padding(.bottom, 12)
@@ -223,10 +271,63 @@ struct AssetViewerScreen: View {
     }
 
     private func trash() async {
+        // a server delete also removes the device copy when one exists.
+        if localIdentifier != nil {
+            await deleteEverywhere()
+            return
+        }
         guard let client = session.client, let asset = current else { return }
         try? await client.trashAssets(ids: [asset.id])
         onChange(.removed(asset.id))
         removeCurrent()
+    }
+
+    /// device first: declining the system dialog aborts with nothing changed.
+    /// after the device copy is gone the index is updated immediately, even if
+    /// the server call then fails.
+    private func deleteEverywhere() async {
+        guard let client = session.client, let asset = current, let localId = localIdentifier else { return }
+        do {
+            try await PhotoLibraryService.delete(localIdentifiers: [localId])
+        } catch {
+            return
+        }
+        session.backup?.noteLocalDeletion([localId])
+        localIdentifier = nil
+        do {
+            try await client.trashAssets(ids: [asset.id])
+            onChange(.removed(asset.id))
+            removeCurrent()
+        } catch {
+            onChange(.localDeleted(asset.id))
+            actionError = "Deleted from this device, but the server copy could not be deleted."
+        }
+    }
+
+    /// saves the server original into the photo library; the index pairing is
+    /// recorded by the backup manager so the delete options appear right away.
+    private func download() async {
+        guard let asset = current, let backup = session.backup else { return }
+        downloading = true
+        defer { downloading = false }
+        do {
+            let localId = try await backup.download(asset: asset)
+            if current?.id == asset.id { localIdentifier = localId }
+        } catch {
+            actionError = "Could not download: \(error.localizedDescription)"
+        }
+    }
+
+    private func deleteFromDevice() async {
+        guard let asset = current, let localId = localIdentifier else { return }
+        do {
+            try await PhotoLibraryService.delete(localIdentifiers: [localId])
+        } catch {
+            return
+        }
+        session.backup?.noteLocalDeletion([localId])
+        localIdentifier = nil
+        onChange(.localDeleted(asset.id))
     }
 
     private func removeCurrent() {

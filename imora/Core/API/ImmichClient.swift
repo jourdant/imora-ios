@@ -378,6 +378,89 @@ nonisolated final class ImmichClient: Sendable {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         return try await get("memories", query: [URLQueryItem(name: "for", value: formatter.string(from: date))])
     }
+
+    // MARK: - backup
+
+    /// downloads an asset's original file into `directory` and returns its url.
+    /// the caller owns the returned file. the extension matters: photokit
+    /// infers the resource type from it when importing.
+    func downloadOriginal(assetID: String, to directory: URL, fileExtension: String) async throws -> URL {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let (tempURL, response) = try await session.download(from: originalURL(assetID: assetID))
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw ImmichError.http(http.statusCode, "")
+        }
+        var destination = directory.appending(path: "download-\(UUID().uuidString)")
+        if !fileExtension.isEmpty {
+            destination = destination.appendingPathExtension(fileExtension)
+        }
+        try FileManager.default.moveItem(at: tempURL, to: destination)
+        return destination
+    }
+
+    /// asks the server which checksums it already stores. only a
+    /// reject/duplicate result with an asset id proves the bytes exist.
+    func bulkUploadCheck(_ items: [BulkUploadCheckItem]) async throws -> [BulkUploadCheckResult] {
+        struct Envelope: Decodable { let results: [BulkUploadCheckResult] }
+        let body = try JSONEncoder().encode(["assets": items])
+        let data = try await send(path: "assets/bulk-upload-check", method: "POST", body: body)
+        do {
+            return try JSONDecoder().decode(Envelope.self, from: data).results
+        } catch {
+            throw ImmichError.decoding("\(error)")
+        }
+    }
+
+    /// multipart upload of one asset file. takes ownership of the source file:
+    /// it is deleted as soon as the request body is built, so peak temp usage
+    /// stays near one file size.
+    func uploadAsset(_ upload: AssetUploadRequest) async throws -> AssetUploadResult {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var fields: [(name: String, value: String)] = [
+            ("deviceAssetId", upload.deviceAssetId),
+            ("deviceId", upload.deviceId),
+            ("fileCreatedAt", iso.string(from: upload.fileCreatedAt)),
+            ("fileModifiedAt", iso.string(from: upload.fileModifiedAt)),
+            ("isFavorite", upload.isFavorite ? "true" : "false"),
+            ("duration", String(upload.durationMs)),
+        ]
+        if let livePhotoVideoId = upload.livePhotoVideoId {
+            fields.append(("livePhotoVideoId", livePhotoVideoId))
+        }
+        if upload.hidden {
+            fields.append(("visibility", "hidden"))
+        }
+
+        let boundary = "imora-\(UUID().uuidString)"
+        let bodyURL = try MultipartBody.makeBodyFile(
+            fields: fields,
+            fileField: "assetData",
+            filename: upload.filename,
+            contentsOf: upload.fileURL,
+            boundary: boundary,
+            in: FileManager.default.temporaryDirectory.appending(path: "backup")
+        )
+        try? FileManager.default.removeItem(at: upload.fileURL)
+        defer { try? FileManager.default.removeItem(at: bodyURL) }
+
+        var request = URLRequest(url: apiURL.appending(path: "assets"))
+        request.httpMethod = "POST"
+        request.setValue(MultipartBody.contentType(boundary: boundary), forHTTPHeaderField: "Content-Type")
+        request.setValue(upload.checksum, forHTTPHeaderField: "x-immich-checksum")
+        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ImmichError.http(http.statusCode, Self.serverMessage(from: data))
+        }
+        do {
+            return try JSONDecoder().decode(AssetUploadResult.self, from: data)
+        } catch {
+            throw ImmichError.decoding("\(error)")
+        }
+    }
 }
 
 // MARK: - timeline filter
@@ -406,6 +489,54 @@ nonisolated struct TimelineFilter: Hashable {
         if let order { items.append(.init(name: "order", value: order)) }
         return items
     }
+}
+
+// MARK: - backup dtos
+
+nonisolated struct BulkUploadCheckItem: Encodable, Sendable {
+    let id: String
+    let checksum: String
+}
+
+nonisolated struct BulkUploadCheckResult: Decodable, Sendable {
+    let id: String
+    let action: String
+    let reason: String?
+    let assetId: String?
+    let isTrashed: Bool?
+
+    /// the only combination that proves the server stores these bytes.
+    var isConfirmedDuplicate: Bool {
+        action == "reject" && reason == "duplicate" && assetId != nil
+    }
+
+    var isUnsupported: Bool {
+        action == "reject" && reason == "unsupported-format"
+    }
+}
+
+nonisolated struct AssetUploadRequest: Sendable {
+    var fileURL: URL
+    var checksum: String
+    var filename: String
+    var deviceAssetId: String
+    var deviceId: String
+    var fileCreatedAt: Date
+    var fileModifiedAt: Date
+    var isFavorite: Bool
+    var durationMs: Int
+    var livePhotoVideoId: String?
+    /// hides the motion part of a live photo from the timeline.
+    var hidden = false
+}
+
+nonisolated struct AssetUploadResult: Decodable, Sendable {
+    let id: String
+    /// created, replaced or duplicate today - kept as a string so new
+    /// server statuses stay a success instead of a decoding failure.
+    let status: String
+
+    var isDuplicate: Bool { status == "duplicate" }
 }
 
 // MARK: - helpers

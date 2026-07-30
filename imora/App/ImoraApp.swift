@@ -14,6 +14,7 @@ struct ImoraApp: App {
 
 struct RootView: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -28,5 +29,9 @@ struct RootView: View {
         }
         .animation(.smooth, value: session.state)
         .task { await session.restore() }
+        .onChange(of: scenePhase) { _, phase in
+            // returning to the foreground picks up photos taken meanwhile.
+            if phase == .active { session.backup?.startIfIdle() }
+        }
     }
 }
