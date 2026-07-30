@@ -237,6 +237,11 @@ nonisolated final class ImmichClient: Sendable {
     // MARK: - users and server
 
     func currentUser() async throws -> CurrentUser { try await get("users/me") }
+    func preferences() async throws -> UserPreferences { try await get("users/me/preferences") }
+
+    func updatePreference(section: String, enabled: Bool) async throws -> UserPreferences {
+        try await request("users/me/preferences", method: "PUT", body: [section: ["enabled": enabled]])
+    }
     func serverAbout() async throws -> ServerAbout { try await get("server/about") }
     func serverFeatures() async throws -> ServerFeatures { try await get("server/features") }
     func serverStorage() async throws -> ServerStorage { try await get("server/storage") }

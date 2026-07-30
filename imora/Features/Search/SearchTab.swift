@@ -11,6 +11,7 @@ struct SearchTab: View {
     @State private var people: [Person] = []
     @State private var places: [ExploreResponse] = []
     @State private var viewer: ViewerContext?
+    @Namespace private var zoomNamespace
 
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
@@ -42,8 +43,8 @@ struct SearchTab: View {
                 PlaceScreen(city: place.city)
             }
             .task { await loadDiscover() }
-            .fullScreenCover(item: $viewer) { context in
-                AssetViewerScreen(assets: context.assets, initialIndex: context.index) { change in
+            .navigationDestination(item: $viewer) { context in
+                AssetViewerScreen(assets: context.assets, initialIndex: context.index, zoomNamespace: zoomNamespace) { change in
                     if case .removed(let id) = change {
                         results.removeAll { $0.id == id }
                     }
@@ -66,6 +67,7 @@ struct SearchTab: View {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(Array(results.enumerated()), id: \.element.id) { index, asset in
                     AssetTile(asset: asset)
+                        .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture {
                             viewer = ViewerContext(assets: results, index: index)
                         }
@@ -87,7 +89,7 @@ struct SearchTab: View {
 
     @ViewBuilder private var discoverContent: some View {
         VStack(alignment: .leading, spacing: 24) {
-            if !people.isEmpty {
+            if !people.isEmpty && session.preferences?.peopleEnabled != false {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("People")
                         .font(.title3.weight(.bold))
@@ -256,6 +258,7 @@ struct PlaceScreen: View {
     @State private var assets: [Asset] = []
     @State private var isLoading = true
     @State private var viewer: ViewerContext?
+    @Namespace private var zoomNamespace
 
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
@@ -264,6 +267,7 @@ struct PlaceScreen: View {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
                     AssetTile(asset: asset)
+                        .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture {
                             viewer = ViewerContext(assets: assets, index: index)
                         }
@@ -289,8 +293,8 @@ struct PlaceScreen: View {
             }
             isLoading = false
         }
-        .fullScreenCover(item: $viewer) { context in
-            AssetViewerScreen(assets: context.assets, initialIndex: context.index) { change in
+        .navigationDestination(item: $viewer) { context in
+            AssetViewerScreen(assets: context.assets, initialIndex: context.index, zoomNamespace: zoomNamespace) { change in
                 if case .removed(let id) = change {
                     assets.removeAll { $0.id == id }
                 }

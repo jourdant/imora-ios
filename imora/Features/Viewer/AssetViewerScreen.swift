@@ -8,19 +8,28 @@ nonisolated enum AssetChange {
 
 struct AssetViewerScreen: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(SessionStore.self) private var session
 
     let onChange: (AssetChange) -> Void
+    let zoomNamespace: Namespace.ID?
 
     @State private var assets: [Asset]
     @State private var currentIndex: Int
     @State private var chromeVisible = true
     @State private var showInfo = false
     @State private var dragOffset: CGFloat = 0
+    @State private var currentPageZoomed = false
 
-    init(assets: [Asset], initialIndex: Int, onChange: @escaping (AssetChange) -> Void) {
+    init(
+        assets: [Asset],
+        initialIndex: Int,
+        zoomNamespace: Namespace.ID? = nil,
+        onChange: @escaping (AssetChange) -> Void
+    ) {
         _assets = State(initialValue: assets)
         _currentIndex = State(initialValue: initialIndex)
+        self.zoomNamespace = zoomNamespace
         self.onChange = onChange
     }
 
@@ -28,16 +37,32 @@ struct AssetViewerScreen: View {
         assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
     }
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        // zooming out targets the currently paged asset's tile when visible.
+        if let zoomNamespace, !reduceMotion {
+            core.navigationTransition(.zoom(sourceID: current?.id ?? "", in: zoomNamespace))
+        } else {
+            core
+        }
+    }
+
+    private var core: some View {
         ZStack {
             Color.black
                 .opacity(1 - Double(min(abs(dragOffset) / 600, 0.6)))
                 .ignoresSafeArea()
+                .accessibilityIdentifier("asset-viewer")
 
             TabView(selection: $currentIndex) {
                 ForEach(assets.indices, id: \.self) { index in
-                    AssetPage(asset: assets[index], isActive: index == currentIndex)
-                        .tag(index)
+                    AssetPage(
+                        asset: assets[index],
+                        isActive: index == currentIndex
+                    ) { isZoomed in
+                        guard index == currentIndex else { return }
+                        currentPageZoomed = isZoomed
+                    }
+                    .tag(index)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
@@ -45,7 +70,9 @@ struct AssetViewerScreen: View {
             .scaleEffect(1 - min(abs(dragOffset) / 2000, 0.15))
             .simultaneousGesture(dismissDrag)
             .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.2)) { chromeVisible.toggle() }
+                withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
+                    chromeVisible.toggle()
+                }
             }
 
             if chromeVisible {
@@ -53,11 +80,19 @@ struct AssetViewerScreen: View {
             }
         }
         .statusBarHidden(!chromeVisible)
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+        .onChange(of: currentIndex) { _, _ in
+            currentPageZoomed = false
+            dragOffset = 0
+        }
         .sheet(isPresented: $showInfo) {
             if let current {
                 AssetInfoSheet(asset: current)
                     .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
                     .presentationBackground(.regularMaterial)
+                    .presentationCornerRadius(28)
             }
         }
     }
@@ -70,11 +105,9 @@ struct AssetViewerScreen: View {
                 Button {
                     dismiss()
                 } label: {
-                    Image(systemName: "xmark")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 40, height: 40)
+                    viewerButtonLabel("chevron.backward")
                 }
-                .buttonStyle(.glass)
+                .viewerControl()
                 .accessibilityIdentifier("viewer-close")
 
                 Spacer()
@@ -98,18 +131,16 @@ struct AssetViewerScreen: View {
                         Label("Archive", systemImage: "archivebox")
                     }
                 } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 40, height: 40)
+                    viewerButtonLabel("ellipsis")
                 }
-                .buttonStyle(.glass)
+                .viewerControl()
             }
             .padding(.horizontal, 16)
 
             Spacer()
 
-            GlassEffectContainer(spacing: 14) {
-                HStack(spacing: 14) {
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
                     chromeButton(current?.isFavorite == true ? "heart.fill" : "heart") {
                         Task { await toggleFavorite() }
                     }
@@ -120,11 +151,9 @@ struct AssetViewerScreen: View {
 
                     if let current, let client = session.client {
                         ShareLink(item: SharedAssetFile(client: client, asset: current), preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.body.weight(.medium))
-                                .frame(width: 44, height: 44)
+                            viewerButtonLabel("square.and.arrow.up")
                         }
-                        .buttonStyle(.glass)
+                        .viewerControl()
                     }
 
                     chromeButton("trash") {
@@ -141,26 +170,37 @@ struct AssetViewerScreen: View {
 
     private func chromeButton(_ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.body.weight(.medium))
-                .frame(width: 44, height: 44)
+            viewerButtonLabel(icon)
         }
-        .buttonStyle(.glass)
+        .viewerControl()
+    }
+
+    private func viewerButtonLabel(_ icon: String) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 15, weight: .semibold))
+            .frame(width: 34, height: 34)
+            .glassEffect(.clear.interactive(), in: .circle)
     }
 
     // MARK: - gestures
 
     private var dismissDrag: some Gesture {
-        DragGesture(minimumDistance: 15)
+        DragGesture(minimumDistance: 12)
             .onChanged { value in
-                guard abs(value.translation.height) > abs(value.translation.width) * 1.2 else { return }
+                guard !currentPageZoomed,
+                      value.translation.height > 0,
+                      value.translation.height > abs(value.translation.width) * 1.15
+                else { return }
                 dragOffset = value.translation.height
             }
             .onEnded { value in
-                if abs(dragOffset) > 140 || abs(value.predictedEndTranslation.height) > 500 {
+                guard dragOffset > 0 else { return }
+                if dragOffset > 110 || value.predictedEndTranslation.height > 360 {
                     dismiss()
                 } else {
-                    withAnimation(.spring(duration: 0.3)) { dragOffset = 0 }
+                    withAnimation(reduceMotion ? .linear(duration: 0.12) : .spring(duration: 0.28, bounce: 0.16)) {
+                        dragOffset = 0
+                    }
                 }
             }
     }
@@ -200,22 +240,32 @@ struct AssetViewerScreen: View {
     }
 }
 
+private extension View {
+    func viewerControl() -> some View {
+        buttonStyle(.plain)
+            .frame(width: 44, height: 44)
+            .contentShape(.rect)
+    }
+}
+
 // MARK: - single page
 
 private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
+    let onZoomChanged: (Bool) -> Void
 
     var body: some View {
         if asset.isVideo {
             VideoPage(asset: asset, isActive: isActive)
         } else if let client = session.client {
-            ZoomableScrollView {
+            ZoomableScrollView(onZoomChanged: onZoomChanged) {
                 RemoteImage(
                     url: client.thumbnailURL(assetID: asset.id, size: "preview"),
                     targetPixelSize: 2048,
                     thumbhash: asset.thumbhash,
+                    fallbackURL: client.thumbnailURL(assetID: asset.id),
                     contentMode: .fit
                 )
             }
@@ -258,6 +308,7 @@ private struct VideoPage: View {
 // MARK: - zoom container
 
 private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
+    let onZoomChanged: (Bool) -> Void
     @ViewBuilder let content: Content
 
     func makeUIView(context: Context) -> UIScrollView {
@@ -265,14 +316,16 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         scrollView.delegate = context.coordinator
         scrollView.maximumZoomScale = 6
         scrollView.minimumZoomScale = 1
+        scrollView.bounces = true
         scrollView.bouncesZoom = true
+        scrollView.decelerationRate = .fast
+        scrollView.isDirectionalLockEnabled = true
         scrollView.showsVerticalScrollIndicator = false
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.backgroundColor = .clear
         scrollView.contentInsetAdjustmentBehavior = .never
 
         let hosted = context.coordinator.hostingController
-        hosted.rootView = AnyView(content)
         hosted.view.backgroundColor = .clear
         hosted.view.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(hosted.view)
@@ -292,33 +345,49 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        context.coordinator.hostingController.rootView = AnyView(content)
+        context.coordinator.hostingController.rootView = content
+        context.coordinator.onZoomChanged = onZoomChanged
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(content: content, onZoomChanged: onZoomChanged)
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
-        let hostingController = UIHostingController<AnyView>(rootView: AnyView(EmptyView()))
+        let hostingController: UIHostingController<Content>
+        var onZoomChanged: (Bool) -> Void
+        private var lastReportedZoomed = false
+
+        init(content: Content, onZoomChanged: @escaping (Bool) -> Void) {
+            hostingController = UIHostingController(rootView: content)
+            self.onZoomChanged = onZoomChanged
+        }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             hostingController.view
         }
 
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            let isZoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+            guard isZoomed != lastReportedZoomed else { return }
+            lastReportedZoomed = isZoomed
+            onZoomChanged(isZoomed)
+        }
+
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
             guard let scrollView = gesture.view as? UIScrollView else { return }
-            if scrollView.zoomScale > 1 {
-                scrollView.setZoomScale(1, animated: true)
-            } else {
-                let point = gesture.location(in: hostingController.view)
-                let size = CGSize(
-                    width: scrollView.bounds.width / 2.5,
-                    height: scrollView.bounds.height / 2.5
-                )
-                let origin = CGPoint(x: point.x - size.width / 2, y: point.y - size.height / 2)
-                scrollView.zoom(to: CGRect(origin: origin, size: size), animated: true)
+            if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
+                scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+                return
             }
+
+            let point = gesture.location(in: hostingController.view)
+            let size = CGSize(
+                width: scrollView.bounds.width / 2.5,
+                height: scrollView.bounds.height / 2.5
+            )
+            let origin = CGPoint(x: point.x - size.width / 2, y: point.y - size.height / 2)
+            scrollView.zoom(to: CGRect(origin: origin, size: size), animated: true)
         }
     }
 }

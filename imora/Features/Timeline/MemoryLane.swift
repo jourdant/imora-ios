@@ -5,9 +5,12 @@ struct MemoryLane: View {
     @Environment(SessionStore.self) private var session
     @State private var memories: [Memory] = []
     @State private var viewer: ViewerContext?
+    @Namespace private var zoomNamespace
 
     var body: some View {
-        if !memories.isEmpty {
+        if session.preferences?.memoriesEnabled == false {
+            Color.clear.frame(height: 0)
+        } else if !memories.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Memories")
                     .font(.title3.weight(.bold))
@@ -21,6 +24,7 @@ struct MemoryLane: View {
                                     openMemory(memory)
                                 } label: {
                                     memoryCard(memory, cover: first)
+                                        .matchedTransitionSource(id: first.id, in: zoomNamespace)
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -30,8 +34,12 @@ struct MemoryLane: View {
                 }
             }
             .padding(.top, 4)
-            .fullScreenCover(item: $viewer) { context in
-                AssetViewerScreen(assets: context.assets, initialIndex: context.index) { _ in }
+            .navigationDestination(item: $viewer) { context in
+                AssetViewerScreen(
+                    assets: context.assets,
+                    initialIndex: context.index,
+                    zoomNamespace: zoomNamespace
+                ) { _ in }
             }
         } else {
             Color.clear

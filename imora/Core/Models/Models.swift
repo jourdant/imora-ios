@@ -114,6 +114,24 @@ nonisolated struct OAuthAuthorizeResponse: Codable {
     let url: String
 }
 
+// MARK: - user preferences
+
+nonisolated struct FeatureToggle: Codable, Hashable {
+    let enabled: Bool
+}
+
+nonisolated struct UserPreferences: Codable, Hashable {
+    let memories: FeatureToggle?
+    let people: FeatureToggle?
+    let folders: FeatureToggle?
+    let ratings: FeatureToggle?
+    let tags: FeatureToggle?
+    let sharedLinks: FeatureToggle?
+
+    var memoriesEnabled: Bool { memories?.enabled ?? true }
+    var peopleEnabled: Bool { people?.enabled ?? true }
+}
+
 nonisolated struct ServerStorage: Codable {
     let diskAvailable: String
     let diskSize: String

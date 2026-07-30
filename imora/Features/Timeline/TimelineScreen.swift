@@ -1,14 +1,28 @@
 import SwiftUI
 
-nonisolated struct ViewerContext: Identifiable {
+nonisolated struct ViewerContext: Identifiable, Hashable {
     let assets: [Asset]
     let index: Int
     var id: String { assets[index].id }
+
+    static func == (lhs: ViewerContext, rhs: ViewerContext) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+private struct TimelineScrollState: Equatable {
+    let fraction: CGFloat
+    let scrollableHeight: CGFloat
 }
 
 /// reusable bucketed photo grid, the workhorse behind most screens.
 struct TimelineScreen<Header: View>: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let title: String
     let filter: TimelineFilter
@@ -24,14 +38,14 @@ struct TimelineScreen<Header: View>: View {
     @State private var scrubberVisible = false
     @State private var scrubberHideTask: Task<Void, Never>?
     @State private var isScrubbing = false
-    @State private var scrubLabel: String?
+    @State private var scrollFraction: CGFloat = 0
+    @State private var scrollableHeight: CGFloat = 0
+    @State private var visibleMonth: String?
+    @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
     @State private var columnCount = 3
     @State private var pinchBaseColumns: Int?
-
-    private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 2), count: columnCount)
-    }
+    @Namespace private var zoomNamespace
 
     init(
         title: String,
@@ -50,49 +64,79 @@ struct TimelineScreen<Header: View>: View {
         _model = State(initialValue: TimelineModel(filter: filter))
     }
 
+    private func tileSide(for width: CGFloat) -> CGFloat {
+        (width - CGFloat(columnCount - 1) * 2) / CGFloat(columnCount)
+    }
+
     var body: some View {
-        ScrollViewReader { proxy in
+        GeometryReader { geometry in
+            let side = tileSide(for: geometry.size.width)
+
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12, pinnedViews: []) {
+                LazyVStack(spacing: 0) {
                     header
 
-                    ForEach(model.sections) { section in
-                        sectionView(section)
-                            .id(section.id)
+                    ForEach(model.rows) { row in
+                        rowView(row, side: side)
+                            .id(row.id)
                     }
                 }
+                .scrollTargetLayout()
                 .padding(.bottom, isSelecting ? 90 : 0)
             }
+            .scrollPosition($scrollPosition)
             .scrollIndicators(.hidden)
+            .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
+                visibleMonth = rowIDs.first.flatMap { model.monthByRowID[$0] }
+            }
             .simultaneousGesture(
-                MagnifyGesture()
-                    .onChanged { value in
-                        let base = pinchBaseColumns ?? columnCount
-                        pinchBaseColumns = base
-                        // zooming in shows fewer, larger tiles.
-                        let target = min(5, max(2, Int((Double(base) / value.magnification).rounded())))
-                        if target != columnCount {
-                            let generator = UISelectionFeedbackGenerator()
-                            generator.selectionChanged()
-                            withAnimation(.smooth(duration: 0.25)) { columnCount = target }
-                        }
-                    }
-                    .onEnded { _ in pinchBaseColumns = nil }
+                pinchGesture(
+                    viewportWidth: geometry.size.width,
+                    viewportHeight: geometry.size.height
+                )
             )
+            .onScrollGeometryChange(for: TimelineScrollState.self) { scroll in
+                let scrollable = max(0, scroll.contentSize.height - scroll.containerSize.height)
+                let rawFraction = scrollable > 0 ? scroll.contentOffset.y / scrollable : 0
+                let fraction = (min(1, max(0, rawFraction)) * 1_000).rounded() / 1_000
+                return TimelineScrollState(
+                    fraction: fraction,
+                    scrollableHeight: scrollable
+                )
+            } action: { _, state in
+                scrollableHeight = state.scrollableHeight
+                guard !isScrubbing else { return }
+                scrollFraction = state.fraction
+            }
             .onScrollPhaseChange { _, newPhase in
-                if newPhase != .idle {
+                if newPhase == .idle {
+                    scheduleScrubberHide()
+                } else {
                     showScrubber()
                 }
             }
+            .onChange(of: isScrubbing) { _, scrubbing in
+                if scrubbing {
+                    showScrubber()
+                } else {
+                    scheduleScrubberHide()
+                }
+            }
             .overlay(alignment: .trailing) {
-                if model.sections.count > 4 {
+                if model.rows.count > 30 {
                     TimelineScrubber(
-                        sections: model.sections,
+                        viewportHeight: geometry.size.height,
+                        scrollableHeight: scrollableHeight,
+                        visibleMonth: visibleMonth,
+                        fraction: $scrollFraction,
                         visible: scrubberVisible || isScrubbing,
-                        isScrubbing: $isScrubbing,
-                        label: $scrubLabel
-                    ) { sectionID in
-                        proxy.scrollTo(sectionID, anchor: .top)
+                        isScrubbing: $isScrubbing
+                    ) { offset in
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            scrollPosition.scrollTo(y: offset)
+                        }
                     }
                 }
             }
@@ -106,9 +150,7 @@ struct TimelineScreen<Header: View>: View {
                 }
             }
         }
-        .overlay {
-            overlayState
-        }
+        .overlay { overlayState }
         .overlay(alignment: .bottom) {
             if isSelecting {
                 SelectionActionBar(
@@ -128,11 +170,16 @@ struct TimelineScreen<Header: View>: View {
         .task {
             if let client = session.client {
                 model.attach(client)
+                model.columns = columnCount
                 await model.load()
             }
         }
-        .fullScreenCover(item: $viewer) { context in
-            AssetViewerScreen(assets: context.assets, initialIndex: context.index) { change in
+        .navigationDestination(item: $viewer) { context in
+            AssetViewerScreen(
+                assets: context.assets,
+                initialIndex: context.index,
+                zoomNamespace: zoomNamespace
+            ) { change in
                 handleViewerChange(change)
             }
         }
@@ -143,54 +190,31 @@ struct TimelineScreen<Header: View>: View {
         }
     }
 
-    @ViewBuilder private var overlayState: some View {
-        if model.isLoading && model.sections.isEmpty {
-            ProgressView()
-        } else if let error = model.loadError, model.sections.isEmpty {
-            ContentUnavailableView {
-                Label("Couldn't load", systemImage: "wifi.exclamationmark")
-            } description: {
-                Text(error)
-            } actions: {
-                Button("Retry") { Task { await model.load() } }
-                    .buttonStyle(.glass)
-            }
-        } else if model.isEmpty {
-            ContentUnavailableView(emptyMessage, systemImage: emptyIcon)
-        }
-    }
+    // MARK: - rows
 
-    // MARK: - sections
-
-    @ViewBuilder private func sectionView(_ section: TimelineSection) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(section.monthTitle)
+    @ViewBuilder private func rowView(_ row: TimelineRow, side: CGFloat) -> some View {
+        switch row {
+        case .monthHeader(_, let monthTitle):
+            Text(monthTitle)
                 .font(.title2.weight(.bold))
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 16)
-                .padding(.top, 12)
+                .frame(height: 56, alignment: .bottomLeading)
 
-            if let days = section.days {
-                ForEach(days) { day in
-                    dayView(day)
-                }
-            } else {
-                bucketPlaceholder(count: section.count)
-                    .onAppear { Task { await model.loadBucket(section.id) } }
-            }
-        }
-    }
-
-    @ViewBuilder private func dayView(_ day: DayGroup) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        case .dayHeader(_, let dayTitle, let assetIDs):
             HStack {
-                Text(day.title)
+                Text(dayTitle)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if isSelecting {
-                    let allSelected = day.assets.allSatisfy { selection.contains($0.id) }
+                    let allSelected = assetIDs.allSatisfy { selection.contains($0) }
                     Button {
-                        toggleDay(day, select: !allSelected)
+                        if allSelected {
+                            selection.subtract(assetIDs)
+                        } else {
+                            selection.formUnion(assetIDs)
+                        }
                     } label: {
                         Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(allSelected ? Color.accentColor : .secondary)
@@ -198,12 +222,23 @@ struct TimelineScreen<Header: View>: View {
                 }
             }
             .padding(.horizontal, 16)
+            .frame(height: 36)
 
-            LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(day.assets) { asset in
+        case .tiles(_, let assets):
+            HStack(spacing: 2) {
+                ForEach(assets) { asset in
                     tile(asset)
+                        .frame(width: side, height: side)
+                }
+                if assets.count < columnCount {
+                    Spacer(minLength: 0)
                 }
             }
+            .padding(.bottom, 2)
+
+        case .placeholder(_, let bucketID, let tileRows):
+            PlaceholderGrid(tileRows: tileRows, columns: columnCount, side: side)
+                .onAppear { Task { await model.loadBucket(bucketID) } }
         }
     }
 
@@ -223,6 +258,7 @@ struct TimelineScreen<Header: View>: View {
                     Rectangle().stroke(Color.accentColor, lineWidth: 3)
                 }
             }
+            .matchedTransitionSource(id: asset.id, in: zoomNamespace)
             .onTapGesture {
                 if isSelecting {
                     toggle(asset)
@@ -239,20 +275,50 @@ struct TimelineScreen<Header: View>: View {
             }
     }
 
-    @ViewBuilder private func bucketPlaceholder(count: Int) -> some View {
-        let rows = max(1, Int((Double(count) / Double(columnCount)).rounded(.up)))
-        let side = (UIScreen.main.bounds.width - CGFloat(columnCount - 1) * 2) / CGFloat(columnCount)
-        VStack(spacing: 2) {
-            ForEach(0..<min(rows, 40), id: \.self) { _ in
-                HStack(spacing: 2) {
-                    ForEach(0..<columnCount, id: \.self) { _ in
-                        Rectangle()
-                            .fill(Color(.secondarySystemFill))
-                            .frame(height: side)
-                    }
-                }
+    @ViewBuilder private var overlayState: some View {
+        if model.isLoading && model.sections.isEmpty {
+            ProgressView()
+        } else if let error = model.loadError, model.sections.isEmpty {
+            ContentUnavailableView {
+                Label("Couldn't load", systemImage: "wifi.exclamationmark")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Retry") { Task { await model.load() } }
+                    .buttonStyle(.glass)
             }
+        } else if model.isEmpty {
+            ContentUnavailableView(emptyMessage, systemImage: emptyIcon)
         }
+    }
+
+    // MARK: - gestures
+
+    private func pinchGesture(viewportWidth: CGFloat, viewportHeight: CGFloat) -> some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                let base = pinchBaseColumns ?? columnCount
+                pinchBaseColumns = base
+                // zooming in shows fewer, larger tiles.
+                let target = min(5, max(2, Int((Double(base) / value.magnification).rounded())))
+                guard target != columnCount else { return }
+
+                let preservedFraction = scrollFraction
+                let generator = UISelectionFeedbackGenerator()
+                generator.selectionChanged()
+
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    columnCount = target
+                    model.columns = target
+                }
+
+                let newSide = (viewportWidth - CGFloat(target - 1) * 2) / CGFloat(target)
+                let contentHeight = model.rows.reduce(CGFloat(0)) { $0 + $1.height(tileSide: newSide) }
+                scrollPosition.scrollTo(y: preservedFraction * max(0, contentHeight - viewportHeight))
+            }
+            .onEnded { _ in pinchBaseColumns = nil }
     }
 
     // MARK: - selection
@@ -263,14 +329,6 @@ struct TimelineScreen<Header: View>: View {
             if selection.isEmpty { isSelecting = false }
         } else {
             selection.insert(asset.id)
-        }
-    }
-
-    private func toggleDay(_ day: DayGroup, select: Bool) {
-        if select {
-            selection.formUnion(day.assets.map(\.id))
-        } else {
-            selection.subtract(day.assets.map(\.id))
         }
     }
 
@@ -326,18 +384,60 @@ struct TimelineScreen<Header: View>: View {
     }
 
     private func showScrubber() {
-        scrubberVisible = true
+        scrubberHideTask?.cancel()
+        scrubberHideTask = nil
+        if reduceMotion {
+            scrubberVisible = true
+        } else {
+            withAnimation(.easeOut(duration: 0.16)) { scrubberVisible = true }
+        }
+    }
+
+    private func scheduleScrubberHide() {
         scrubberHideTask?.cancel()
         scrubberHideTask = Task {
-            try? await Task.sleep(for: .seconds(1.2))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.3)) { scrubberVisible = false }
+            try? await Task.sleep(for: .milliseconds(3_200))
+            guard !Task.isCancelled, !isScrubbing else { return }
+            if reduceMotion {
+                scrubberVisible = false
+            } else {
+                withAnimation(.easeOut(duration: 0.2)) { scrubberVisible = false }
+            }
         }
     }
 }
 
 extension [String]: @retroactive Identifiable {
     public var id: String { joined(separator: ",") }
+}
+
+/// dimmed grid pattern shown while a bucket loads. fixed height by construction.
+private struct PlaceholderGrid: View {
+    let tileRows: Int
+    let columns: Int
+    let side: CGFloat
+
+    var body: some View {
+        // draw at most a screenful of visible squares; the rest is one flat block.
+        let visibleRows = min(tileRows, 12)
+        VStack(spacing: 2) {
+            ForEach(0..<visibleRows, id: \.self) { _ in
+                HStack(spacing: 2) {
+                    ForEach(0..<columns, id: \.self) { _ in
+                        Rectangle()
+                            .fill(Color(.secondarySystemFill))
+                            .frame(width: side, height: side)
+                    }
+                }
+            }
+            if tileRows > visibleRows {
+                Rectangle()
+                    .fill(Color(.secondarySystemFill).opacity(0.6))
+                    .frame(height: CGFloat(tileRows - visibleRows) * (side + 2) - 2)
+            }
+        }
+        .padding(.bottom, 2)
+    }
 }
 
 /// glass bottom bar shown during multi-select.
@@ -392,84 +492,99 @@ private struct SelectionActionBar: View {
     }
 }
 
-/// right-edge drag scrubber with a floating month label.
+/// right-edge drag scrubber backed by continuous scroll offsets.
 private struct TimelineScrubber: View {
-    let sections: [TimelineSection]
+    let viewportHeight: CGFloat
+    let scrollableHeight: CGFloat
+    let visibleMonth: String?
+    @Binding var fraction: CGFloat
     let visible: Bool
     @Binding var isScrubbing: Bool
-    @Binding var label: String?
-    let onJump: (String) -> Void
+    let onJump: (CGFloat) -> Void
 
-    @State private var fraction: CGFloat = 0
-    @State private var lastSectionID: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var label: String?
+    @State private var labelHideTask: Task<Void, Never>?
+    @State private var lastMonth: String?
 
-    var body: some View {
-        GeometryReader { proxy in
-            let height = proxy.size.height - 120
-            ZStack(alignment: .topTrailing) {
-                Color.clear
+    private let trackTop: CGFloat = 64
+    private let trackBottom: CGFloat = 82
+    private let thumbHeight: CGFloat = 36
 
-                HStack(spacing: 10) {
-                    if isScrubbing, let label {
-                        Text(label)
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .glassEffect(.regular, in: .capsule)
-                            .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .trailing)))
-                    }
-
-                    Capsule()
-                        .fill(.clear)
-                        .frame(width: 36, height: 44)
-                        .glassEffect(.regular, in: .capsule)
-                        .overlay {
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(.secondary)
-                        }
-                }
-                .offset(y: 60 + fraction * height - 22)
-                .opacity(visible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.25), value: visible)
-            }
-            .contentShape(.rect)
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        guard visible || isScrubbing else { return }
-                        isScrubbing = true
-                        fraction = min(1, max(0, (value.location.y - 60) / height))
-                        scrub(to: fraction)
-                    }
-                    .onEnded { _ in
-                        isScrubbing = false
-                        label = nil
-                    },
-                including: .gesture
-            )
-            .allowsHitTesting(visible || isScrubbing)
-        }
-        .frame(width: 52)
+    private var trackHeight: CGFloat {
+        max(1, viewportHeight - trackTop - trackBottom - thumbHeight)
     }
 
-    private func scrub(to fraction: CGFloat) {
-        let total = sections.reduce(0) { $0 + $1.count }
-        guard total > 0 else { return }
-        let target = Int(fraction * CGFloat(total))
-        var running = 0
-        for section in sections {
-            running += section.count
-            if running >= target {
-                label = section.monthTitle
-                if section.id != lastSectionID {
-                    lastSectionID = section.id
-                    let generator = UISelectionFeedbackGenerator()
-                    generator.selectionChanged()
-                    onJump(section.id)
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            HStack(spacing: 8) {
+                if let label {
+                    Text(label)
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .glassEffect(.regular, in: .capsule)
+                        .accessibilityIdentifier("timeline-scrubber-label")
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.94, anchor: .trailing)))
                 }
-                return
+
+                Capsule()
+                    .fill(.secondary.opacity(0.72))
+                    .frame(width: 4, height: thumbHeight)
+                    .frame(width: 36, height: 44)
+                    .contentShape(.rect)
+            }
+            .offset(y: trackTop + fraction * trackHeight)
+            .opacity(visible ? 1 : 0)
+        }
+        .frame(width: 176, height: viewportHeight, alignment: .topTrailing)
+        .overlay(alignment: .trailing) {
+            Color.black.opacity(0.001)
+                .frame(width: 44, height: viewportHeight)
+                .contentShape(.rect)
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            guard visible || isScrubbing else { return }
+                            labelHideTask?.cancel()
+                            if let visibleMonth { setLabel(visibleMonth) }
+                            isScrubbing = true
+                            fraction = min(1, max(0, (value.location.y - trackTop - thumbHeight / 2) / trackHeight))
+                            onJump(fraction * scrollableHeight)
+                        }
+                        .onEnded { _ in
+                            isScrubbing = false
+                            scheduleLabelHide()
+                        }
+                )
+                .allowsHitTesting(visible || isScrubbing)
+                .accessibilityIdentifier("timeline-scrubber")
+        }
+        .onChange(of: visibleMonth) { _, month in
+            guard isScrubbing || label != nil, let month else { return }
+            setLabel(month)
+        }
+        .onDisappear { labelHideTask?.cancel() }
+    }
+
+    private func scheduleLabelHide() {
+        labelHideTask?.cancel()
+        labelHideTask = Task {
+            try? await Task.sleep(for: .milliseconds(3_000))
+            guard !Task.isCancelled else { return }
+            if reduceMotion {
+                label = nil
+            } else {
+                withAnimation(.easeOut(duration: 0.18)) { label = nil }
             }
         }
+    }
+
+    private func setLabel(_ month: String) {
+        label = month
+        guard month != lastMonth else { return }
+        lastMonth = month
+        let generator = UISelectionFeedbackGenerator()
+        generator.selectionChanged()
     }
 }

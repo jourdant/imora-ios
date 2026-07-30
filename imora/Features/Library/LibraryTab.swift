@@ -21,7 +21,7 @@ struct LibraryTab: View {
                     }
                 }
 
-                if !people.isEmpty {
+                if !people.isEmpty && session.preferences?.peopleEnabled != false {
                     Section("People") {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 14) {

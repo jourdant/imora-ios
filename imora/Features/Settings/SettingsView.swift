@@ -8,6 +8,21 @@ struct SettingsView: View {
     @State private var about: ServerAbout?
     @State private var confirmLogout = false
 
+    private func preferenceToggle(_ title: String, icon: String, section: String, isOn: Bool) -> some View {
+        Toggle(isOn: Binding(
+            get: { isOn },
+            set: { newValue in
+                Task {
+                    if let updated = try? await session.client?.updatePreference(section: section, enabled: newValue) {
+                        session.preferences = updated
+                    }
+                }
+            }
+        )) {
+            Label(title, systemImage: icon)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -48,6 +63,11 @@ struct SettingsView: View {
                         }
                         .padding(.vertical, 4)
                     }
+                }
+
+                Section("Features") {
+                    preferenceToggle("Memories", icon: "clock.arrow.circlepath", section: "memories", isOn: session.preferences?.memoriesEnabled ?? true)
+                    preferenceToggle("People", icon: "person.2", section: "people", isOn: session.preferences?.peopleEnabled ?? true)
                 }
 
                 Section("Server") {

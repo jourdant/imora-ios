@@ -16,18 +16,63 @@ nonisolated struct TimelineSection: Identifiable, Hashable {
     var isLoaded: Bool { days != nil }
 }
 
+/// flat list element with a deterministic height. fixed heights are what keep
+/// lazyvstack from re-measuring and jumping while scrolling backwards.
+nonisolated enum TimelineRow: Identifiable, Hashable {
+    case monthHeader(String, String)
+    case dayHeader(String, String, [String])
+    case tiles(String, [Asset])
+    case placeholder(String, String, Int)
+
+    var id: String {
+        switch self {
+        case .monthHeader(let id, _): id
+        case .dayHeader(let id, _, _): id
+        case .tiles(let id, _): id
+        case .placeholder(let id, _, _): id
+        }
+    }
+
+    func height(tileSide: CGFloat) -> CGFloat {
+        switch self {
+        case .monthHeader: 56
+        case .dayHeader: 36
+        case .tiles: tileSide + 2
+        case .placeholder(_, _, let rows): CGFloat(rows) * (tileSide + 2)
+        }
+    }
+
+    var monthTitle: String? {
+        if case .monthHeader(_, let title) = self { return title }
+        return nil
+    }
+}
+
 /// drives any bucketed grid screen: main timeline, favorites, archive, trash, person, album.
 @Observable
 final class TimelineModel {
     let filter: TimelineFilter
     private(set) var sections: [TimelineSection] = []
+    private(set) var rows: [TimelineRow] = []
+    private(set) var monthByRowID: [String: String] = [:]
     private(set) var isLoading = false
     private(set) var loadError: String?
+
+    var columns: Int = 3 {
+        didSet { if columns != oldValue { rebuildRows() } }
+    }
+
     private var client: ImmichClient?
     private var inflightBuckets: Set<String> = []
+    private var prefetchTask: Task<Void, Never>?
+    private var rebuildScheduled = false
 
     init(filter: TimelineFilter) {
         self.filter = filter
+    }
+
+    deinit {
+        prefetchTask?.cancel()
     }
 
     var isEmpty: Bool { !isLoading && sections.isEmpty }
@@ -36,8 +81,6 @@ final class TimelineModel {
     var flatAssets: [Asset] {
         sections.flatMap { $0.days ?? [] }.flatMap(\.assets)
     }
-
-    var totalCount: Int { sections.reduce(0) { $0 + $1.count } }
 
     func attach(_ client: ImmichClient) {
         guard self.client == nil else { return }
@@ -48,47 +91,45 @@ final class TimelineModel {
         guard let client, !isLoading else { return }
         isLoading = true
         loadError = nil
+        defer { isLoading = false }
+
         do {
-            let buckets = try await client.timeBuckets(filter)
-            sections = buckets.map { bucket in
-                TimelineSection(
-                    id: bucket.timeBucket,
-                    monthTitle: Self.monthTitle(for: bucket.timeBucket),
-                    count: bucket.count,
-                    days: nil
-                )
-            }
-            // preload the first screenful so the ui never starts blank.
-            if let first = sections.first { await loadBucket(first.id) }
+            try await reloadSections(using: client)
         } catch {
             loadError = error.localizedDescription
         }
-        isLoading = false
     }
 
     func refresh() async {
-        guard client != nil else { return }
+        guard let client else { return }
+        prefetchTask?.cancel()
+        prefetchTask = nil
         inflightBuckets.removeAll()
-        let previouslyLoaded = Set(sections.filter(\.isLoaded).map(\.id))
+        loadError = nil
+
         do {
-            let buckets = try await client!.timeBuckets(filter)
-            sections = buckets.map { bucket in
-                TimelineSection(
-                    id: bucket.timeBucket,
-                    monthTitle: Self.monthTitle(for: bucket.timeBucket),
-                    count: bucket.count,
-                    days: nil
-                )
-            }
-            for id in previouslyLoaded.union(sections.prefix(1).map(\.id)) {
-                await loadBucket(id)
-            }
+            try await reloadSections(using: client)
         } catch {
             loadError = error.localizedDescription
         }
     }
 
-    func loadBucket(_ id: String) async {
+    private func reloadSections(using client: ImmichClient) async throws {
+        let buckets = try await client.timeBuckets(filter)
+        sections = buckets.map { bucket in
+            TimelineSection(
+                id: bucket.timeBucket,
+                monthTitle: Self.monthTitle(for: bucket.timeBucket),
+                count: bucket.count,
+                days: nil
+            )
+        }
+        rebuildRows()
+        if let first = sections.first { await loadBucket(first.id) }
+        startPrefetch()
+    }
+
+    func loadBucket(_ id: String, immediateRows: Bool = true) async {
         guard let client,
               let index = sections.firstIndex(where: { $0.id == id }),
               sections[index].days == nil,
@@ -100,12 +141,86 @@ final class TimelineModel {
             let assets = try await client.timeBucket(id, filter: filter)
             guard let current = sections.firstIndex(where: { $0.id == id }) else { return }
             sections[current].days = Self.groupByDay(assets)
+            if immediateRows {
+                rebuildRows()
+            } else {
+                scheduleRebuild()
+            }
         } catch {
             // leave the placeholder; a retry happens next time it scrolls into view.
         }
     }
 
-    /// applies an in-place mutation, used after favorite and archive actions.
+    /// loads every remaining bucket in the background so heights become exact
+    /// and the scrubber can jump anywhere without triggering churn.
+    private func startPrefetch() {
+        guard prefetchTask == nil else { return }
+        let bucketIDs = sections.filter { !$0.isLoaded }.map(\.id)
+        prefetchTask = Task { [weak self] in
+            for bucketID in bucketIDs {
+                guard !Task.isCancelled, let self else { return }
+                await self.loadBucket(bucketID, immediateRows: false)
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.rebuildRows()
+        }
+    }
+
+    // MARK: - rows
+
+    private func rebuildRows() {
+        var result: [TimelineRow] = []
+        var monthByRowID: [String: String] = [:]
+        result.reserveCapacity(rows.count + 16)
+
+        for section in sections {
+            let monthID = "m-\(section.id)"
+            result.append(.monthHeader(monthID, section.monthTitle))
+            monthByRowID[monthID] = section.monthTitle
+
+            if let days = section.days {
+                for day in days {
+                    let dayID = "d-\(section.id)-\(day.id)"
+                    result.append(.dayHeader(dayID, day.title, day.assets.map(\.id)))
+                    monthByRowID[dayID] = section.monthTitle
+
+                    var start = 0
+                    var rowIndex = 0
+                    while start < day.assets.count {
+                        let end = min(start + columns, day.assets.count)
+                        let tileID = "t-\(section.id)-\(day.id)-\(rowIndex)"
+                        result.append(.tiles(tileID, Array(day.assets[start..<end])))
+                        monthByRowID[tileID] = section.monthTitle
+                        start = end
+                        rowIndex += 1
+                    }
+                }
+            } else {
+                let tileRows = max(1, Int((Double(section.count) / Double(columns)).rounded(.up)))
+                let placeholderID = "p-\(section.id)"
+                result.append(.placeholder(placeholderID, section.id, tileRows))
+                monthByRowID[placeholderID] = section.monthTitle
+            }
+        }
+
+        rows = result
+        self.monthByRowID = monthByRowID
+    }
+
+    private func scheduleRebuild() {
+        guard !rebuildScheduled else { return }
+        rebuildScheduled = true
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self else { return }
+            rebuildScheduled = false
+            rebuildRows()
+        }
+    }
+
+    // MARK: - mutations
+
+    /// applies an in-place mutation, used after favorite actions.
     func updateAssets(ids: Set<String>, _ transform: (inout Asset) -> Void) {
         for s in sections.indices {
             guard var days = sections[s].days else { continue }
@@ -122,6 +237,7 @@ final class TimelineModel {
             }
             sections[s].days = days
         }
+        rebuildRows()
     }
 
     /// drops assets from the grid, used after trash, archive or delete.
@@ -135,6 +251,7 @@ final class TimelineModel {
             sections[s].days = filtered
         }
         sections.removeAll { $0.isLoaded && ($0.days?.isEmpty ?? false) }
+        rebuildRows()
     }
 
     // MARK: - grouping helpers

@@ -8,11 +8,7 @@ final class ImoraUITests: XCTestCase {
 
     @MainActor
     func testWalkthrough() throws {
-        let app = XCUIApplication()
-        app.launchEnvironment["IMORA_SERVER"] = "https://demo.immich.app"
-        app.launchEnvironment["IMORA_EMAIL"] = "demo@immich.app"
-        app.launchEnvironment["IMORA_PASSWORD"] = "demo"
-        app.launch()
+        let app = launchDemoApp()
 
         // timeline appears after auto login.
         XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
@@ -117,6 +113,49 @@ final class ImoraUITests: XCTestCase {
     }
 
     @MainActor
+    func testTimelineScrubberAndViewerDetails() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+        let tile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(tile.waitForExistence(timeout: 20), "no tiles loaded")
+
+        app.swipeUp(velocity: .fast)
+        let scrubber = app.descendants(matching: .any).matching(identifier: "timeline-scrubber").firstMatch
+        XCTAssertTrue(scrubber.waitForExistence(timeout: 3), "timeline scrubber did not appear")
+        scrubber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+            .press(forDuration: 0.1, thenDragTo: scrubber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)))
+        XCTAssertTrue(
+            app.descendants(matching: .any)
+                .matching(identifier: "timeline-scrubber-label")
+                .firstMatch
+                .waitForExistence(timeout: 1),
+            "timeline scrubber did not expose its date label"
+        )
+        snap("timeline-scrubber")
+
+        scrubber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+            .press(forDuration: 0.1, thenDragTo: scrubber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.05)))
+        let firstTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(firstTile.waitForExistence(timeout: 5), "first tile did not return")
+        XCTAssertTrue(firstTile.isHittable, "first tile was not hittable")
+        firstTile.tap()
+
+        let viewer = app.descendants(matching: .any).matching(identifier: "asset-viewer").firstMatch
+        XCTAssertTrue(viewer.waitForExistence(timeout: 5), "viewer did not open")
+        sleep(1)
+        snap("viewer-motion")
+        let info = app.descendants(matching: .any).matching(identifier: "viewer-info").firstMatch
+        XCTAssertTrue(info.waitForExistence(timeout: 3), "info button did not appear")
+        info.tap()
+
+        let details = app.descendants(matching: .any).matching(identifier: "asset-details").firstMatch
+        XCTAssertTrue(details.waitForExistence(timeout: 5), "asset details did not appear")
+        XCTAssertTrue(app.staticTexts["Details"].exists, "technical details were not shown")
+        snap("asset-details")
+    }
+
+    @MainActor
     func testOAuthLoginReachesIdentityProvider() throws {
         let app = XCUIApplication()
         app.launchEnvironment["IMORA_SERVER"] = "https://photos.vexcited.com"
@@ -150,6 +189,16 @@ final class ImoraUITests: XCTestCase {
             sleep(4)
             snap("oauth-after-continue")
         }
+    }
+
+    @MainActor
+    private func launchDemoApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["IMORA_SERVER"] = "https://demo.immich.app"
+        app.launchEnvironment["IMORA_EMAIL"] = "demo@immich.app"
+        app.launchEnvironment["IMORA_PASSWORD"] = "demo"
+        app.launch()
+        return app
     }
 
     @MainActor

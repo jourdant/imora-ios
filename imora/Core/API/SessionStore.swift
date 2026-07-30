@@ -14,6 +14,7 @@ final class SessionStore {
     private(set) var client: ImmichClient?
     private(set) var user: CurrentUser?
     private(set) var features: ServerFeatures?
+    var preferences: UserPreferences?
 
     private static let serverKey = "imora.serverURL"
     private static let tokenKey = "accessToken"
@@ -62,8 +63,12 @@ final class SessionStore {
 
     func refreshUser() async {
         guard let client else { return }
-        if let user = try? await client.currentUser() { self.user = user }
-        if let features = try? await client.serverFeatures() { self.features = features }
+        async let userTask = try? client.currentUser()
+        async let featuresTask = try? client.serverFeatures()
+        async let preferencesTask = try? client.preferences()
+        if let user = await userTask { self.user = user }
+        if let features = await featuresTask { self.features = features }
+        if let preferences = await preferencesTask { self.preferences = preferences }
     }
 
     private func adopt(client: ImmichClient, user: CurrentUser?) {
