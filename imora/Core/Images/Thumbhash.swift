@@ -3,7 +3,12 @@ import UIKit
 /// decodes immich thumbhash strings into tiny placeholder images.
 /// port of the reference thumbhash implementation.
 nonisolated enum Thumbhash {
+    private static var isCancelled: Bool {
+        withUnsafeCurrentTask { $0?.isCancelled ?? false }
+    }
+
     static func image(fromBase64 base64: String) -> UIImage? {
+        guard !isCancelled else { return nil }
         var normalized = base64.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         while normalized.count % 4 != 0 { normalized.append("=") }
         guard let data = Data(base64Encoded: normalized) else { return nil }
@@ -61,6 +66,7 @@ nonisolated enum Thumbhash {
 
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for y in 0..<height {
+            guard !isCancelled else { return nil }
             for x in 0..<width {
                 var fx = [Double](repeating: 0, count: max(lx, hasAlpha ? 5 : 3))
                 var fy = [Double](repeating: 0, count: max(ly, hasAlpha ? 5 : 3))

@@ -4,10 +4,12 @@ import SwiftUI
 struct MemoryLane: View {
     @Environment(SessionStore.self) private var session
     @State private var memories: [Memory] = []
-    @State private var viewer: ViewerContext?
+    @State private var viewer = ViewerPresentation()
     @Namespace private var zoomNamespace
 
     var body: some View {
+        @Bindable var viewer = viewer
+
         if session.preferences?.memoriesEnabled == false {
             Color.clear.frame(height: 0)
         } else if !memories.isEmpty {
@@ -26,19 +28,23 @@ struct MemoryLane: View {
                                     memoryCard(memory, cover: first)
                                         .matchedTransitionSource(id: first.id, in: zoomNamespace)
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(PressableCardStyle())
                             }
                         }
                     }
-                    .padding(.horizontal, 16)
+                    .scrollTargetLayout()
                 }
+                .contentMargins(.horizontal, 16, for: .scrollContent)
+                .scrollTargetBehavior(.viewAligned)
             }
             .padding(.top, 4)
-            .navigationDestination(item: $viewer) { context in
+            .fullScreenCover(item: $viewer.route) { route in
                 AssetViewerScreen(
-                    assets: context.assets,
-                    initialIndex: context.index,
-                    zoomNamespace: zoomNamespace
+                    assets: route.assets,
+                    initialIndex: route.initialIndex,
+                    presentationID: route.id,
+                    zoomNamespace: zoomNamespace,
+                    onDismissed: { viewer.complete(route.id) }
                 ) { _ in }
             }
         } else {
@@ -83,7 +89,7 @@ struct MemoryLane: View {
     private func openMemory(_ memory: Memory) {
         let assets = memory.assets.map { $0.asAsset() }
         guard !assets.isEmpty else { return }
-        viewer = ViewerContext(assets: assets, index: 0)
+        viewer.present(assets: assets, initialIndex: 0)
     }
 
     private func load() async {

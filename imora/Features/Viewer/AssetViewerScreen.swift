@@ -14,28 +14,38 @@ struct AssetViewerScreen: View {
     @Environment(SessionStore.self) private var session
 
     let onChange: (AssetChange) -> Void
+    let onDismissed: () -> Void
+    let presentationID: UUID
     let zoomNamespace: Namespace.ID?
 
     @State private var assets: [Asset]
     @State private var currentIndex: Int
+    @State private var selectedAssetID: String?
     @State private var chromeVisible = true
     @State private var showInfo = false
-    @State private var dragOffset: CGFloat = 0
     @State private var currentPageZoomed = false
     /// device copy of the current asset, when the backup index proves one exists.
     @State private var localIdentifier: String?
     @State private var downloading = false
     @State private var actionError: String?
+    @State private var isDismissing = false
+    @State private var didNotifyDismissal = false
 
     init(
         assets: [Asset],
         initialIndex: Int,
+        presentationID: UUID,
         zoomNamespace: Namespace.ID? = nil,
+        onDismissed: @escaping () -> Void,
         onChange: @escaping (AssetChange) -> Void
     ) {
+        let safeIndex = assets.indices.contains(initialIndex) ? initialIndex : 0
         _assets = State(initialValue: assets)
-        _currentIndex = State(initialValue: initialIndex)
+        _currentIndex = State(initialValue: safeIndex)
+        _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
+        self.presentationID = presentationID
         self.zoomNamespace = zoomNamespace
+        self.onDismissed = onDismissed
         self.onChange = onChange
     }
 
@@ -43,38 +53,43 @@ struct AssetViewerScreen: View {
         assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
     }
 
+    private var loadedPageIDs: Set<String> {
+        guard assets.indices.contains(currentIndex) else { return [] }
+        let lower = max(0, currentIndex - 1)
+        let upper = min(assets.count - 1, currentIndex + 1)
+        return Set(assets[lower...upper].map(\.id))
+    }
+
     @ViewBuilder var body: some View {
         // zooming out targets the currently paged asset's tile when visible.
         if let zoomNamespace, !reduceMotion {
-            core.navigationTransition(.zoom(sourceID: current?.id ?? "", in: zoomNamespace))
-        } else {
             core
+                .id(presentationID)
+                .navigationTransition(.zoom(sourceID: current?.id ?? "", in: zoomNamespace))
+        } else {
+            core.id(presentationID)
         }
     }
 
     private var core: some View {
         ZStack {
             Color.black
-                .opacity(1 - Double(min(abs(dragOffset) / 600, 0.6)))
                 .ignoresSafeArea()
                 .accessibilityIdentifier("asset-viewer")
+                // lets ui tests confirm the pager landed on the tapped asset.
+                .accessibilityValue(selectedAssetID ?? "")
 
-            TabView(selection: $currentIndex) {
-                ForEach(assets.indices, id: \.self) { index in
-                    AssetPage(
-                        asset: assets[index],
-                        isActive: index == currentIndex
-                    ) { isZoomed in
-                        guard index == currentIndex else { return }
-                        currentPageZoomed = isZoomed
-                    }
-                    .tag(index)
-                }
+            // the pager lives in its own child view so per frame chrome and
+            // dismissal state changes in this screen never re-diff the pages.
+            AssetPager(
+                assets: assets,
+                loadedIDs: loadedPageIDs,
+                selection: $selectedAssetID
+            ) { id, isZoomed in
+                guard id == selectedAssetID else { return }
+                currentPageZoomed = isZoomed
             }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            .offset(y: dragOffset)
-            .scaleEffect(1 - min(abs(dragOffset) / 2000, 0.15))
-            .simultaneousGesture(dismissDrag)
+            .ignoresSafeArea()
             .onTapGesture {
                 withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
                     chromeVisible.toggle()
@@ -86,11 +101,17 @@ struct AssetViewerScreen: View {
             }
         }
         .statusBarHidden(!chromeVisible)
-        .toolbar(.hidden, for: .navigationBar)
-        .toolbar(.hidden, for: .tabBar)
-        .onChange(of: currentIndex) { _, _ in
+        .allowsHitTesting(!isDismissing)
+        .onChange(of: selectedAssetID) { _, id in
+            guard let id, let index = assets.firstIndex(where: { $0.id == id }) else { return }
+            currentIndex = index
             currentPageZoomed = false
-            dragOffset = 0
+        }
+        .onDisappear {
+            guard !didNotifyDismissal else { return }
+            didNotifyDismissal = true
+            currentPageZoomed = false
+            onDismissed()
         }
         .sheet(isPresented: $showInfo) {
             if let current {
@@ -104,7 +125,9 @@ struct AssetViewerScreen: View {
         .task(id: current?.id) {
             localIdentifier = nil
             guard let asset = current, let backup = session.backup else { return }
-            localIdentifier = await backup.localIdentifier(forRemote: asset.id)
+            let identifier = await backup.localIdentifier(forRemote: asset.id)
+            guard !Task.isCancelled, current?.id == asset.id else { return }
+            localIdentifier = identifier
         }
         .alert(
             actionError ?? "",
@@ -123,7 +146,7 @@ struct AssetViewerScreen: View {
         VStack {
             HStack {
                 Button {
-                    dismiss()
+                    requestDismissal()
                 } label: {
                     viewerButtonLabel("chevron.backward")
                 }
@@ -188,9 +211,17 @@ struct AssetViewerScreen: View {
 
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
-                    chromeButton(current?.isFavorite == true ? "heart.fill" : "heart") {
+                    Button {
                         Task { await toggleFavorite() }
+                    } label: {
+                        Image(systemName: current?.isFavorite == true ? "heart.fill" : "heart")
+                            .contentTransition(.symbolEffect(.replace))
+                            .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: current?.isFavorite == true)
+                            .font(.system(size: 15, weight: .semibold))
+                            .frame(width: 34, height: 34)
+                            .glassEffect(.clear.interactive(), in: .circle)
                     }
+                    .viewerControl()
                     .tint(current?.isFavorite == true ? .red : nil)
 
                     chromeButton("info.circle") { showInfo = true }
@@ -230,30 +261,13 @@ struct AssetViewerScreen: View {
             .glassEffect(.clear.interactive(), in: .circle)
     }
 
-    // MARK: - gestures
-
-    private var dismissDrag: some Gesture {
-        DragGesture(minimumDistance: 12)
-            .onChanged { value in
-                guard !currentPageZoomed,
-                      value.translation.height > 0,
-                      value.translation.height > abs(value.translation.width) * 1.15
-                else { return }
-                dragOffset = value.translation.height
-            }
-            .onEnded { value in
-                guard dragOffset > 0 else { return }
-                if dragOffset > 110 || value.predictedEndTranslation.height > 360 {
-                    dismiss()
-                } else {
-                    withAnimation(reduceMotion ? .linear(duration: 0.12) : .spring(duration: 0.28, bounce: 0.16)) {
-                        dragOffset = 0
-                    }
-                }
-            }
-    }
-
     // MARK: - actions
+
+    private func requestDismissal() {
+        guard !isDismissing else { return }
+        isDismissing = true
+        dismiss()
+    }
 
     private func toggleFavorite() async {
         guard let client = session.client, let asset = current else { return }
@@ -334,9 +348,10 @@ struct AssetViewerScreen: View {
         guard assets.indices.contains(currentIndex) else { return }
         assets.remove(at: currentIndex)
         if assets.isEmpty {
-            dismiss()
-        } else if currentIndex >= assets.count {
-            currentIndex = assets.count - 1
+            requestDismissal()
+        } else {
+            currentIndex = min(currentIndex, assets.count - 1)
+            selectedAssetID = assets[currentIndex].id
         }
     }
 }
@@ -349,24 +364,71 @@ private extension View {
     }
 }
 
+// MARK: - pager
+
+/// lazy horizontal pager. lazyhstack only materializes pages near the
+/// viewport, so opening and closing the viewer costs o(visible) instead of
+/// o(library) like the page style tabview, which froze the zoom transition.
+private struct AssetPager: View {
+    let assets: [Asset]
+    let loadedIDs: Set<String>
+    @Binding var selection: String?
+    let onZoomChanged: (String, Bool) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 0) {
+                ForEach(assets) { asset in
+                    AssetPage(
+                        asset: asset,
+                        isActive: asset.id == selection,
+                        shouldLoad: loadedIDs.contains(asset.id)
+                    ) { isZoomed in
+                        onZoomChanged(asset.id, isZoomed)
+                    }
+                    .containerRelativeFrame([.horizontal, .vertical])
+                }
+            }
+            .scrollTargetLayout()
+        }
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $selection)
+        .scrollIndicators(.hidden)
+    }
+}
+
 // MARK: - single page
 
 private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
+    let shouldLoad: Bool
     let onZoomChanged: (Bool) -> Void
 
     var body: some View {
+        // stable single container so the pager keeps this page's identity
+        // while heavy content mounts and unmounts with the load window. kept
+        // transparent so the screen backdrop still fades during drag dismiss.
+        ZStack {
+            Color.clear
+            if shouldLoad {
+                pageContent
+            }
+        }
+    }
+
+    @ViewBuilder private var pageContent: some View {
         if asset.isVideo {
             VideoPage(asset: asset, isActive: isActive)
         } else if let client = session.client {
-            ZoomableScrollView(onZoomChanged: onZoomChanged) {
+            ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
                 RemoteImage(
                     url: client.thumbnailURL(assetID: asset.id, size: "preview"),
                     targetPixelSize: 2048,
                     thumbhash: asset.thumbhash,
                     fallbackURL: client.thumbnailURL(assetID: asset.id),
+                    fallbackTargetPixelSize: 640,
                     contentMode: .fit
                 )
             }
@@ -388,9 +450,9 @@ private struct VideoPage: View {
                 ProgressView().tint(.white)
             }
         }
-        .task(id: isActive) {
+        .task(id: "\(asset.id):\(isActive)") {
             guard isActive else {
-                player?.pause()
+                tearDownPlayer()
                 return
             }
             if player == nil, let client = session.client {
@@ -402,13 +464,20 @@ private struct VideoPage: View {
             }
             player?.play()
         }
-        .onDisappear { player?.pause() }
+        .onDisappear { tearDownPlayer() }
+    }
+
+    private func tearDownPlayer() {
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
     }
 }
 
 // MARK: - zoom container
 
 private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
+    let contentID: String
     let onZoomChanged: (Bool) -> Void
     @ViewBuilder let content: Content
 
@@ -446,22 +515,40 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        context.coordinator.hostingController.rootView = content
         context.coordinator.onZoomChanged = onZoomChanged
+        guard context.coordinator.contentID != contentID else { return }
+        context.coordinator.contentID = contentID
+        context.coordinator.hostingController.rootView = content
+        context.coordinator.resetZoomReporting()
+        scrollView.setZoomScale(scrollView.minimumZoomScale, animated: false)
+    }
+
+    static func dismantleUIView(_ scrollView: UIScrollView, coordinator: Coordinator) {
+        scrollView.delegate = nil
+        coordinator.onZoomChanged = { _ in }
+        coordinator.hostingController.view.removeFromSuperview()
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(content: content, onZoomChanged: onZoomChanged)
+        Coordinator(contentID: contentID, content: content, onZoomChanged: onZoomChanged)
     }
 
+    @MainActor
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let hostingController: UIHostingController<Content>
+        var contentID: String
         var onZoomChanged: (Bool) -> Void
         private var lastReportedZoomed = false
 
-        init(content: Content, onZoomChanged: @escaping (Bool) -> Void) {
+        init(contentID: String, content: Content, onZoomChanged: @escaping (Bool) -> Void) {
+            self.contentID = contentID
             hostingController = UIHostingController(rootView: content)
             self.onZoomChanged = onZoomChanged
+        }
+
+        func resetZoomReporting() {
+            lastReportedZoomed = false
+            onZoomChanged(false)
         }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {

@@ -7,30 +7,44 @@ struct RemoteImage: View {
     let url: URL
     var targetPixelSize: CGFloat = 320
     var thumbhash: String?
+    var fallbackURL: URL?
+    var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
+    /// reports loaded, fallback, placeholder or empty so hosts can expose the
+    /// state to ui tests without altering this view's accessibility tree.
+    var onPhaseChange: ((String) -> Void)?
 
-    private let fallbackImage: UIImage?
-    @State private var image: UIImage?
-    @State private var placeholder: UIImage?
+    @State private var image: KeyedImage?
+    @State private var placeholder: KeyedImage?
 
-    init(
-        url: URL,
-        targetPixelSize: CGFloat = 320,
-        thumbhash: String? = nil,
-        fallbackURL: URL? = nil,
-        contentMode: ContentMode = .fill
-    ) {
-        self.url = url
-        self.targetPixelSize = targetPixelSize
-        self.thumbhash = thumbhash
-        self.contentMode = contentMode
-        fallbackImage = fallbackURL.flatMap { ImageLoader.shared.cachedImage(for: $0) }
-        _image = State(initialValue: ImageLoader.shared.cachedImage(for: url))
+    private struct KeyedImage {
+        let key: String
+        let image: UIImage
+    }
+
+    private var requestKey: String {
+        ImageLoader.shared.requestKey(for: url, targetPixelSize: targetPixelSize)
+    }
+
+    private var taskID: String {
+        "\(requestKey)|\(thumbhash ?? "")"
     }
 
     var body: some View {
+        let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
+        let loaded = image?.key == requestKey ? image?.image : cached
+        let fallback = fallbackURL.flatMap {
+            ImageLoader.shared.cachedImage(
+                for: $0,
+                targetPixelSize: fallbackTargetPixelSize ?? targetPixelSize
+            )
+        }
+        let decodedPlaceholder = placeholder?.key == requestKey ? placeholder?.image : nil
+        let displayImage = loaded ?? fallback ?? decodedPlaceholder
+        let phase = loaded != nil ? "loaded" : fallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
+
         ZStack {
-            if let displayImage = image ?? fallbackImage ?? placeholder {
+            if let displayImage {
                 Image(uiImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
@@ -38,27 +52,42 @@ struct RemoteImage: View {
                 Color(.secondarySystemFill)
             }
         }
-        .task(id: url) {
-            guard image == nil else { return }
-            let start = ContinuousClock.now
-
-            if let thumbhash, placeholder == nil {
-                placeholder = await Task.detached(priority: .utility) {
-                    Thumbhash.image(fromBase64: thumbhash)
-                }.value
+        .onChange(of: phase, initial: true) { _, newPhase in
+            onPhaseChange?(newPhase)
+        }
+        .task(id: taskID) {
+            if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
+                image = KeyedImage(key: requestKey, image: cached)
+                return
             }
-            guard image == nil, !Task.isCancelled else { return }
 
-            let target = targetPixelSize
-            let loaded = try? await Task.detached(priority: .userInitiated) { [url] in
-                try await ImageLoader.shared.image(for: url, targetPixelSize: target)
-            }.value
+            let key = requestKey
+            let start = ContinuousClock.now
+            if let thumbhash, placeholder?.key != key {
+                let decodeTask = Task.detached(priority: .utility) {
+                    Thumbhash.image(fromBase64: thumbhash)
+                }
+                let decoded = await withTaskCancellationHandler {
+                    await decodeTask.value
+                } onCancel: {
+                    decodeTask.cancel()
+                }
+                guard !Task.isCancelled, let decoded else { return }
+                placeholder = KeyedImage(key: key, image: decoded)
+            }
+
+            guard !Task.isCancelled else { return }
+            let loaded = try? await ImageLoader.shared.image(
+                for: url,
+                targetPixelSize: targetPixelSize
+            )
             guard !Task.isCancelled, let loaded else { return }
+            let keyed = KeyedImage(key: key, image: loaded)
 
             if ContinuousClock.now - start < .milliseconds(120) {
-                image = loaded
+                image = keyed
             } else {
-                withAnimation(.easeIn(duration: 0.15)) { image = loaded }
+                withAnimation(.easeIn(duration: 0.15)) { image = keyed }
             }
         }
     }
@@ -69,6 +98,8 @@ struct AssetTile: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
 
+    @State private var thumbnailPhase = "empty"
+
     var body: some View {
         Color.clear
             .aspectRatio(1, contentMode: .fit)
@@ -77,7 +108,8 @@ struct AssetTile: View {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id),
                         targetPixelSize: 640,
-                        thumbhash: asset.thumbhash
+                        thumbhash: asset.thumbhash,
+                        onPhaseChange: { thumbnailPhase = $0 }
                     )
                 }
             }
@@ -104,5 +136,8 @@ struct AssetTile: View {
             }
             .contentShape(.rect)
             .accessibilityIdentifier("asset-tile")
+            // "assetid|phase" lets ui tests target one tile and observe its
+            // thumbnail state at the same time.
+            .accessibilityValue("\(asset.id)|\(thumbnailPhase)")
     }
 }

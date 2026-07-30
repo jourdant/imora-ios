@@ -138,7 +138,11 @@ final class ImoraUITests: XCTestCase {
             .press(forDuration: 0.1, thenDragTo: scrubber.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.05)))
         let firstTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
         XCTAssertTrue(firstTile.waitForExistence(timeout: 5), "first tile did not return")
-        XCTAssertTrue(firstTile.isHittable, "first tile was not hittable")
+        let hittable = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"),
+            object: firstTile
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [hittable], timeout: 3), .completed, "first tile was not hittable")
         firstTile.tap()
 
         let viewer = app.descendants(matching: .any).matching(identifier: "asset-viewer").firstMatch
@@ -151,8 +155,122 @@ final class ImoraUITests: XCTestCase {
 
         let details = app.descendants(matching: .any).matching(identifier: "asset-details").firstMatch
         XCTAssertTrue(details.waitForExistence(timeout: 5), "asset details did not appear")
-        XCTAssertTrue(app.staticTexts["Details"].exists, "technical details were not shown")
+        XCTAssertTrue(app.staticTexts["Details"].waitForExistence(timeout: 5), "technical details were not shown")
         snap("asset-details")
+    }
+
+    @MainActor
+    func testRapidViewerReopenRestoresChromeAndThumbnail() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+        let firstTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(firstTile.waitForExistence(timeout: 20), "no tiles loaded")
+        guard let firstValue = firstTile.value as? String,
+              let assetID = firstValue.split(separator: "|").first.map(String.init),
+              !assetID.isEmpty
+        else {
+            XCTFail("first tile did not expose its asset id")
+            return
+        }
+
+        // tiles expose "assetid|phase" so one query pins the tile and reads
+        // its thumbnail state.
+        func tileForAsset() -> XCUIElement {
+            app.descendants(matching: .any)
+                .matching(identifier: "asset-tile")
+                .matching(NSPredicate(format: "value BEGINSWITH %@", "\(assetID)|"))
+                .firstMatch
+        }
+
+        XCTAssertTrue(waitForValue("\(assetID)|loaded", on: tileForAsset(), timeout: 10), "thumbnail did not finish loading")
+
+        for _ in 0..<5 {
+            let tile = tileForAsset()
+            XCTAssertTrue(tile.exists && tile.isHittable, "source tile was not immediately available")
+            tile.tap()
+
+            let viewer = app.descendants(matching: .any)["asset-viewer"]
+            XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not open")
+            XCTAssertEqual(viewer.value as? String, assetID, "viewer did not open on the tapped asset")
+            let close = app.descendants(matching: .any)["viewer-close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 2), "viewer close button did not appear")
+            close.tap()
+
+            XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close")
+            XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 2), "photos navigation bar did not return")
+            XCTAssertTrue(app.descendants(matching: .any)["profile-avatar"].waitForExistence(timeout: 2), "profile avatar did not return")
+            XCTAssertTrue(app.tabBars.firstMatch.waitForExistence(timeout: 2), "tab bar did not return")
+
+            let tileAfterClose = tileForAsset()
+            XCTAssertTrue(tileAfterClose.waitForExistence(timeout: 2), "tile disappeared after viewer dismissal")
+            XCTAssertEqual(tileAfterClose.value as? String, "\(assetID)|loaded", "thumbnail returned to a placeholder")
+        }
+
+        // burst: reopen immediately after each close with no settling waits,
+        // the way an impatient thumb does it.
+        for round in 0..<3 {
+            let tile = tileForAsset()
+            XCTAssertTrue(tile.waitForExistence(timeout: 3), "tile missing in burst round \(round)")
+            tile.tap()
+            let viewer = app.descendants(matching: .any)["asset-viewer"]
+            XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not open in burst round \(round)")
+            let close = app.descendants(matching: .any)["viewer-close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 2), "close missing in burst round \(round)")
+            close.tap()
+        }
+        XCTAssertTrue(waitForDisappearance(app.descendants(matching: .any)["asset-viewer"], timeout: 3), "viewer did not close after burst")
+
+        tileForAsset().tap()
+        let viewer = app.descendants(matching: .any)["asset-viewer"]
+        XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not reopen")
+        viewer.tap()
+        // the system zoom transition provides the pull down dismissal.
+        viewer.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+            .press(forDuration: 0.05, thenDragTo: viewer.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)))
+        if !waitForDisappearance(viewer, timeout: 3) {
+            // fall back to the close button when the synthesized gesture does
+            // not engage the system dismissal in the simulator.
+            viewer.tap()
+            let close = app.descendants(matching: .any)["viewer-close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 2), "chrome did not return for fallback close")
+            close.tap()
+            XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close")
+        }
+
+        let reopenedTile = tileForAsset()
+        XCTAssertTrue(reopenedTile.waitForExistence(timeout: 2) && reopenedTile.isHittable, "tile was not available after drag dismissal")
+        reopenedTile.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["viewer-close"].waitForExistence(timeout: 2), "viewer chrome stayed hidden after reopening")
+        XCTAssertTrue(app.descendants(matching: .any)["viewer-info"].waitForExistence(timeout: 2), "viewer info stayed hidden after reopening")
+    }
+
+    @MainActor
+    func testViewerPagingRendersAdjacentPhotos() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+        let tile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(tile.waitForExistence(timeout: 20), "no tiles loaded")
+        tile.tap()
+
+        let viewer = app.descendants(matching: .any)["asset-viewer"]
+        XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not open")
+        sleep(2)
+
+        for step in 1...3 {
+            viewer.swipeLeft()
+            sleep(2)
+            snap("viewer-page-\(step)")
+        }
+        viewer.swipeRight()
+        sleep(2)
+        snap("viewer-page-back")
+
+        let close = app.descendants(matching: .any)["viewer-close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 2), "close button missing after paging")
+        close.tap()
+        XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close after paging")
     }
 
     @MainActor
@@ -189,6 +307,20 @@ final class ImoraUITests: XCTestCase {
             sleep(4)
             snap("oauth-after-continue")
         }
+    }
+
+    @MainActor
+    private func waitForValue(_ value: String, on element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate(format: "value == %@", value)
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForDisappearance(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate(format: "exists == false")
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
     @MainActor

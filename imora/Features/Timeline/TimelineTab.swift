@@ -19,6 +19,7 @@ struct TimelineTab: View {
                     } label: {
                         ProfileAvatar(size: 30)
                     }
+                    .accessibilityIdentifier("profile-avatar")
                 }
             }
             .sheet(isPresented: $showSettings) {

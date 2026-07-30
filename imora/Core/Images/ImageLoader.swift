@@ -52,24 +52,34 @@ nonisolated final class ImageLoader: @unchecked Sendable {
         store.replace(Self.makeSession(headers: headers))
     }
 
-    func cachedImage(for url: URL) -> UIImage? {
-        memory.object(forKey: url.absoluteString as NSString)
+    func requestKey(for url: URL, targetPixelSize: CGFloat) -> String {
+        "\(url.absoluteString)#\(Self.normalizedPixelSize(targetPixelSize))"
+    }
+
+    func cachedImage(for url: URL, targetPixelSize: CGFloat) -> UIImage? {
+        memory.object(forKey: requestKey(for: url, targetPixelSize: targetPixelSize) as NSString)
     }
 
     func image(for url: URL, targetPixelSize: CGFloat) async throws -> UIImage {
-        let key = url.absoluteString as NSString
+        let key = requestKey(for: url, targetPixelSize: targetPixelSize) as NSString
         if let cached = memory.object(forKey: key) { return cached }
 
         let (data, response) = try await store.session.data(from: url)
+        try Task.checkCancellation()
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw ImmichError.http(http.statusCode, "")
         }
         guard let image = Self.downsample(data: data, targetPixelSize: targetPixelSize) else {
             throw ImmichError.decoding("not an image")
         }
+        try Task.checkCancellation()
         let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
         memory.setObject(image, forKey: key, cost: cost)
         return image
+    }
+
+    private static func normalizedPixelSize(_ value: CGFloat) -> Int {
+        max(1, Int(value.rounded(.up)))
     }
 
     /// decodes at reduced resolution to keep memory flat while scrolling.

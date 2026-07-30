@@ -10,12 +10,14 @@ struct SearchTab: View {
     @State private var nextPage: Int?
     @State private var people: [Person] = []
     @State private var places: [ExploreResponse] = []
-    @State private var viewer: ViewerContext?
+    @State private var viewer = ViewerPresentation()
     @Namespace private var zoomNamespace
 
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
     var body: some View {
+        @Bindable var viewer = viewer
+
         NavigationStack {
             ScrollView {
                 if hasSearched {
@@ -43,8 +45,14 @@ struct SearchTab: View {
                 PlaceScreen(city: place.city)
             }
             .task { await loadDiscover() }
-            .navigationDestination(item: $viewer) { context in
-                AssetViewerScreen(assets: context.assets, initialIndex: context.index, zoomNamespace: zoomNamespace) { change in
+            .fullScreenCover(item: $viewer.route) { route in
+                AssetViewerScreen(
+                    assets: route.assets,
+                    initialIndex: route.initialIndex,
+                    presentationID: route.id,
+                    zoomNamespace: zoomNamespace,
+                    onDismissed: { viewer.complete(route.id) }
+                ) { change in
                     if case .removed(let id) = change {
                         results.removeAll { $0.id == id }
                     }
@@ -69,7 +77,7 @@ struct SearchTab: View {
                     AssetTile(asset: asset)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture {
-                            viewer = ViewerContext(assets: results, index: index)
+                            viewer.present(assets: results, initialIndex: index)
                         }
                         .onAppear {
                             if index >= results.count - 12, nextPage != nil, !isSearching {
@@ -257,19 +265,21 @@ struct PlaceScreen: View {
 
     @State private var assets: [Asset] = []
     @State private var isLoading = true
-    @State private var viewer: ViewerContext?
+    @State private var viewer = ViewerPresentation()
     @Namespace private var zoomNamespace
 
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
     var body: some View {
+        @Bindable var viewer = viewer
+
         ScrollView {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
                     AssetTile(asset: asset)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture {
-                            viewer = ViewerContext(assets: assets, index: index)
+                            viewer.present(assets: assets, initialIndex: index)
                         }
                 }
             }
@@ -293,8 +303,14 @@ struct PlaceScreen: View {
             }
             isLoading = false
         }
-        .navigationDestination(item: $viewer) { context in
-            AssetViewerScreen(assets: context.assets, initialIndex: context.index, zoomNamespace: zoomNamespace) { change in
+        .fullScreenCover(item: $viewer.route) { route in
+            AssetViewerScreen(
+                assets: route.assets,
+                initialIndex: route.initialIndex,
+                presentationID: route.id,
+                zoomNamespace: zoomNamespace,
+                onDismissed: { viewer.complete(route.id) }
+            ) { change in
                 if case .removed(let id) = change {
                     assets.removeAll { $0.id == id }
                 }

@@ -40,7 +40,7 @@ struct AlbumsTab: View {
                             NavigationLink(value: album) {
                                 AlbumCard(album: album)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(PressableCardStyle())
                         }
                     }
                     .padding(.horizontal, 16)

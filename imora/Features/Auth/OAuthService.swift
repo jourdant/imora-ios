@@ -100,6 +100,13 @@ final class OAuthService: NSObject, ASWebAuthenticationPresentationContextProvid
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let windows = scenes.flatMap(\.windows)
-        return windows.first(where: \.isKeyWindow) ?? windows.first ?? ASPresentationAnchor()
+        if let window = windows.first(where: \.isKeyWindow) ?? windows.first {
+            return window
+        }
+        if let scene = scenes.first {
+            return ASPresentationAnchor(windowScene: scene)
+        }
+        // oauth is only started from on screen ui, so a scene always exists.
+        preconditionFailure("no window scene available for oauth presentation")
     }
 }

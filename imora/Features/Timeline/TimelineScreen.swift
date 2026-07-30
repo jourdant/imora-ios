@@ -1,22 +1,26 @@
 import SwiftUI
 
-nonisolated struct ViewerContext: Identifiable, Hashable {
-    let assets: [Asset]
-    let index: Int
-    var id: String { assets[index].id }
-
-    static func == (lhs: ViewerContext, rhs: ViewerContext) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
 private struct TimelineScrollState: Equatable {
     let fraction: CGFloat
     let scrollableHeight: CGFloat
+}
+
+/// scroll-driven values live here instead of screen @state so per-frame
+/// updates only re-render the scrubber overlay, never the whole grid body.
+@Observable @MainActor
+private final class ScrubberState {
+    var fraction: CGFloat = 0
+    var scrollableHeight: CGFloat = 0
+    var visibleMonth: String?
+    var isScrubbing = false
+
+    func update(with state: TimelineScrollState) {
+        if scrollableHeight != state.scrollableHeight {
+            scrollableHeight = state.scrollableHeight
+        }
+        guard !isScrubbing, fraction != state.fraction else { return }
+        fraction = state.fraction
+    }
 }
 
 /// reusable bucketed photo grid, the workhorse behind most screens.
@@ -34,13 +38,13 @@ struct TimelineScreen<Header: View>: View {
     @State private var model: TimelineModel
     @State private var selection = Set<String>()
     @State private var isSelecting = false
-    @State private var viewer: ViewerContext?
+    @State private var viewer = ViewerPresentation()
     @State private var scrubberVisible = false
+    /// stays true a little longer than the fade so a finger reaching for the
+    /// thumb still grabs it instead of scrolling the grid underneath.
+    @State private var scrubberGrabbable = false
     @State private var scrubberHideTask: Task<Void, Never>?
-    @State private var isScrubbing = false
-    @State private var scrollFraction: CGFloat = 0
-    @State private var scrollableHeight: CGFloat = 0
-    @State private var visibleMonth: String?
+    @State private var scrub = ScrubberState()
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
     @State private var columnCount = 3
@@ -68,7 +72,17 @@ struct TimelineScreen<Header: View>: View {
         (width - CGFloat(columnCount - 1) * 2) / CGFloat(columnCount)
     }
 
+    /// pads the scroll bottom so the last month header can reach the top of
+    /// the viewport. without it a short final month is unreachable by the
+    /// scrubber because the scroll stops at the previous month.
+    private func endPadding(side: CGFloat, viewportHeight: CGFloat) -> CGFloat {
+        guard model.contentHeight(tileSide: side) > viewportHeight else { return 0 }
+        return max(0, (viewportHeight - model.tailHeight(tileSide: side)).rounded())
+    }
+
     var body: some View {
+        @Bindable var viewer = viewer
+
         GeometryReader { geometry in
             let side = tileSide(for: geometry.size.width)
 
@@ -82,12 +96,18 @@ struct TimelineScreen<Header: View>: View {
                     }
                 }
                 .scrollTargetLayout()
-                .padding(.bottom, isSelecting ? 90 : 0)
+                .padding(.bottom, (isSelecting ? 90 : 0) + endPadding(side: side, viewportHeight: geometry.size.height))
             }
             .scrollPosition($scrollPosition)
             .scrollIndicators(.hidden)
             .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
-                visibleMonth = rowIDs.first.flatMap { model.monthByRowID[$0] }
+                let month = rowIDs.first.flatMap { model.monthByRowID[$0] }
+                guard month != scrub.visibleMonth else { return }
+                // deferred one tick so the write never lands in the same
+                // frame as the scroll pass that produced it.
+                Task { @MainActor in
+                    if month != scrub.visibleMonth { scrub.visibleMonth = month }
+                }
             }
             .simultaneousGesture(
                 pinchGesture(
@@ -96,7 +116,8 @@ struct TimelineScreen<Header: View>: View {
                 )
             )
             .onScrollGeometryChange(for: TimelineScrollState.self) { scroll in
-                let scrollable = max(0, scroll.contentSize.height - scroll.containerSize.height)
+                // rounded so sub point layout noise dedupes to equal states.
+                let scrollable = max(0, (scroll.contentSize.height - scroll.containerSize.height).rounded())
                 let rawFraction = scrollable > 0 ? scroll.contentOffset.y / scrollable : 0
                 let fraction = (min(1, max(0, rawFraction)) * 1_000).rounded() / 1_000
                 return TimelineScrollState(
@@ -104,9 +125,7 @@ struct TimelineScreen<Header: View>: View {
                     scrollableHeight: scrollable
                 )
             } action: { _, state in
-                scrollableHeight = state.scrollableHeight
-                guard !isScrubbing else { return }
-                scrollFraction = state.fraction
+                scrub.update(with: state)
             }
             .onScrollPhaseChange { _, newPhase in
                 if newPhase == .idle {
@@ -115,27 +134,24 @@ struct TimelineScreen<Header: View>: View {
                     showScrubber()
                 }
             }
-            .onChange(of: isScrubbing) { _, scrubbing in
-                if scrubbing {
-                    showScrubber()
-                } else {
-                    scheduleScrubberHide()
-                }
-            }
             .overlay(alignment: .trailing) {
-                if model.rows.count > 30 {
+                if model.rows.count > 30 && !viewer.isTransitioning {
                     TimelineScrubber(
                         viewportHeight: geometry.size.height,
-                        scrollableHeight: scrollableHeight,
-                        visibleMonth: visibleMonth,
-                        fraction: $scrollFraction,
-                        visible: scrubberVisible || isScrubbing,
-                        isScrubbing: $isScrubbing
+                        scrub: scrub,
+                        visible: scrubberVisible,
+                        grabbable: scrubberGrabbable
                     ) { offset in
                         var transaction = Transaction()
                         transaction.disablesAnimations = true
                         withTransaction(transaction) {
                             scrollPosition.scrollTo(y: offset)
+                        }
+                    } onScrubbingChanged: { scrubbing in
+                        if scrubbing {
+                            showScrubber()
+                        } else {
+                            scheduleScrubberHide()
                         }
                     }
                 }
@@ -174,11 +190,16 @@ struct TimelineScreen<Header: View>: View {
                 await model.load()
             }
         }
-        .navigationDestination(item: $viewer) { context in
+        // full screen cover keeps the grid and its bars on screen behind the
+        // zoom morph, exactly like the system photos app; a navigation push
+        // slides the source bars and stalls taps after the pop settles.
+        .fullScreenCover(item: $viewer.route) { route in
             AssetViewerScreen(
-                assets: context.assets,
-                initialIndex: context.index,
-                zoomNamespace: zoomNamespace
+                assets: route.assets,
+                initialIndex: route.initialIndex,
+                presentationID: route.id,
+                zoomNamespace: zoomNamespace,
+                onDismissed: { finishViewer(route.id) }
             ) { change in
                 handleViewerChange(change)
             }
@@ -218,6 +239,8 @@ struct TimelineScreen<Header: View>: View {
                     } label: {
                         Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(allSelected ? Color.accentColor : .secondary)
+                            .contentTransition(.symbolEffect(.replace))
+                            .animation(.snappy(duration: 0.22), value: allSelected)
                     }
                 }
             }
@@ -238,7 +261,10 @@ struct TimelineScreen<Header: View>: View {
 
         case .placeholder(_, let bucketID, let tileRows):
             PlaceholderGrid(tileRows: tileRows, columns: columnCount, side: side)
-                .onAppear { Task { await model.loadBucket(bucketID) } }
+                // debounced rows: a synchronous rebuild here changes the
+                // bottom padding inside the scroll pass that revealed the
+                // placeholder, re entering the geometry callbacks same frame.
+                .onAppear { Task { await model.loadBucket(bucketID, immediateRows: false) } }
         }
     }
 
@@ -250,6 +276,8 @@ struct TimelineScreen<Header: View>: View {
                         .font(.title3)
                         .symbolRenderingMode(.palette)
                         .foregroundStyle(.white, selection.contains(asset.id) ? Color.accentColor : .black.opacity(0.25))
+                        .contentTransition(.symbolEffect(.replace))
+                        .animation(.snappy(duration: 0.22), value: selection.contains(asset.id))
                         .padding(6)
                 }
             }
@@ -303,7 +331,7 @@ struct TimelineScreen<Header: View>: View {
                 let target = min(5, max(2, Int((Double(base) / value.magnification).rounded())))
                 guard target != columnCount else { return }
 
-                let preservedFraction = scrollFraction
+                let preservedFraction = scrub.fraction
                 let generator = UISelectionFeedbackGenerator()
                 generator.selectionChanged()
 
@@ -315,8 +343,18 @@ struct TimelineScreen<Header: View>: View {
                 }
 
                 let newSide = (viewportWidth - CGFloat(target - 1) * 2) / CGFloat(target)
-                let contentHeight = model.rows.reduce(CGFloat(0)) { $0 + $1.height(tileSide: newSide) }
-                scrollPosition.scrollTo(y: preservedFraction * max(0, contentHeight - viewportHeight))
+                let contentHeight = model.contentHeight(tileSide: newSide)
+                    + endPadding(side: newSide, viewportHeight: viewportHeight)
+                // one tick later so content size and offset never both
+                // change inside the same gesture frame.
+                let offset = preservedFraction * max(0, contentHeight - viewportHeight)
+                Task { @MainActor in
+                    var scrollTransaction = Transaction()
+                    scrollTransaction.disablesAnimations = true
+                    withTransaction(scrollTransaction) {
+                        scrollPosition.scrollTo(y: offset)
+                    }
+                }
             }
             .onEnded { _ in pinchBaseColumns = nil }
     }
@@ -338,9 +376,38 @@ struct TimelineScreen<Header: View>: View {
     }
 
     private func openViewer(at asset: Asset) {
-        let flat = model.flatAssets
-        guard let index = flat.firstIndex(where: { $0.id == asset.id }) else { return }
-        viewer = ViewerContext(assets: flat, index: index)
+        guard let index = model.flatAssetIndex(for: asset.id) else { return }
+
+        // no transition gate: taps during a still settling dismissal must
+        // start the next presentation, matching the system photos app. the
+        // suspension resolves through the active viewer's completion.
+        model.suspendForViewer()
+        hideScrubberForViewer()
+        viewer.present(assets: model.flatAssets, initialIndex: index)
+    }
+
+    private func finishViewer(_ id: UUID) {
+        viewer.complete(id)
+        Task {
+            // let the zoom out settle before the o(library) row rebuild and
+            // prefetch restart, otherwise they land on the animation's last
+            // frames and read as a freeze.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !viewer.isTransitioning else { return }
+            model.resumeAfterViewer()
+        }
+    }
+
+    private func hideScrubberForViewer() {
+        scrubberHideTask?.cancel()
+        scrubberHideTask = nil
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrubberVisible = false
+            scrubberGrabbable = false
+            scrub.isScrubbing = false
+        }
     }
 
     private func handleViewerChange(_ change: AssetChange) {
@@ -406,8 +473,10 @@ struct TimelineScreen<Header: View>: View {
     }
 
     private func showScrubber() {
+        guard !viewer.isTransitioning else { return }
         scrubberHideTask?.cancel()
         scrubberHideTask = nil
+        scrubberGrabbable = true
         if reduceMotion {
             scrubberVisible = true
         } else {
@@ -416,15 +485,21 @@ struct TimelineScreen<Header: View>: View {
     }
 
     private func scheduleScrubberHide() {
+        guard !viewer.isTransitioning else { return }
         scrubberHideTask?.cancel()
         scrubberHideTask = Task {
-            try? await Task.sleep(for: .milliseconds(3_200))
-            guard !Task.isCancelled, !isScrubbing else { return }
+            try? await Task.sleep(for: .milliseconds(5_000))
+            guard !Task.isCancelled, !scrub.isScrubbing else { return }
             if reduceMotion {
                 scrubberVisible = false
             } else {
                 withAnimation(.easeOut(duration: 0.2)) { scrubberVisible = false }
             }
+            // grace window: grabbing the edge right after the fade revives
+            // the scrubber under the finger instead of scrolling the grid.
+            try? await Task.sleep(for: .milliseconds(4_000))
+            guard !Task.isCancelled, !scrub.isScrubbing else { return }
+            scrubberGrabbable = false
         }
     }
 }
@@ -517,12 +592,11 @@ private struct SelectionActionBar: View {
 /// right-edge drag scrubber backed by continuous scroll offsets.
 private struct TimelineScrubber: View {
     let viewportHeight: CGFloat
-    let scrollableHeight: CGFloat
-    let visibleMonth: String?
-    @Binding var fraction: CGFloat
+    let scrub: ScrubberState
     let visible: Bool
-    @Binding var isScrubbing: Bool
+    let grabbable: Bool
     let onJump: (CGFloat) -> Void
+    let onScrubbingChanged: (Bool) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var label: String?
@@ -531,35 +605,48 @@ private struct TimelineScrubber: View {
 
     private let trackTop: CGFloat = 64
     private let trackBottom: CGFloat = 82
-    private let thumbHeight: CGFloat = 36
+    private let thumbHeight: CGFloat = 44
 
     private var trackHeight: CGFloat {
         max(1, viewportHeight - trackTop - trackBottom - thumbHeight)
     }
 
+    private var shown: Bool { visible || scrub.isScrubbing }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            HStack(spacing: 8) {
-                if let label {
-                    Text(label)
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .glassEffect(.regular, in: .capsule)
-                        .accessibilityIdentifier("timeline-scrubber-label")
-                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.94, anchor: .trailing)))
-                }
+            // the glass thumb must actually leave the hierarchy when hidden -
+            // fading it with opacity leaves the glass layer visible on screen
+            // while hit testing is off, a phantom pill that ignores touches.
+            if shown {
+                HStack(spacing: 8) {
+                    if let label {
+                        Text(label)
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .glassEffect(.regular, in: .capsule)
+                            .accessibilityIdentifier("timeline-scrubber-label")
+                            .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.94, anchor: .trailing)))
+                    }
 
-                Capsule()
-                    .fill(.secondary.opacity(0.72))
-                    .frame(width: 4, height: thumbHeight)
-                    .frame(width: 36, height: 44)
-                    .contentShape(.rect)
+                    VStack(spacing: 1) {
+                        Image(systemName: "chevron.compact.up")
+                        Image(systemName: "chevron.compact.down")
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 26, height: thumbHeight)
+                    .glassEffect(.regular, in: .capsule)
+                    .scaleEffect(scrub.isScrubbing && !reduceMotion ? 1.12 : 1, anchor: .trailing)
+                    .animation(.snappy(duration: 0.2), value: scrub.isScrubbing)
+                    .padding(.trailing, 4)
+                }
+                .offset(y: trackTop + scrub.fraction * trackHeight)
+                .transition(.opacity)
             }
-            .offset(y: trackTop + fraction * trackHeight)
-            .opacity(visible ? 1 : 0)
         }
-        .frame(width: 176, height: viewportHeight, alignment: .topTrailing)
+        .frame(width: 220, height: viewportHeight, alignment: .topTrailing)
         .overlay(alignment: .trailing) {
             Color.black.opacity(0.001)
                 .frame(width: 44, height: viewportHeight)
@@ -567,23 +654,32 @@ private struct TimelineScrubber: View {
                 .highPriorityGesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
-                            guard visible || isScrubbing else { return }
+                            guard grabbable || scrub.isScrubbing else { return }
                             labelHideTask?.cancel()
-                            if let visibleMonth { setLabel(visibleMonth) }
-                            isScrubbing = true
-                            fraction = min(1, max(0, (value.location.y - trackTop - thumbHeight / 2) / trackHeight))
-                            onJump(fraction * scrollableHeight)
+                            if let month = scrub.visibleMonth { setLabel(month) }
+                            if !scrub.isScrubbing {
+                                scrub.isScrubbing = true
+                                onScrubbingChanged(true)
+                            }
+                            // quantized and deduped so coalesced touch
+                            // samples collapse to one write per frame.
+                            let raw = min(1, max(0, (value.location.y - trackTop - thumbHeight / 2) / trackHeight))
+                            let fraction = (raw * 1_000).rounded() / 1_000
+                            guard fraction != scrub.fraction else { return }
+                            scrub.fraction = fraction
+                            onJump(fraction * scrub.scrollableHeight)
                         }
                         .onEnded { _ in
-                            isScrubbing = false
+                            scrub.isScrubbing = false
+                            onScrubbingChanged(false)
                             scheduleLabelHide()
                         }
                 )
-                .allowsHitTesting(visible || isScrubbing)
+                .allowsHitTesting(grabbable || scrub.isScrubbing)
                 .accessibilityIdentifier("timeline-scrubber")
         }
-        .onChange(of: visibleMonth) { _, month in
-            guard isScrubbing || label != nil, let month else { return }
+        .onChange(of: scrub.visibleMonth) { _, month in
+            guard scrub.isScrubbing || label != nil, let month else { return }
             setLabel(month)
         }
         .onDisappear { labelHideTask?.cancel() }
