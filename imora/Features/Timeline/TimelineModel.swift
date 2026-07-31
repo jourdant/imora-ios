@@ -169,7 +169,7 @@ final class TimelineModel {
             guard !isViewerSuspended,
                   let current = sections.firstIndex(where: { $0.id == id })
             else { return }
-            sections[current].days = Self.groupByDay(assets)
+            sections[current].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
             if immediateRows {
                 rebuildRows(rebuildAssets: true)
             } else {
@@ -396,7 +396,7 @@ final class TimelineModel {
         )
     }
 
-    private static func groupByDay(_ assets: [Asset]) -> [DayGroup] {
+    private static func groupByDay(_ assets: [Asset], byUploadDate: Bool = false) -> [DayGroup] {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone(identifier: "UTC")!
         var groups: [DayGroup] = []
@@ -411,7 +411,7 @@ final class TimelineModel {
         }
 
         for asset in assets {
-            let local = asset.localDate
+            let local = byUploadDate ? asset.uploadLocalDate : asset.localDate
             let components = calendar.dateComponents([.year, .month, .day], from: local)
             let key = "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
             if key != currentKey {

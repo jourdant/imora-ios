@@ -3,48 +3,72 @@ import SwiftUI
 struct SearchTab: View {
     @Environment(SessionStore.self) private var session
 
+    @State private var model = SearchModel()
     @State private var query = ""
-    @State private var results: [Asset] = []
-    @State private var isSearching = false
-    @State private var hasSearched = false
-    @State private var nextPage: Int?
-    @State private var people: [Person] = []
-    @State private var places: [ExploreResponse] = []
+    @State private var searchScope: SearchFilter.TextType = .context
+    @State private var scopeInitialized = false
+    @State private var activeSheet: FilterSheet?
     @State private var viewer = ViewerPresentation()
     @Namespace private var zoomNamespace
 
-    private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
+    /// context and ocr are feature-gated server-side, like the flutter menu.
+    private var availableScopes: [SearchFilter.TextType] {
+        var scopes: [SearchFilter.TextType] = []
+        if session.features?.smartSearch != false { scopes.append(.context) }
+        scopes.append(.filename)
+        scopes.append(.description)
+        if session.features?.ocr == true { scopes.append(.ocr) }
+        return scopes
+    }
 
     var body: some View {
         @Bindable var viewer = viewer
 
         NavigationStack {
             ScrollView {
-                if hasSearched {
-                    resultsGrid
-                } else {
-                    discoverContent
+                VStack(spacing: 0) {
+                    FilterChipsRow(filter: model.filter, activeSheet: $activeSheet)
+
+                    if model.hasActiveSearch {
+                        SearchResultsGrid(model: model, zoomNamespace: zoomNamespace) { index in
+                            viewer.present(assets: model.assets, initialIndex: index)
+                        }
+                    } else {
+                        suggestionsContent
+                    }
                 }
             }
             .navigationTitle("Search")
-            .searchable(text: $query, prompt: "Search your photos")
-            .onSubmit(of: .search) {
-                Task { await search(reset: true) }
-            }
-            .onChange(of: query) { _, newValue in
-                if newValue.isEmpty {
-                    hasSearched = false
-                    results = []
-                    nextPage = nil
+            .searchable(text: $query, prompt: searchScope.prompt)
+            .searchScopes($searchScope, activation: .onSearchPresentation) {
+                ForEach(availableScopes) { scope in
+                    Text(scope.title).tag(scope)
                 }
+            }
+            .onSubmit(of: .search) { submit() }
+            .onChange(of: query) { _, newValue in
+                if newValue.isEmpty, !model.filter.activeText.isEmpty {
+                    applyFilter { $0.setText("", type: searchScope) }
+                }
+            }
+            .onAppear {
+                guard !scopeInitialized else { return }
+                scopeInitialized = true
+                searchScope = session.features?.smartSearch != false ? .context : .filename
+            }
+            .task {
+                if let client = session.client { model.attach(client) }
+            }
+            .sheet(item: $activeSheet) { sheet in
+                filterSheet(for: sheet)
+                    .presentationDetents(sheet == .people || sheet == .tags ? [.large] : [.medium, .large])
+            }
+            .navigationDestination(for: QuickLink.self) { link in
+                quickLinkScreen(link)
             }
             .navigationDestination(for: Person.self) { person in
                 PersonScreen(person: person)
             }
-            .navigationDestination(for: PlaceLink.self) { place in
-                PlaceScreen(city: place.city)
-            }
-            .task { await loadDiscover() }
             .fullScreenCover(item: $viewer.route) { route in
                 AssetViewerScreen(
                     assets: route.assets,
@@ -53,160 +77,265 @@ struct SearchTab: View {
                     zoomNamespace: zoomNamespace,
                     onDismissed: { viewer.complete(route.id) }
                 ) { change in
-                    if case .removed(let id) = change {
-                        results.removeAll { $0.id == id }
+                    switch change {
+                    case .removed(let id):
+                        model.removeAssets(ids: [id])
+                    case .favorite(let id, let value):
+                        model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                    case .localDeleted:
+                        break
                     }
                 }
             }
         }
     }
 
-    // MARK: - results
+    // MARK: - search dispatch
 
-    @ViewBuilder private var resultsGrid: some View {
-        if isSearching && results.isEmpty {
-            ProgressView()
-                .frame(maxWidth: .infinity)
-                .padding(.top, 120)
-        } else if results.isEmpty {
-            ContentUnavailableView.search(text: query)
-                .padding(.top, 60)
-        } else {
-            LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(Array(results.enumerated()), id: \.element.id) { index, asset in
-                    AssetTile(asset: asset)
-                        .matchedTransitionSource(id: asset.id, in: zoomNamespace)
-                        .onTapGesture {
-                            viewer.present(assets: results, initialIndex: index)
-                        }
-                        .onAppear {
-                            if index >= results.count - 12, nextPage != nil, !isSearching {
-                                Task { await search(reset: false) }
-                            }
-                        }
-                }
-            }
-            if isSearching {
-                ProgressView()
-                    .padding(.vertical, 20)
-            }
+    /// bcp47 tag for smart search, e.g. "en-US".
+    private var languageTag: String {
+        let locale = Locale.current
+        let language = locale.language.languageCode?.identifier ?? "en"
+        guard let region = locale.region?.identifier else { return language }
+        return "\(language)-\(region)"
+    }
+
+    private func submit() {
+        applyFilter { $0.setText(query.trimmingCharacters(in: .whitespacesAndNewlines), type: searchScope) }
+    }
+
+    private func applyFilter(_ mutate: (inout SearchFilter) -> Void) {
+        var next = model.filter
+        mutate(&next)
+        next.language = languageTag
+        model.apply(next)
+    }
+
+    @ViewBuilder private func filterSheet(for sheet: FilterSheet) -> some View {
+        switch sheet {
+        case .people:
+            PeoplePickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .location:
+            LocationPickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .camera:
+            CameraPickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .date:
+            DatePickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .mediaType:
+            MediaTypePickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .rating:
+            RatingPickerSheet(filter: model.filter, onApply: applySheetFilter)
+        case .display:
+            DisplayOptionsSheet(filter: model.filter, onApply: applySheetFilter)
+        case .tags:
+            TagsPickerSheet(filter: model.filter, onApply: applySheetFilter)
         }
     }
 
-    // MARK: - discover
-
-    @ViewBuilder private var discoverContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            if !people.isEmpty && session.preferences?.peopleEnabled != false {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("People")
-                        .font(.title3.weight(.bold))
-                        .padding(.horizontal, 16)
-
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 14) {
-                            ForEach(people.prefix(20)) { person in
-                                NavigationLink(value: person) {
-                                    VStack(spacing: 6) {
-                                        if let client = session.client {
-                                            RemoteImage(url: client.personThumbnailURL(personID: person.id), targetPixelSize: 180)
-                                                .frame(width: 72, height: 72)
-                                                .clipShape(.circle)
-                                        }
-                                        Text(person.name.isEmpty ? "Unnamed" : person.name)
-                                            .font(.caption)
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-                                            .frame(width: 76)
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                    }
-                }
-            }
-
-            if let cityExplore = places.first(where: { $0.fieldName.contains("city") }) ?? places.first,
-               !cityExplore.items.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Places")
-                        .font(.title3.weight(.bold))
-                        .padding(.horizontal, 16)
-
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 12) {
-                            ForEach(cityExplore.items, id: \.value) { item in
-                                NavigationLink(value: PlaceLink(city: item.value)) {
-                                    placeCard(item)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                    }
-                }
-            }
-
-            if people.isEmpty && places.isEmpty {
-                ContentUnavailableView(
-                    "Search your library",
-                    systemImage: "magnifyingglass",
-                    description: Text("Find photos by content, people or places.")
-                )
-                .padding(.top, 80)
-            }
-        }
-        .padding(.vertical, 8)
+    private func applySheetFilter(_ newFilter: SearchFilter) {
+        applyFilter { $0 = newFilter }
     }
 
-    @ViewBuilder private func placeCard(_ item: ExploreItem) -> some View {
-        ZStack(alignment: .bottomLeading) {
-            if let client = session.client {
-                RemoteImage(url: client.thumbnailURL(assetID: item.data.id), targetPixelSize: 480, thumbhash: item.data.thumbhash)
-                    .frame(width: 140, height: 180)
-                    .clipped()
+    // MARK: - suggestions (pre-search landing)
+
+    @ViewBuilder private var suggestionsContent: some View {
+        VStack(spacing: 0) {
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: 64, weight: .light))
+                .foregroundStyle(.secondary)
+                .padding(.top, 48)
+
+            Text("Search for your photos and videos")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.top, 16)
+
+            quickLinks
+                .padding(.horizontal, 16)
+                .padding(.top, 32)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder private var quickLinks: some View {
+        VStack(spacing: 0) {
+            quickLinkRow(.recentlyTaken, icon: "clock", title: "Recently Taken")
+            Divider().padding(.leading, 56)
+            quickLinkRow(.recentlyAdded, icon: "tray.and.arrow.down", title: "Recently Added")
+            Divider().padding(.leading, 56)
+            quickLinkRow(.videos, icon: "play.circle", title: "Videos")
+            Divider().padding(.leading, 56)
+            quickLinkRow(.favorites, icon: "heart", title: "Favorites")
+        }
+        .background(.fill.quaternary, in: .rect(cornerRadius: 20))
+    }
+
+    @ViewBuilder private func quickLinkRow(_ link: QuickLink, icon: String, title: String) -> some View {
+        NavigationLink(value: link) {
+            HStack(spacing: 16) {
+                Image(systemName: icon)
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 28)
+                Text(title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
-            LinearGradient(colors: [.clear, .black.opacity(0.65)], startPoint: .center, endPoint: .bottom)
-            Text(item.value)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(10)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .contentShape(.rect)
         }
-        .frame(width: 140, height: 180)
-        .clipShape(.rect(cornerRadius: 14))
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("quick-link-\(link.rawValue)")
     }
 
-    // MARK: - data
-
-    private func loadDiscover() async {
-        guard let client = session.client else { return }
-        async let peopleTask = try? client.people()
-        async let placesTask = try? client.explorePlaces()
-        people = (await peopleTask)?.people.filter { !($0.isHidden ?? false) } ?? []
-        places = (await placesTask) ?? []
-    }
-
-    private func search(reset: Bool) async {
-        guard let client = session.client, !query.isEmpty else { return }
-        if reset {
-            results = []
-            nextPage = 1
-        }
-        guard let page = nextPage else { return }
-        isSearching = true
-        hasSearched = true
-        defer { isSearching = false }
-        if let response = try? await client.searchSmart(query: query, page: page) {
-            results.append(contentsOf: response.assets.items.map { $0.asAsset() })
-            nextPage = response.assets.nextPage.flatMap { Int($0) }
+    @ViewBuilder private func quickLinkScreen(_ link: QuickLink) -> some View {
+        switch link {
+        case .recentlyTaken:
+            TimelineScreen(
+                title: "Recently Taken",
+                filter: TimelineFilter(),
+                emptyIcon: "clock",
+                emptyMessage: "No photos yet",
+                showsLargeTitle: false
+            )
+        case .recentlyAdded:
+            TimelineScreen(
+                title: "Recently Added",
+                filter: TimelineFilter(orderBy: "createdAt"),
+                emptyIcon: "tray.and.arrow.down",
+                emptyMessage: "No photos yet",
+                showsLargeTitle: false
+            )
+        case .videos:
+            SearchResultsScreen(
+                title: "Videos",
+                baseFilter: {
+                    var filter = SearchFilter()
+                    filter.mediaType = .video
+                    return filter
+                }(),
+                emptyIcon: "play.slash",
+                emptyMessage: "No videos yet"
+            )
+        case .favorites:
+            TimelineScreen(
+                title: "Favorites",
+                filter: TimelineFilter(isFavorite: true),
+                emptyIcon: "heart",
+                emptyMessage: "No favorites yet",
+                showsLargeTitle: false
+            )
         }
     }
 }
 
-nonisolated struct PlaceLink: Hashable {
-    let city: String
+nonisolated enum QuickLink: String, Hashable {
+    case recentlyTaken
+    case recentlyAdded
+    case videos
+    case favorites
+}
+
+// MARK: - results grid
+
+/// flat paged grid shared by the search tab and canned searches like videos.
+struct SearchResultsGrid: View {
+    let model: SearchModel
+    let zoomNamespace: Namespace.ID
+    let onTap: (Int) -> Void
+
+    private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
+
+    var body: some View {
+        if model.isLoading && model.assets.isEmpty {
+            ProgressView()
+                .frame(maxWidth: .infinity)
+                .padding(.top, 120)
+        } else if model.assets.isEmpty {
+            ContentUnavailableView(
+                "No results",
+                systemImage: "magnifyingglass",
+                description: Text("Try another search term or change the filters.")
+            )
+            .padding(.top, 60)
+        } else {
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(Array(model.assets.enumerated()), id: \.element.id) { index, asset in
+                    AssetTile(asset: asset)
+                        .matchedTransitionSource(id: asset.id, in: zoomNamespace)
+                        .onTapGesture { onTap(index) }
+                        .onAppear {
+                            if index >= model.assets.count - 12 {
+                                model.loadMore()
+                            }
+                        }
+                }
+            }
+
+            if model.isLoading {
+                ProgressView()
+                    .padding(.vertical, 24)
+            } else if model.nextPage == nil {
+                Text("No more results")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 24)
+            }
+        }
+    }
+}
+
+/// standalone paged search screen for canned filters, e.g. the videos quick
+/// link.
+struct SearchResultsScreen: View {
+    @Environment(SessionStore.self) private var session
+    let title: String
+    let baseFilter: SearchFilter
+    var emptyIcon = "magnifyingglass"
+    var emptyMessage = "No results"
+
+    @State private var model = SearchModel()
+    @State private var viewer = ViewerPresentation()
+    @Namespace private var zoomNamespace
+
+    var body: some View {
+        @Bindable var viewer = viewer
+
+        ScrollView {
+            SearchResultsGrid(model: model, zoomNamespace: zoomNamespace) { index in
+                viewer.present(assets: model.assets, initialIndex: index)
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if let client = session.client { model.attach(client) }
+            model.apply(baseFilter)
+        }
+        .fullScreenCover(item: $viewer.route) { route in
+            AssetViewerScreen(
+                assets: route.assets,
+                initialIndex: route.initialIndex,
+                presentationID: route.id,
+                zoomNamespace: zoomNamespace,
+                onDismissed: { viewer.complete(route.id) }
+            ) { change in
+                switch change {
+                case .removed(let id):
+                    model.removeAssets(ids: [id])
+                case .favorite(let id, let value):
+                    model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                case .localDeleted:
+                    break
+                }
+            }
+        }
+    }
 }
 
 /// timeline filtered to a person.
@@ -263,45 +392,25 @@ struct PlaceScreen: View {
     @Environment(SessionStore.self) private var session
     let city: String
 
-    @State private var assets: [Asset] = []
-    @State private var isLoading = true
+    @State private var model = SearchModel()
     @State private var viewer = ViewerPresentation()
     @Namespace private var zoomNamespace
-
-    private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
     var body: some View {
         @Bindable var viewer = viewer
 
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-                    AssetTile(asset: asset)
-                        .matchedTransitionSource(id: asset.id, in: zoomNamespace)
-                        .onTapGesture {
-                            viewer.present(assets: assets, initialIndex: index)
-                        }
-                }
+            SearchResultsGrid(model: model, zoomNamespace: zoomNamespace) { index in
+                viewer.present(assets: model.assets, initialIndex: index)
             }
         }
         .navigationTitle(city)
         .navigationBarTitleDisplayMode(.inline)
-        .overlay {
-            if isLoading {
-                ProgressView()
-            } else if assets.isEmpty {
-                ContentUnavailableView("No photos", systemImage: "mappin.slash")
-            }
-        }
         .task {
-            guard let client = session.client else { return }
-            if let response = try? await client.searchMetadata(filters: [
-                "city": AnyEncodable(city),
-                "size": AnyEncodable(1000),
-            ]) {
-                assets = response.assets.items.map { $0.asAsset() }
-            }
-            isLoading = false
+            if let client = session.client { model.attach(client) }
+            var filter = SearchFilter()
+            filter.city = city
+            model.apply(filter)
         }
         .fullScreenCover(item: $viewer.route) { route in
             AssetViewerScreen(
@@ -312,9 +421,13 @@ struct PlaceScreen: View {
                 onDismissed: { viewer.complete(route.id) }
             ) { change in
                 if case .removed(let id) = change {
-                    assets.removeAll { $0.id == id }
+                    model.removeAssets(ids: [id])
                 }
             }
         }
     }
+}
+
+nonisolated struct PlaceLink: Hashable {
+    let city: String
 }

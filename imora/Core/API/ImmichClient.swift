@@ -344,17 +344,30 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - search
 
-    func searchSmart(query: String, page: Int = 1, size: Int = 100) async throws -> SearchResponse {
-        try await request("search/smart", method: "POST", body: [
-            "query": AnyEncodable(query),
-            "page": AnyEncodable(page),
-            "size": AnyEncodable(size),
-        ])
+    /// routes to /search/smart when a context query is set, /search/metadata
+    /// otherwise, mirroring the official mobile client.
+    func search(_ filter: SearchFilter, page: Int) async throws -> SearchResponse {
+        let path = filter.usesSmartSearch ? "search/smart" : "search/metadata"
+        return try await request(path, method: "POST", body: filter.requestBody(page: page))
     }
 
     func searchMetadata(filters: [String: AnyEncodable]) async throws -> SearchResponse {
         try await request("search/metadata", method: "POST", body: filters)
     }
+
+    /// distinct exif values for the filter dropdowns. types: country, state,
+    /// city, camera-make, camera-model. narrowing params cascade the way the
+    /// pickers do.
+    func searchSuggestions(type: String, country: String? = nil, state: String? = nil, make: String? = nil) async throws -> [String] {
+        var query = [URLQueryItem(name: "type", value: type)]
+        if let country { query.append(URLQueryItem(name: "country", value: country)) }
+        if let state { query.append(URLQueryItem(name: "state", value: state)) }
+        if let make { query.append(URLQueryItem(name: "make", value: make)) }
+        let values: [String?] = try await get("search/suggestions", query: query)
+        return values.compactMap(\.self).filter { !$0.isEmpty }
+    }
+
+    func tags() async throws -> [Tag] { try await get("tags") }
 
     func people(withHidden: Bool = false) async throws -> PeopleResponse {
         try await get("people", query: [URLQueryItem(name: "withHidden", value: withHidden ? "true" : "false")])
@@ -364,6 +377,11 @@ nonisolated final class ImmichClient: Sendable {
 
     func explorePlaces() async throws -> [ExploreResponse] {
         try await get("search/explore")
+    }
+
+    /// one representative asset per city, alphabetical.
+    func cities() async throws -> [AssetDetail] {
+        try await get("search/cities")
     }
 
     func updatePerson(id: String, name: String) async throws {
@@ -475,6 +493,11 @@ nonisolated struct TimelineFilter: Hashable {
     var personId: String?
     var userId: String?
     var order: String?
+    /// takenAt (default) or createdAt for upload-time ordering.
+    var orderBy: String?
+
+    /// recently-added screens bucket and group by upload time.
+    var groupsByUploadDate: Bool { orderBy == "createdAt" }
 
     var queryItems: [URLQueryItem] {
         var items: [URLQueryItem] = []
@@ -487,6 +510,7 @@ nonisolated struct TimelineFilter: Hashable {
         if let personId { items.append(.init(name: "personId", value: personId)) }
         if let userId { items.append(.init(name: "userId", value: userId)) }
         if let order { items.append(.init(name: "order", value: order)) }
+        if let orderBy { items.append(.init(name: "orderBy", value: orderBy)) }
         return items
     }
 }

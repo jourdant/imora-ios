@@ -102,6 +102,8 @@ nonisolated struct ServerFeatures: Codable {
     let oauth: Bool
     let oauthAutoLaunch: Bool
     let passwordLogin: Bool
+    /// text recognition search, added server-side in v2.x.
+    let ocr: Bool?
 }
 
 nonisolated struct ServerConfig: Codable {
@@ -130,6 +132,8 @@ nonisolated struct UserPreferences: Codable, Hashable {
 
     var memoriesEnabled: Bool { memories?.enabled ?? true }
     var peopleEnabled: Bool { people?.enabled ?? true }
+    var tagsEnabled: Bool { tags?.enabled ?? true }
+    var ratingsEnabled: Bool { ratings?.enabled ?? false }
 }
 
 nonisolated struct ServerStorage: Codable {
@@ -172,11 +176,19 @@ nonisolated struct Asset: Identifiable, Hashable {
     let ratio: Double
     let city: String?
     let country: String?
+    /// server upload time, drives the recently-added ordering.
+    var createdAt: Date?
 
     var isVideo: Bool { !isImage }
 
     /// date shifted into the asset's local timezone for grouping and display.
     var localDate: Date { fileCreatedAt.addingTimeInterval(localOffsetHours * 3600) }
+
+    /// upload time shifted into device-local wall clock, comparable in the
+    /// same utc calendar space the grouping code uses.
+    var uploadLocalDate: Date {
+        (createdAt ?? fileCreatedAt).addingTimeInterval(TimeInterval(TimeZone.current.secondsFromGMT()))
+    }
 
     var durationLabel: String? {
         guard let duration, isVideo else { return nil }
@@ -205,6 +217,7 @@ nonisolated struct TimeBucketAssets: Codable {
     let ratio: [Double]
     let city: [String?]?
     let country: [String?]?
+    let createdAt: [String]?
 
     func assets() -> [Asset] {
         id.indices.map { i in
@@ -223,7 +236,8 @@ nonisolated struct TimeBucketAssets: Codable {
                 livePhotoVideoId: livePhotoVideoId[i],
                 ratio: ratio[i],
                 city: city?[i] ?? nil,
-                country: country?[i] ?? nil
+                country: country?[i] ?? nil,
+                createdAt: createdAt.flatMap { APIDate.parse($0[i]) }
             )
         }
     }
@@ -267,6 +281,8 @@ nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
     let thumbhash: String?
     let fileCreatedAt: String
     let localDateTime: String
+    /// server upload time.
+    let createdAt: String?
     let isFavorite: Bool
     let isArchived: Bool?
     let isTrashed: Bool
@@ -305,7 +321,8 @@ nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
             livePhotoVideoId: livePhotoVideoId,
             ratio: ratio,
             city: exifInfo?.city,
-            country: exifInfo?.country
+            country: exifInfo?.country,
+            createdAt: createdAt.flatMap { APIDate.parse($0) }
         )
     }
 }
@@ -345,6 +362,14 @@ nonisolated struct Person: Codable, Identifiable, Hashable {
     let thumbnailPath: String?
     let isHidden: Bool?
     let birthDate: String?
+}
+
+nonisolated struct Tag: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// full hierarchical path, e.g. "travel/asia".
+    let value: String
+    let parentId: String?
 }
 
 nonisolated struct PeopleResponse: Codable {

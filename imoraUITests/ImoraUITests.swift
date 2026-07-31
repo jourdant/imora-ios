@@ -310,6 +310,95 @@ final class ImoraUITests: XCTestCase {
     }
 
     @MainActor
+    func testSearchFeature() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+
+        // search tab shows the quick links landing.
+        app.tabBars.buttons["Search"].tap()
+        let recentlyTaken = app.descendants(matching: .any).matching(identifier: "quick-link-recentlyTaken").firstMatch
+        XCTAssertTrue(recentlyTaken.waitForExistence(timeout: 10), "quick links missing")
+        snap("search-landing")
+
+        // videos quick link is a canned metadata search.
+        let videos = app.descendants(matching: .any).matching(identifier: "quick-link-videos").firstMatch
+        videos.tap()
+        let videoTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(videoTile.waitForExistence(timeout: 20), "videos grid empty")
+        snap("search-videos")
+        app.navigationBars.buttons.firstMatch.tap()
+        sleep(1)
+
+        // smart search from the context scope.
+        let searchField = app.searchFields.firstMatch
+        XCTAssertTrue(searchField.waitForExistence(timeout: 5), "search field missing")
+        searchField.tap()
+        searchField.typeText("beach\n")
+        let resultTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(resultTile.waitForExistence(timeout: 25), "no smart search results")
+        snap("search-results")
+
+        // media type filter narrows to video. the chip can start off screen,
+        // so swipe the chip row until its frame is inside the window.
+        let chipsRow = app.descendants(matching: .any).matching(identifier: "filter-chips").firstMatch
+        let mediaChip = app.descendants(matching: .any).matching(identifier: "filter-chip-mediaType").firstMatch
+        XCTAssertTrue(mediaChip.exists, "media type chip missing")
+        revealChip(mediaChip, in: chipsRow, app: app)
+        mediaChip.tap()
+        let videoOption = app.descendants(matching: .any).matching(identifier: "media-type-video").firstMatch
+        XCTAssertTrue(videoOption.waitForExistence(timeout: 5), "media type sheet missing")
+        videoOption.tap()
+        app.descendants(matching: .any).matching(identifier: "filter-apply").firstMatch.tap()
+        sleep(3)
+        snap("search-filter-video")
+
+        // display options sheet applies favorites, and the chip reflects it.
+        let displayChip = app.descendants(matching: .any).matching(identifier: "filter-chip-display").firstMatch
+        XCTAssertTrue(displayChip.exists, "display options chip missing")
+        revealChip(displayChip, in: chipsRow, app: app)
+        displayChip.tap()
+        let favoriteToggle = app.descendants(matching: .any).matching(identifier: "display-favorite").firstMatch
+        XCTAssertTrue(favoriteToggle.waitForExistence(timeout: 5), "favorite toggle missing")
+        // tapping the row center does not flip a form toggle - aim at the
+        // switch itself, falling back to the trailing edge.
+        let favoriteSwitch = favoriteToggle.switches.firstMatch
+        if favoriteSwitch.exists {
+            favoriteSwitch.tap()
+        } else {
+            favoriteToggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        }
+        app.descendants(matching: .any).matching(identifier: "filter-apply").firstMatch.tap()
+        sleep(3)
+        XCTAssertTrue(displayChip.label.contains("Favorite"), "display chip did not activate")
+        snap("search-filter-favorite")
+
+        // cancel restores the landing content once the filter is cleared.
+        let cancel = app.buttons["Cancel"].firstMatch
+        if cancel.exists { cancel.tap() }
+        sleep(1)
+    }
+
+    /// horizontally scrolls a chip row until the chip's frame is on screen.
+    /// hittability queries throw for off-screen elements, frames do not.
+    @MainActor
+    private func revealChip(_ chip: XCUIElement, in row: XCUIElement, app: XCUIApplication) {
+        let window = app.windows.firstMatch.frame
+        var attempts = 0
+        while attempts < 4 && chip.frame.maxX > window.maxX - 8 {
+            row.swipeLeft()
+            sleep(1)
+            attempts += 1
+        }
+        attempts = 0
+        while attempts < 4 && chip.frame.minX < 8 {
+            row.swipeRight()
+            sleep(1)
+            attempts += 1
+        }
+    }
+
+    @MainActor
     private func waitForValue(_ value: String, on element: XCUIElement, timeout: TimeInterval) -> Bool {
         let predicate = NSPredicate(format: "value == %@", value)
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
