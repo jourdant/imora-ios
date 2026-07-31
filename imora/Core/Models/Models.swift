@@ -178,6 +178,13 @@ nonisolated struct Asset: Identifiable, Hashable {
     let country: String?
     /// server upload time, drives the recently-added ordering.
     var createdAt: Date?
+    /// set for device-only assets merged into the timeline before backup.
+    var localIdentifier: String? = nil
+    /// snapshot of the backup index at merge time: true once every component
+    /// of the device asset is confirmed on the server.
+    var isLocalBackedUp = false
+
+    var isLocal: Bool { localIdentifier != nil }
 
     var isVideo: Bool { !isImage }
 

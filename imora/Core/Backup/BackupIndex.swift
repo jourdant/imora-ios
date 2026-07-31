@@ -194,4 +194,17 @@ actor BackupIndex {
     func localId(forRemote remoteId: String) -> String? {
         remoteToLocal[remoteId]
     }
+
+    /// remote ids of assets that exist on this device and are fully backed
+    /// up. drives the merged cloud badge on timeline tiles.
+    func backedUpRemoteIds() -> Set<String> {
+        var ids: Set<String> = []
+        ids.reserveCapacity(entries.count)
+        for entry in entries.values where entry.isBackedUp {
+            if let remoteId = entry.primaryRemoteId {
+                ids.insert(remoteId)
+            }
+        }
+        return ids
+    }
 }

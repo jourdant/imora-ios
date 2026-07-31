@@ -68,7 +68,6 @@ struct AlbumsTab: View {
                     ContentUnavailableView("No albums", systemImage: "rectangle.stack")
                 }
             }
-            .refreshable { await load() }
             .task { await load() }
             // reloads after returning from a detail where the album may have
             // been renamed or deleted. the initial load stays with .task.
@@ -76,6 +75,10 @@ struct AlbumsTab: View {
                 if !albums.isEmpty {
                     Task { await load() }
                 }
+            }
+            // server-side album changes arrive over the realtime channel.
+            .onChange(of: session.realtime?.albumsGeneration ?? 0) {
+                Task { await load() }
             }
             .alert("New Album", isPresented: $showCreate) {
                 TextField("Album name", text: $newAlbumName)

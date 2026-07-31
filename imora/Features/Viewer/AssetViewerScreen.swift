@@ -124,7 +124,7 @@ struct AssetViewerScreen: View {
         }
         .task(id: current?.id) {
             localIdentifier = nil
-            guard let asset = current, let backup = session.backup else { return }
+            guard let asset = current, !asset.isLocal, let backup = session.backup else { return }
             let identifier = await backup.localIdentifier(forRemote: asset.id)
             guard !Task.isCancelled, current?.id == asset.id else { return }
             localIdentifier = identifier
@@ -167,6 +167,10 @@ struct AssetViewerScreen: View {
 
                 Spacer()
 
+                if current?.isLocal == true {
+                    // device-only photos have no server actions yet.
+                    Color.clear.frame(width: 44, height: 44)
+                } else {
                 Menu {
                     Button {
                         Task { await archive() }
@@ -204,11 +208,23 @@ struct AssetViewerScreen: View {
                 }
                 .viewerControl()
                 .accessibilityIdentifier("viewer-menu")
+                }
             }
             .padding(.horizontal, 16)
 
             Spacer()
 
+            if let current, current.isLocal {
+                HStack(spacing: 6) {
+                    Image(systemName: current.isLocalBackedUp ? "checkmark.icloud" : "icloud.slash")
+                    Text(current.isLocalBackedUp ? "Backed up" : "Not backed up yet")
+                }
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .glassEffect(.regular, in: .capsule)
+                .padding(.bottom, 12)
+            } else {
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     Button {
@@ -242,6 +258,7 @@ struct AssetViewerScreen: View {
                 }
             }
             .padding(.bottom, 12)
+            }
         }
         .foregroundStyle(.white)
         .transition(.opacity)
@@ -419,7 +436,19 @@ private struct AssetPage: View {
     }
 
     @ViewBuilder private var pageContent: some View {
-        if asset.isVideo {
+        if let localId = asset.localIdentifier {
+            if asset.isVideo {
+                LocalVideoPage(localIdentifier: localId, isActive: isActive)
+            } else {
+                ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
+                    LocalPhotoImage(
+                        localIdentifier: localId,
+                        targetPixelSize: 2048,
+                        contentMode: .fit
+                    )
+                }
+            }
+        } else if asset.isVideo {
             VideoPage(asset: asset, isActive: isActive)
         } else if let client = session.client {
             ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
@@ -433,6 +462,41 @@ private struct AssetPage: View {
                 )
             }
         }
+    }
+}
+
+/// plays a device-only video straight from the photo library.
+private struct LocalVideoPage: View {
+    let localIdentifier: String
+    let isActive: Bool
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        ZStack {
+            if let player {
+                VideoPlayer(player: player)
+            } else {
+                ProgressView().tint(.white)
+            }
+        }
+        .task(id: "\(localIdentifier):\(isActive)") {
+            guard isActive else {
+                tearDownPlayer()
+                return
+            }
+            if player == nil,
+               let item = await LocalImageLoader.shared.playerItem(localIdentifier: localIdentifier) {
+                player = AVPlayer(playerItem: item)
+            }
+            player?.play()
+        }
+        .onDisappear { tearDownPlayer() }
+    }
+
+    private func tearDownPlayer() {
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
     }
 }
 

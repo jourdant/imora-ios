@@ -501,8 +501,11 @@ nonisolated final class ImmichClient: Sendable {
 
     /// multipart upload of one asset file. takes ownership of the source file:
     /// it is deleted as soon as the request body is built, so peak temp usage
-    /// stays near one file size.
-    func uploadAsset(_ upload: AssetUploadRequest) async throws -> AssetUploadResult {
+    /// stays near one file size. onProgress receives the sent fraction.
+    func uploadAsset(
+        _ upload: AssetUploadRequest,
+        onProgress: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> AssetUploadResult {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var fields: [(name: String, value: String)] = [
@@ -536,7 +539,8 @@ nonisolated final class ImmichClient: Sendable {
         request.httpMethod = "POST"
         request.setValue(MultipartBody.contentType(boundary: boundary), forHTTPHeaderField: "Content-Type")
         request.setValue(upload.checksum, forHTTPHeaderField: "x-immich-checksum")
-        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        let delegate = onProgress.map { UploadProgressDelegate(onProgress: $0) }
+        let (data, response) = try await session.upload(for: request, fromFile: bodyURL, delegate: delegate)
         guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
         guard (200..<300).contains(http.statusCode) else {
             throw ImmichError.http(http.statusCode, Self.serverMessage(from: data))
@@ -546,6 +550,26 @@ nonisolated final class ImmichClient: Sendable {
         } catch {
             throw ImmichError.decoding("\(error)")
         }
+    }
+}
+
+/// forwards urlsession byte progress for one upload task.
+private nonisolated final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let onProgress: @Sendable (Double) -> Void
+
+    init(onProgress: @escaping @Sendable (Double) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        guard totalBytesExpectedToSend > 0 else { return }
+        onProgress(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
     }
 }
 

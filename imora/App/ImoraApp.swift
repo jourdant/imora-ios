@@ -30,8 +30,17 @@ struct RootView: View {
         .animation(.smooth, value: session.state)
         .task { await session.restore() }
         .onChange(of: scenePhase) { _, phase in
-            // returning to the foreground picks up photos taken meanwhile.
-            if phase == .active { session.backup?.startIfIdle() }
+            switch phase {
+            case .active:
+                // returning to the foreground picks up photos taken meanwhile
+                // and reconnects the realtime channel, which resyncs grids.
+                session.backup?.startIfIdle()
+                session.realtime?.setActive(true)
+            case .background:
+                session.realtime?.setActive(false)
+            default:
+                break
+            }
         }
     }
 }

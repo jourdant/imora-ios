@@ -33,6 +33,8 @@ struct TimelineScreen<Header: View>: View {
     var emptyIcon = "photo.on.rectangle"
     var emptyMessage = "No photos yet"
     var showsLargeTitle = true
+    /// main photos tab only: weave in device photos and show backup badges.
+    var mergesLocalPhotos = false
     let header: Header
 
     @State private var model: TimelineModel
@@ -57,6 +59,7 @@ struct TimelineScreen<Header: View>: View {
         emptyIcon: String = "photo.on.rectangle",
         emptyMessage: String = "No photos yet",
         showsLargeTitle: Bool = true,
+        mergesLocalPhotos: Bool = false,
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
         self.title = title
@@ -64,8 +67,9 @@ struct TimelineScreen<Header: View>: View {
         self.emptyIcon = emptyIcon
         self.emptyMessage = emptyMessage
         self.showsLargeTitle = showsLargeTitle
+        self.mergesLocalPhotos = mergesLocalPhotos
         self.header = header()
-        _model = State(initialValue: TimelineModel(filter: filter))
+        _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
 
     private func tileSide(for width: CGFloat) -> CGFloat {
@@ -183,10 +187,10 @@ struct TimelineScreen<Header: View>: View {
             }
         }
         .animation(.smooth(duration: 0.25), value: isSelecting)
-        .refreshable { await model.refresh() }
+        // no pull-to-refresh: the realtime hub keeps every grid current.
         .task {
             if let client = session.client {
-                model.attach(client)
+                model.attach(client, backup: session.backup, hub: session.realtime)
                 model.columns = columnCount
                 await model.load()
             }
@@ -229,7 +233,7 @@ struct TimelineScreen<Header: View>: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if isSelecting {
+                if isSelecting, !assetIDs.isEmpty {
                     let allSelected = assetIDs.allSatisfy { selection.contains($0) }
                     Button {
                         if allSelected {
@@ -270,9 +274,9 @@ struct TimelineScreen<Header: View>: View {
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {
-        AssetTile(asset: asset)
+        AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
             .overlay(alignment: .topLeading) {
-                if isSelecting {
+                if isSelecting && !asset.isLocal {
                     Image(systemName: selection.contains(asset.id) ? "checkmark.circle.fill" : "circle")
                         .font(.title3)
                         .symbolRenderingMode(.palette)
@@ -290,13 +294,14 @@ struct TimelineScreen<Header: View>: View {
             .matchedTransitionSource(id: asset.id, in: zoomNamespace)
             .onTapGesture {
                 if isSelecting {
-                    toggle(asset)
+                    // server actions cannot target device-only photos.
+                    if !asset.isLocal { toggle(asset) }
                 } else {
                     openViewer(at: asset)
                 }
             }
             .onLongPressGesture(minimumDuration: 0.3) {
-                guard !isSelecting else { return }
+                guard !isSelecting, !asset.isLocal else { return }
                 let generator = UIImpactFeedbackGenerator(style: .medium)
                 generator.impactOccurred()
                 isSelecting = true

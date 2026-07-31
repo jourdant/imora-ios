@@ -37,7 +37,7 @@ struct BackupScreen: View {
             }
             .accessibilityIdentifier("backup-auto-toggle")
         } footer: {
-            Text("Photos and videos upload to your server while the app is open. New uploads appear in the timeline after pull-to-refresh.")
+            Text("Photos and videos upload to your server while the app is open. New uploads appear in the timeline automatically.")
         }
     }
 

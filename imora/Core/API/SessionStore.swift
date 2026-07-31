@@ -15,6 +15,7 @@ final class SessionStore {
     private(set) var user: CurrentUser?
     private(set) var features: ServerFeatures?
     private(set) var backup: BackupManager?
+    private(set) var realtime: RealtimeHub?
     var preferences: UserPreferences?
 
     private static let serverKey = "imora.serverURL"
@@ -68,6 +69,8 @@ final class SessionStore {
             await client.logout()
         }
         KeychainStore.delete(Self.tokenKey)
+        realtime?.shutdown()
+        realtime = nil
         backup?.shutdown()
         backup = nil
         client = nil
@@ -84,6 +87,7 @@ final class SessionStore {
         if let user = await userTask {
             self.user = user
             backup?.userId = user.id
+            await backup?.primeLocalState()
         }
         if let features = await featuresTask { self.features = features }
         if let preferences = await preferencesTask { self.preferences = preferences }
@@ -96,8 +100,12 @@ final class SessionStore {
         let backup = BackupManager(client: client)
         backup.userId = user?.id
         self.backup = backup
+        let hub = RealtimeHub(client: client)
+        backup.onLocalChange = { [weak hub] in hub?.notifyLocalChange() }
+        realtime = hub
         state = .loggedIn
         Task { await refreshUser() }
         backup.startIfIdle()
+        hub.setActive(true)
     }
 }

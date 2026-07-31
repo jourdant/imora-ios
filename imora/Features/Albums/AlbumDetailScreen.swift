@@ -58,6 +58,11 @@ struct AlbumDetailScreen: View {
         }
         .animation(.smooth(duration: 0.25), value: feedback)
         .task { await refreshAlbum() }
+        // metadata edits from other clients arrive over the realtime channel;
+        // the grid itself resyncs through the timeline model.
+        .onChange(of: session.realtime?.albumsGeneration ?? 0) {
+            Task { await refreshAlbum() }
+        }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .edit:

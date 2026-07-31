@@ -29,6 +29,33 @@ nonisolated struct DeviceAsset: Sendable {
     let modificationDate: Date?
     let isFavorite: Bool
     let durationMs: Int
+    let pixelWidth: Int
+    let pixelHeight: Int
+
+    /// timeline representation of a device asset that is not on the server
+    /// yet. dates follow the photographer-local convention the grids use.
+    func asAsset(backedUp: Bool) -> Asset {
+        let created = creationDate ?? modificationDate ?? .distantPast
+        return Asset(
+            id: "local-\(localIdentifier)",
+            ownerId: "",
+            isImage: !isVideo,
+            isFavorite: isFavorite,
+            isTrashed: false,
+            visibility: .timeline,
+            thumbhash: nil,
+            fileCreatedAt: created,
+            localOffsetHours: Double(TimeZone.current.secondsFromGMT(for: created)) / 3600,
+            duration: isVideo ? durationMs : nil,
+            livePhotoVideoId: nil,
+            ratio: pixelHeight > 0 ? Double(pixelWidth) / Double(pixelHeight) : 1,
+            city: nil,
+            country: nil,
+            createdAt: nil,
+            localIdentifier: localIdentifier,
+            isLocalBackedUp: backedUp
+        )
+    }
 }
 
 /// photokit wrapper for backup: scanning, hashing, exporting and deleting.
@@ -90,7 +117,9 @@ nonisolated enum PhotoLibraryService {
             creationDate: asset.creationDate,
             modificationDate: asset.modificationDate,
             isFavorite: asset.isFavorite,
-            durationMs: Int(asset.duration * 1000)
+            durationMs: Int(asset.duration * 1000),
+            pixelWidth: asset.pixelWidth,
+            pixelHeight: asset.pixelHeight
         )
     }
 

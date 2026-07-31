@@ -28,6 +28,20 @@ nonisolated struct CleanupReport: Equatable, Sendable {
     var keptLocalOnly = 0
 }
 
+/// live per-asset upload state, keyed by local identifier. drives the
+/// progress overlay on timeline tiles.
+nonisolated enum LocalUploadState: Equatable, Sendable {
+    case uploading(Double)
+    case failed
+}
+
+/// device asset paired with what the backup index knows about it.
+nonisolated struct LocalTimelineItem: Sendable {
+    let device: DeviceAsset
+    let remoteId: String?
+    let backedUp: Bool
+}
+
 /// per-install identifier sent as deviceId on uploads. dedup is checksum
 /// based, so a fresh id after reinstall is harmless.
 nonisolated enum DeviceID {
@@ -54,6 +68,14 @@ final class BackupManager {
     /// first per-asset failure of the current run, for display next to counts.
     private(set) var lastFailure: String?
     var userId: String?
+
+    /// per-asset upload progress for tile overlays.
+    private(set) var uploadStates: [String: LocalUploadState] = [:]
+    /// remote ids proven to be fully backed up from this device, for the
+    /// merged cloud badge on remote tiles.
+    private(set) var backedUpRemoteIds: Set<String> = []
+    /// wired by sessionstore to the realtime hub, which debounces.
+    var onLocalChange: (() -> Void)?
 
     var autoBackup: Bool {
         didSet {
@@ -129,8 +151,10 @@ final class BackupManager {
         if !isRunning { start() }
     }
 
+    /// the observer keeps the merged timeline fresh, so it registers with
+    /// full access alone - auto backup only decides whether uploads start.
     private func updateChangeObserver() {
-        if autoBackup, PhotoLibraryService.hasFullAccess {
+        if PhotoLibraryService.hasFullAccess {
             guard changeObserver == nil else { return }
             let observer = LibraryChangeObserver { [weak self] in
                 guard let self else { return }
@@ -145,11 +169,58 @@ final class BackupManager {
     }
 
     private func libraryChanged() {
+        LocalImageLoader.shared.noteLibraryChange()
+        localChanged()
         if isRunning {
             rerunRequested = true
         } else {
             startIfIdle()
         }
+    }
+
+    // MARK: - local timeline support
+
+    /// refreshes the badge snapshot and tells the hub the device library or
+    /// index changed.
+    private func localChanged() {
+        Task { [weak self] in
+            guard let self else { return }
+            self.backedUpRemoteIds = await self.index.backedUpRemoteIds()
+            self.onLocalChange?()
+        }
+    }
+
+    /// loads the index for the signed-in account so badges and the merged
+    /// timeline are right from the first frame.
+    func primeLocalState() async {
+        guard let userId else { return }
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
+        backedUpRemoteIds = await index.backedUpRemoteIds()
+        updateChangeObserver()
+        onLocalChange?()
+    }
+
+    /// every device asset paired with its backup status, newest first.
+    func localTimelineAssets() async -> [LocalTimelineItem] {
+        guard PhotoLibraryService.hasFullAccess, let userId else { return [] }
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
+        let entries = await index.allEntries()
+        let scanned = await PhotoLibraryService.scan()
+        return scanned.map { asset in
+            let entry = entries[asset.localIdentifier]
+            return LocalTimelineItem(
+                device: asset,
+                remoteId: entry?.primaryRemoteId,
+                backedUp: entry?.isBackedUp ?? false
+            )
+        }
+    }
+
+    private func noteUploadProgress(_ localId: String, _ fraction: Double) {
+        guard case .uploading(let current) = uploadStates[localId] else { return }
+        // quantized so progress redraws stay coarse.
+        guard fraction >= 1 || fraction - current >= 0.02 else { return }
+        uploadStates[localId] = .uploading(min(fraction, 1))
     }
 
     // MARK: - pipeline
@@ -174,6 +245,7 @@ final class BackupManager {
 
             try await hashPhase(scanned)
             let pending = try await checkPhase(scanned)
+            localChanged()
             try await uploadPhase(pending)
 
             await index.save()
@@ -185,6 +257,8 @@ final class BackupManager {
             await index.save()
             phase = .error(error.localizedDescription)
         }
+        uploadStates.removeAll()
+        localChanged()
         runTask = nil
         if rerunRequested {
             rerunRequested = false
@@ -293,33 +367,50 @@ final class BackupManager {
         let deviceId = DeviceID.current
         let scratch = Self.scratchDirectory
         var quotaMessage: String?
+        let progress: @Sendable (String, Double) -> Void = { [weak self] localId, fraction in
+            Task { @MainActor in self?.noteUploadProgress(localId, fraction) }
+        }
 
-        await withTaskGroup(of: UploadOutcome.self) { group in
+        await withTaskGroup(of: (String, UploadOutcome).self) { group in
             var next = 0
             var done = 0
             func addNext() {
                 guard next < queue.count, quotaMessage == nil else { return }
                 let asset = queue[next]
                 next += 1
+                uploadStates[asset.localIdentifier] = .uploading(0)
                 group.addTask {
-                    await Self.uploadOne(asset: asset, client: client, index: index, deviceId: deviceId, scratch: scratch)
+                    let outcome = await Self.uploadOne(
+                        asset: asset, client: client, index: index,
+                        deviceId: deviceId, scratch: scratch, onProgress: progress
+                    )
+                    return (asset.localIdentifier, outcome)
                 }
             }
             for _ in 0..<Self.uploadWorkers { addNext() }
-            while let outcome = await group.next() {
+            while let (localId, outcome) = await group.next() {
                 done += 1
                 switch outcome {
-                case .uploaded: summary.uploaded += 1
-                case .duplicate: summary.duplicates += 1
+                case .uploaded:
+                    summary.uploaded += 1
+                    uploadStates[localId] = nil
+                case .duplicate:
+                    summary.duplicates += 1
+                    uploadStates[localId] = nil
                 case .failed(let reason):
                     if lastFailure == nil { lastFailure = reason }
                     summary.failed += 1
-                case .skipped: summary.skipped += 1
+                    markUploadFailed(localId)
+                case .skipped:
+                    summary.skipped += 1
+                    uploadStates[localId] = nil
                 case .quota(let message):
                     // nothing else can succeed once the account is full.
                     quotaMessage = message
+                    uploadStates[localId] = nil
                     group.cancelAll()
                 }
+                localChanged()
                 phase = .uploading(done: done, total: queue.count)
                 addNext()
             }
@@ -327,6 +418,17 @@ final class BackupManager {
         try Task.checkCancellation()
         if let quotaMessage {
             throw ImmichError.http(400, quotaMessage)
+        }
+    }
+
+    /// the red error overlay lingers briefly, then the tile falls back to
+    /// the not-backed-up badge, mirroring the official client.
+    private func markUploadFailed(_ localId: String) {
+        uploadStates[localId] = .failed
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, self.uploadStates[localId] == .failed else { return }
+            self.uploadStates[localId] = nil
         }
     }
 
@@ -348,7 +450,8 @@ final class BackupManager {
         client: ImmichClient,
         index: BackupIndex,
         deviceId: String,
-        scratch: URL
+        scratch: URL,
+        onProgress: @escaping @Sendable (String, Double) -> Void
     ) async -> UploadOutcome {
         // the asset may have changed or vanished since the scan.
         guard let current = await PhotoLibraryService.assetInfo(localIdentifier: asset.localIdentifier) else {
@@ -400,7 +503,9 @@ final class BackupManager {
                     isFavorite: false,
                     durationMs: 0,
                     hidden: true
-                ))
+                )) { fraction in
+                    onProgress(current.localIdentifier, fraction)
+                }
                 // persisted immediately so a failed still upload resumes here.
                 await index.setMotionRemoteId(localId: current.localIdentifier, result.id)
                 await index.save()
@@ -423,7 +528,9 @@ final class BackupManager {
                     isFavorite: current.isFavorite,
                     durationMs: current.isVideo ? current.durationMs : 0,
                     livePhotoVideoId: motionRemoteId
-                ))
+                )) { fraction in
+                    onProgress(current.localIdentifier, fraction)
+                }
                 await index.setPrimaryRemoteId(localId: current.localIdentifier, result.id)
                 await index.save()
                 if !result.isDuplicate { uploadedSomething = true }
@@ -454,6 +561,7 @@ final class BackupManager {
         Task {
             await index.remove(ids: localIds)
             await index.save()
+            localChanged()
         }
     }
 
@@ -506,6 +614,7 @@ final class BackupManager {
                 await index.setMotionRemoteId(localId: localId, motionId)
             }
             await index.save()
+            localChanged()
             return localId
         } catch {
             // on success the files were moved into the library; on any failure
@@ -597,6 +706,7 @@ final class BackupManager {
         try await PhotoLibraryService.delete(localIdentifiers: ids)
         await index.remove(ids: ids)
         await index.save()
+        localChanged()
         return ids.count
     }
 }

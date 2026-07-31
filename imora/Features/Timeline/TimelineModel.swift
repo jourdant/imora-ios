@@ -52,6 +52,9 @@ nonisolated enum TimelineRow: Identifiable, Hashable {
 @Observable
 final class TimelineModel {
     let filter: TimelineFilter
+    /// main timeline only: device photos not yet on the server appear in the
+    /// grid with backup badges, google-photos style.
+    let mergesLocal: Bool
     private(set) var sections: [TimelineSection] = []
     private(set) var rows: [TimelineRow] = []
     private(set) var monthByRowID: [String: String] = [:]
@@ -73,6 +76,7 @@ final class TimelineModel {
     }
 
     private var client: ImmichClient?
+    private var backup: BackupManager?
     private var inflightBuckets: Set<String> = []
     private var flatAssetIndexByID: [String: Int] = [:]
     private var prefetchTask: Task<Void, Never>?
@@ -81,25 +85,38 @@ final class TimelineModel {
     private var hasLoaded = false
     private var isViewerSuspended = false
     private var rebuildPending = false
+    /// device assets paired with backup status, merged during row building.
+    private var localItems: [LocalTimelineItem] = []
+    private var resyncTask: Task<Void, Never>?
+    private var resyncAgain = false
+    private var resyncPending = false
 
-    init(filter: TimelineFilter) {
+    init(filter: TimelineFilter, mergesLocal: Bool = false) {
         self.filter = filter
+        self.mergesLocal = mergesLocal
     }
 
     deinit {
         prefetchTask?.cancel()
         rebuildTask?.cancel()
+        resyncTask?.cancel()
     }
 
-    var isEmpty: Bool { !isLoading && sections.isEmpty }
+    /// rows cover both server sections and merged device photos.
+    var isEmpty: Bool { !isLoading && rows.isEmpty }
 
     func flatAssetIndex(for id: String) -> Int? {
         flatAssetIndexByID[id]
     }
 
-    func attach(_ client: ImmichClient) {
-        guard self.client == nil else { return }
-        self.client = client
+    func attach(_ client: ImmichClient, backup: BackupManager? = nil, hub: RealtimeHub? = nil) {
+        if self.client == nil {
+            self.client = client
+        }
+        if mergesLocal, self.backup == nil {
+            self.backup = backup
+        }
+        hub?.addListener(self)
     }
 
     func load() async {
@@ -111,27 +128,7 @@ final class TimelineModel {
         do {
             try await reloadSections(using: client)
             hasLoaded = true
-        } catch is CancellationError {
-            return
-        } catch {
-            loadError = error.localizedDescription
-        }
-    }
-
-    func refresh() async {
-        guard let client else { return }
-        prefetchTask?.cancel()
-        prefetchTask = nil
-        prefetchID = nil
-        rebuildTask?.cancel()
-        rebuildTask = nil
-        rebuildPending = false
-        inflightBuckets.removeAll()
-        loadError = nil
-
-        do {
-            try await reloadSections(using: client)
-            hasLoaded = true
+            await refreshLocalItems()
         } catch is CancellationError {
             return
         } catch {
@@ -224,7 +221,7 @@ final class TimelineModel {
         var sectionDayHeaders = 0
         var sectionTileRows = 0
 
-        for section in sections {
+        for section in mergedSections() {
             let monthID = "m-\(section.id)"
             result.append(.monthHeader(monthID, section.monthTitle))
             monthByRowID[monthID] = section.monthTitle
@@ -242,7 +239,9 @@ final class TimelineModel {
                     }
 
                     let dayID = "d-\(section.id)-\(day.id)"
-                    result.append(.dayHeader(dayID, day.title, day.assets.map(\.id)))
+                    // select-all only targets server assets; local tiles are
+                    // outside selection until they are backed up.
+                    result.append(.dayHeader(dayID, day.title, day.assets.filter { !$0.isLocal }.map(\.id)))
                     monthByRowID[dayID] = section.monthTitle
                     sectionDayHeaders += 1
 
@@ -331,6 +330,234 @@ final class TimelineModel {
             rebuildRows(rebuildAssets: true)
         }
         startPrefetch()
+        if resyncPending {
+            resyncPending = false
+            requestResync()
+        }
+    }
+
+    // MARK: - realtime resync
+
+    /// diffs bucket counts against the server and refetches only what
+    /// changed. cheap enough to run on every websocket burst.
+    func requestResync() {
+        guard client != nil else { return }
+        guard hasLoaded else {
+            // a failed first load retries here, e.g. app started offline.
+            if !isLoading { Task { await load() } }
+            return
+        }
+        guard !isViewerSuspended else {
+            resyncPending = true
+            return
+        }
+        guard resyncTask == nil else {
+            resyncAgain = true
+            return
+        }
+        resyncTask = Task { [weak self] in
+            await self?.resync()
+            guard let self else { return }
+            self.resyncTask = nil
+            if self.resyncAgain {
+                self.resyncAgain = false
+                self.requestResync()
+            }
+        }
+    }
+
+    private func resync() async {
+        guard let client else { return }
+        do {
+            let buckets = try await client.timeBuckets(filter)
+            guard !isViewerSuspended else {
+                resyncPending = true
+                return
+            }
+            let existingByID = Dictionary(sections.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var fresh: [TimelineSection] = []
+            var toFetch: [String] = []
+            var dirty = buckets.count != sections.count
+            for bucket in buckets {
+                if let existing = existingByID[bucket.timeBucket] {
+                    if existing.count == bucket.count {
+                        fresh.append(existing)
+                    } else {
+                        dirty = true
+                        fresh.append(TimelineSection(
+                            id: existing.id,
+                            monthTitle: existing.monthTitle,
+                            count: bucket.count,
+                            days: existing.days
+                        ))
+                        if existing.isLoaded { toFetch.append(bucket.timeBucket) }
+                    }
+                } else {
+                    // a brand-new month, straight to the top: fetch eagerly.
+                    dirty = true
+                    fresh.append(TimelineSection(
+                        id: bucket.timeBucket,
+                        monthTitle: Self.monthTitle(for: bucket.timeBucket),
+                        count: bucket.count,
+                        days: nil
+                    ))
+                    toFetch.append(bucket.timeBucket)
+                }
+            }
+            guard dirty else { return }
+            sections = fresh
+            for id in toFetch {
+                guard !isViewerSuspended else {
+                    resyncPending = true
+                    break
+                }
+                if let assets = try? await client.timeBucket(id, filter: filter),
+                   let index = sections.firstIndex(where: { $0.id == id }) {
+                    sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
+                }
+            }
+            rebuildRows(rebuildAssets: true)
+            await refreshLocalItems()
+        } catch {
+            // stale is fine; the next event, tick or foreground pass retries.
+        }
+    }
+
+    // MARK: - local merge
+
+    /// re-reads device assets and their backup status, then rebuilds rows.
+    func refreshLocalItems() async {
+        guard mergesLocal, let backup else { return }
+        let items = await backup.localTimelineAssets()
+        localItems = items
+        if isViewerSuspended {
+            rebuildPending = true
+        } else {
+            rebuildRows(rebuildAssets: true)
+        }
+    }
+
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
+
+    private static func monthKey(for date: Date) -> String {
+        let comps = utcCalendar.dateComponents([.year, .month], from: date)
+        return String(format: "%04d-%02d-01", comps.year ?? 0, comps.month ?? 0)
+    }
+
+    /// server sections with device-only assets woven in. server data stays
+    /// untouched in `sections`; the merge is recomputed on every rebuild.
+    private func mergedSections() -> [TimelineSection] {
+        guard mergesLocal, !localItems.isEmpty else { return sections }
+
+        // server assets already in the grid hide their device twins, so an
+        // upload swaps tiles without ever showing the photo twice.
+        var loadedServerIDs: Set<String> = []
+        for section in sections {
+            guard let days = section.days else { continue }
+            for day in days {
+                for asset in day.assets { loadedServerIDs.insert(asset.id) }
+            }
+        }
+
+        var byMonth: [String: [Asset]] = [:]
+        for item in localItems {
+            if let remoteId = item.remoteId, loadedServerIDs.contains(remoteId) { continue }
+            let asset = item.device.asAsset(backedUp: item.backedUp)
+            byMonth[Self.monthKey(for: asset.localDate), default: []].append(asset)
+        }
+        guard !byMonth.isEmpty else { return sections }
+        for key in byMonth.keys {
+            byMonth[key]?.sort { $0.localDate > $1.localDate }
+        }
+
+        var merged: [TimelineSection] = []
+        var remainingMonths = Set(byMonth.keys)
+        for section in sections {
+            let key = Self.bucketDate(section.id).map(Self.monthKey(for:)) ?? section.id
+            if let locals = byMonth[key], section.days != nil {
+                merged.append(Self.mergeSection(section, locals: locals))
+                remainingMonths.remove(key)
+            } else {
+                // unloaded buckets keep their placeholder; their local
+                // photos appear once the prefetch loads the month.
+                if section.days == nil { remainingMonths.remove(key) }
+                merged.append(section)
+            }
+        }
+
+        // months that only exist on the device get sections of their own.
+        for key in remainingMonths.sorted(by: >) {
+            guard let locals = byMonth[key], let monthDate = Self.bucketDate(key) else { continue }
+            let days = Self.groupByDay(locals)
+            let section = TimelineSection(id: key, monthTitle: Self.monthTitle(for: key), count: locals.count, days: days)
+            let index = merged.firstIndex { existing in
+                guard let date = Self.bucketDate(existing.id) else { return false }
+                return date < monthDate
+            } ?? merged.count
+            merged.insert(section, at: index)
+        }
+        return merged
+    }
+
+    private static func mergeSection(_ section: TimelineSection, locals: [Asset]) -> TimelineSection {
+        guard var days = section.days else { return section }
+
+        var localsByDay: [String: [Asset]] = [:]
+        for asset in locals {
+            let comps = utcCalendar.dateComponents([.year, .month, .day], from: asset.localDate)
+            let key = "\(comps.year ?? 0)-\(comps.month ?? 0)-\(comps.day ?? 0)"
+            localsByDay[key, default: []].append(asset)
+        }
+
+        for i in days.indices {
+            guard let extra = localsByDay.removeValue(forKey: days[i].id) else { continue }
+            days[i] = DayGroup(
+                id: days[i].id,
+                title: days[i].title,
+                assets: mergeSortedByLocalDate(days[i].assets, extra)
+            )
+        }
+        for (key, assets) in localsByDay {
+            guard let date = assets.first?.localDate else { continue }
+            let day = DayGroup(id: key, title: dayTitle(date, calendar: utcCalendar), assets: assets)
+            let index = days.firstIndex { existing in
+                guard let existingDate = existing.assets.first?.localDate else { return false }
+                return existingDate < date
+            } ?? days.count
+            days.insert(day, at: index)
+        }
+
+        return TimelineSection(
+            id: section.id,
+            monthTitle: section.monthTitle,
+            count: section.count + locals.count,
+            days: days
+        )
+    }
+
+    /// merges two lists already sorted newest-first, preserving each side's
+    /// internal order on ties.
+    private static func mergeSortedByLocalDate(_ a: [Asset], _ b: [Asset]) -> [Asset] {
+        var result: [Asset] = []
+        result.reserveCapacity(a.count + b.count)
+        var i = 0
+        var j = 0
+        while i < a.count && j < b.count {
+            if a[i].localDate >= b[j].localDate {
+                result.append(a[i])
+                i += 1
+            } else {
+                result.append(b[j])
+                j += 1
+            }
+        }
+        result.append(contentsOf: a[i...])
+        result.append(contentsOf: b[j...])
+        return result
     }
 
     // MARK: - mutations
@@ -443,5 +670,38 @@ final class TimelineModel {
 
     private static func nowShifted() -> Date {
         Date().addingTimeInterval(TimeInterval(TimeZone.current.secondsFromGMT()))
+    }
+}
+
+// MARK: - realtime
+
+extension TimelineModel: RealtimeListener {
+    func realtimeAssetsRemoved(_ ids: Set<String>) {
+        guard ids.contains(where: { flatAssetIndex(for: $0) != nil }) else { return }
+        removeAssets(ids: ids)
+    }
+
+    func realtimeAssetUpdated(_ detail: AssetDetail) {
+        guard flatAssetIndex(for: detail.id) != nil else { return }
+        let fresh = detail.asAsset()
+        updateAssets(ids: [detail.id]) { asset in
+            asset.isFavorite = fresh.isFavorite
+            asset.isTrashed = fresh.isTrashed
+            asset.visibility = fresh.visibility
+        }
+        // membership changes, like unfavoriting on the favorites grid,
+        // resolve through the resync that follows the same event.
+    }
+
+    func realtimeResync() {
+        requestResync()
+    }
+
+    func realtimeAlbumsChanged() {
+        if filter.albumId != nil { requestResync() }
+    }
+
+    func realtimeLocalChanged() {
+        Task { await refreshLocalItems() }
     }
 }

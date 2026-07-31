@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 final class ImoraUITests: XCTestCase {
@@ -183,7 +184,7 @@ final class ImoraUITests: XCTestCase {
                 .firstMatch
         }
 
-        XCTAssertTrue(waitForValue("\(assetID)|loaded", on: tileForAsset(), timeout: 10), "thumbnail did not finish loading")
+        XCTAssertTrue(waitForValuePrefix("\(assetID)|loaded", on: tileForAsset(), timeout: 10), "thumbnail did not finish loading")
 
         for _ in 0..<5 {
             let tile = tileForAsset()
@@ -204,7 +205,11 @@ final class ImoraUITests: XCTestCase {
 
             let tileAfterClose = tileForAsset()
             XCTAssertTrue(tileAfterClose.waitForExistence(timeout: 2), "tile disappeared after viewer dismissal")
-            XCTAssertEqual(tileAfterClose.value as? String, "\(assetID)|loaded", "thumbnail returned to a placeholder")
+            // prefix match: badge grids append a third value segment.
+            XCTAssertTrue(
+                (tileAfterClose.value as? String)?.hasPrefix("\(assetID)|loaded") == true,
+                "thumbnail returned to a placeholder"
+            )
         }
 
         // burst: reopen immediately after each close with no settling waits,
@@ -541,8 +546,8 @@ final class ImoraUITests: XCTestCase {
     }
 
     @MainActor
-    private func waitForValue(_ value: String, on element: XCUIElement, timeout: TimeInterval) -> Bool {
-        let predicate = NSPredicate(format: "value == %@", value)
+    private func waitForValuePrefix(_ value: String, on element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate(format: "value BEGINSWITH %@", value)
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
@@ -552,6 +557,130 @@ final class ImoraUITests: XCTestCase {
         let predicate = NSPredicate(format: "exists == false")
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    // MARK: - e2e against the disposable docker immich
+
+    /// uploads an asset through the api while the app is open and expects the
+    /// timeline to gain and lose tiles with no pull-to-refresh at all.
+    @MainActor
+    func testRealtimeTimelineUpdates() async throws {
+        try skipUnlessE2E()
+        let server = try await E2EServer.logIn()
+        let app = launchE2EApp()
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+        sleep(3)
+
+        // upload from the outside, like another device would.
+        let assetId = try await server.uploadTinyImage()
+        let tile = tileForAsset(assetId, in: app)
+        XCTAssertTrue(tile.waitForExistence(timeout: 25), "uploaded asset never appeared in the timeline")
+        snap("realtime-appeared")
+
+        // trash from the outside; the tile must vanish on its own.
+        try await server.trash(ids: [assetId])
+        let gone = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: tile)
+        await fulfillment(of: [gone], timeout: 25)
+        snap("realtime-removed")
+    }
+
+    /// enables backup, grants photo access, and expects device photos to end
+    /// up on the server with cloud badges on their tiles.
+    @MainActor
+    func testBackupBadgesEndToEnd() async throws {
+        try skipUnlessE2E()
+        _ = try await E2EServer.logIn()
+        let app = launchE2EApp()
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+
+        // settings -> backup -> back up now. the plain button is reliable
+        // under xcui where the form toggle tap can miss, and start() asks
+        // for photo access itself.
+        app.navigationBars["Photos"].buttons.firstMatch.tap()
+        let backupRow = app.descendants(matching: .any).matching(identifier: "settings-backup").firstMatch
+        XCTAssertTrue(backupRow.waitForExistence(timeout: 10), "backup row missing")
+        backupRow.tap()
+        sleep(2)
+        let start = app.descendants(matching: .any).matching(identifier: "backup-start").firstMatch
+        XCTAssertTrue(start.waitForExistence(timeout: 10), "backup start button missing")
+        start.tap()
+        allowFullPhotoAccess()
+
+        // a tap landing during the push transition misses silently: retry.
+        let status = app.descendants(matching: .any).matching(identifier: "backup-status").firstMatch
+        sleep(3)
+        if status.exists, status.label.hasPrefix("Waiting") {
+            if start.exists { start.tap() }
+            allowFullPhotoAccess()
+        }
+
+        // the simulator library is small; give hashing plus uploads a while.
+        let done = expectation(
+            for: NSPredicate(format: "label BEGINSWITH 'Done'"),
+            evaluatedWith: status
+        )
+        await fulfillment(of: [done], timeout: 240)
+        snap("backup-done")
+
+        // back to the timeline: pop to the settings root, then close the
+        // sheet - the close button only lives on the root toolbar.
+        app.navigationBars.buttons.firstMatch.tap()
+        let close = app.descendants(matching: .any).matching(identifier: "settings-close").firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "settings close missing")
+        close.tap()
+        sleep(2)
+        let backedTile = app.descendants(matching: .any)
+            .matching(identifier: "asset-tile")
+            .matching(NSPredicate(format: "value ENDSWITH '|cloud-done'"))
+            .firstMatch
+        XCTAssertTrue(backedTile.waitForExistence(timeout: 30), "no backed-up badge appeared")
+
+        // device-only tiles must have swapped to their server twins by now.
+        let localTile = app.descendants(matching: .any)
+            .matching(identifier: "asset-tile")
+            .matching(NSPredicate(format: "value BEGINSWITH 'local-'"))
+            .firstMatch
+        let swapped = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: localTile)
+        await fulfillment(of: [swapped], timeout: 30)
+        snap("badges-backed-up")
+    }
+
+    private func skipUnlessE2E() throws {
+        guard ProcessInfo.processInfo.environment["IMORA_TEST_E2E"] == "1" else {
+            throw XCTSkip("set IMORA_TEST_E2E=1 with scripts/e2e-immich running")
+        }
+    }
+
+    @MainActor
+    private func launchE2EApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["IMORA_SERVER"] = E2EServer.root
+        app.launchEnvironment["IMORA_EMAIL"] = E2EServer.email
+        app.launchEnvironment["IMORA_PASSWORD"] = E2EServer.password
+        app.launch()
+        return app
+    }
+
+    @MainActor
+    private func tileForAsset(_ id: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(identifier: "asset-tile")
+            .matching(NSPredicate(format: "value BEGINSWITH %@", id))
+            .firstMatch
+    }
+
+    /// answers the system photos dialog when it shows; a clone that already
+    /// granted access simply has no dialog.
+    @MainActor
+    private func allowFullPhotoAccess() {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for label in ["Allow Full Access", "Allow Access to All Photos", "Allow"] {
+            let button = springboard.buttons[label]
+            if button.waitForExistence(timeout: 5) {
+                button.tap()
+                return
+            }
+        }
     }
 
     @MainActor
@@ -570,5 +699,111 @@ final class ImoraUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+// MARK: - e2e api client
+
+/// thin rest client for the disposable docker immich the e2e tests drive
+/// from the outside, playing the role of another device.
+private struct E2EServer {
+    static let root = "http://localhost:2283"
+    static let email = "e2e@imora.test"
+    static let password = "imora-e2e-pass"
+
+    private static var api: URL { URL(string: root + "/api")! }
+
+    let token: String
+
+    static func logIn() async throws -> E2EServer {
+        // the first run against a fresh server creates the admin; later runs
+        // get a 400 here, which is fine.
+        _ = try? await postJSON("auth/admin-sign-up", body: [
+            "name": "E2E", "email": email, "password": password,
+        ])
+        let data = try await postJSON("auth/login", body: ["email": email, "password": password])
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = object["accessToken"] as? String
+        else {
+            throw NSError(domain: "e2e", code: 1, userInfo: [NSLocalizedDescriptionKey: "login failed"])
+        }
+        return E2EServer(token: token)
+    }
+
+    /// uploads a tiny generated png with unique bytes, so a rerun never
+    /// collides with the checksum of a previously trashed copy.
+    func uploadTinyImage() async throws -> String {
+        let size = CGSize(width: 240, height: 240)
+        let marker = UUID().uuidString
+        let image = UIGraphicsImageRenderer(size: size).image { context in
+            UIColor.systemIndigo.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            (marker as NSString).draw(
+                at: CGPoint(x: 10, y: 110),
+                withAttributes: [.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 11)]
+            )
+        }
+        guard let png = image.pngData() else {
+            throw NSError(domain: "e2e", code: 2, userInfo: [NSLocalizedDescriptionKey: "png render failed"])
+        }
+
+        let iso = ISO8601DateFormatter()
+        let now = iso.string(from: Date())
+        let boundary = "e2e-\(UUID().uuidString)"
+        var body = Data()
+        func field(_ name: String, _ value: String) {
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
+        }
+        field("deviceAssetId", "e2e-\(marker)")
+        field("deviceId", "e2e-runner")
+        field("fileCreatedAt", now)
+        field("fileModifiedAt", now)
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"e2e-\(marker).png\"\r\nContent-Type: image/png\r\n\r\n".utf8))
+        body.append(png)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+        var request = URLRequest(url: Self.api.appending(path: "assets"))
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = object["id"] as? String
+        else {
+            throw NSError(domain: "e2e", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "upload failed: \(String(data: data, encoding: .utf8) ?? "")",
+            ])
+        }
+        return id
+    }
+
+    func trash(ids: [String]) async throws {
+        var request = URLRequest(url: Self.api.appending(path: "assets"))
+        request.httpMethod = "DELETE"
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["ids": ids])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "e2e", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "trash failed: \(String(data: data, encoding: .utf8) ?? "")",
+            ])
+        }
+    }
+
+    private static func postJSON(_ path: String, body: [String: String]) async throws -> Data {
+        var request = URLRequest(url: api.appending(path: path))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "e2e", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "\(path) failed: \(String(data: data, encoding: .utf8) ?? "")",
+            ])
+        }
+        return data
     }
 }

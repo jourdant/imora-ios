@@ -8,7 +8,8 @@ struct TimelineTab: View {
         NavigationStack {
             TimelineScreen(
                 title: "Photos",
-                filter: TimelineFilter(withPartners: true, withStacked: true)
+                filter: TimelineFilter(withPartners: true, withStacked: true),
+                mergesLocalPhotos: true
             ) {
                 MemoryLane()
             }

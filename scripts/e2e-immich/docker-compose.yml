@@ -1,0 +1,40 @@
+# disposable immich server for e2e tests. starts empty; tests sign up the
+# admin themselves (e2e@imora.test / imora-e2e-pass). the simulator reaches
+# it at http://localhost:2283. tear down with: docker compose down -v
+name: imora-e2e
+
+services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    environment:
+      DB_HOSTNAME: database
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      IMMICH_MACHINE_LEARNING_ENABLED: 'false'
+    volumes:
+      - upload:/data
+    ports:
+      - '2283:2283'
+    depends_on:
+      - redis
+      - database
+
+  redis:
+    image: docker.io/valkey/valkey:9
+
+  database:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - db:/var/lib/postgresql/data
+    shm_size: 128mb
+
+volumes:
+  upload:
+  db:

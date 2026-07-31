@@ -93,10 +93,59 @@ struct RemoteImage: View {
     }
 }
 
-/// square grid tile for an asset, with video and favorite badges.
+/// async device-library thumbnail, the photokit sibling of remoteimage.
+struct LocalPhotoImage: View {
+    let localIdentifier: String
+    var targetPixelSize: CGFloat = 640
+    var contentMode: ContentMode = .fill
+    var onPhaseChange: ((String) -> Void)?
+
+    @State private var image: KeyedImage?
+
+    private struct KeyedImage {
+        let key: String
+        let image: UIImage
+    }
+
+    private var requestKey: String {
+        "\(localIdentifier)#\(Int(targetPixelSize))"
+    }
+
+    var body: some View {
+        let cached = LocalImageLoader.shared.cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize)
+        let display = image?.key == requestKey ? image?.image : cached
+        ZStack {
+            if let display {
+                Image(uiImage: display)
+                    .resizable()
+                    .aspectRatio(contentMode: contentMode)
+            } else {
+                Color(.secondarySystemFill)
+            }
+        }
+        .onChange(of: display == nil, initial: true) { _, isEmpty in
+            onPhaseChange?(isEmpty ? "empty" : "loaded")
+        }
+        .task(id: requestKey) {
+            let key = requestKey
+            guard image?.key != key else { return }
+            let loaded = await LocalImageLoader.shared.image(
+                localIdentifier: localIdentifier,
+                targetPixelSize: targetPixelSize
+            )
+            guard !Task.isCancelled, let loaded else { return }
+            image = KeyedImage(key: key, image: loaded)
+        }
+    }
+}
+
+/// square grid tile for an asset, with video, favorite and backup badges.
 struct AssetTile: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
+    /// backup status in the corner plus the upload progress overlay. only
+    /// the main timeline shows these, matching the official client.
+    var showsBackupBadge = false
 
     @State private var thumbnailPhase = "empty"
 
@@ -104,7 +153,12 @@ struct AssetTile: View {
         Color.clear
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let client = session.client {
+                if let localId = asset.localIdentifier {
+                    LocalPhotoImage(
+                        localIdentifier: localId,
+                        onPhaseChange: { thumbnailPhase = $0 }
+                    )
+                } else if let client = session.client {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id),
                         targetPixelSize: 640,
@@ -134,10 +188,100 @@ struct AssetTile: View {
                         .padding(6)
                 }
             }
+            .overlay(alignment: .bottomTrailing) {
+                if showsBackupBadge { backupBadge }
+            }
+            .overlay {
+                if showsBackupBadge { uploadOverlay }
+            }
             .contentShape(.rect)
             .accessibilityIdentifier("asset-tile")
             // "assetid|phase" lets ui tests target one tile and observe its
-            // thumbnail state at the same time.
-            .accessibilityValue("\(asset.id)|\(thumbnailPhase)")
+            // thumbnail state at the same time; badge grids append the badge
+            // state as a third segment.
+            .accessibilityValue(
+                showsBackupBadge
+                    ? "\(asset.id)|\(thumbnailPhase)|\(badgeToken)"
+                    : "\(asset.id)|\(thumbnailPhase)"
+            )
+    }
+
+    // MARK: - backup status
+
+    private var uploadState: LocalUploadState? {
+        guard let localId = asset.localIdentifier else { return nil }
+        return session.backup?.uploadStates[localId]
+    }
+
+    private var badgeToken: String {
+        switch uploadState {
+        case .uploading: "uploading"
+        case .failed: "error"
+        case nil:
+            if asset.isLocal {
+                asset.isLocalBackedUp ? "cloud-done" : "cloud-off"
+            } else {
+                session.backup?.backedUpRemoteIds.contains(asset.id) == true ? "cloud-done" : "cloud"
+            }
+        }
+    }
+
+    @ViewBuilder private var backupBadge: some View {
+        if uploadState == nil {
+            if asset.isLocal {
+                badgeIcon(asset.isLocalBackedUp ? "checkmark.icloud" : "icloud.slash")
+            } else if session.backup?.backedUpRemoteIds.contains(asset.id) == true {
+                badgeIcon("checkmark.icloud")
+            } else {
+                badgeIcon("icloud")
+            }
+        }
+    }
+
+    private func badgeIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.6), radius: 2.5)
+            .padding(6)
+            .accessibilityIdentifier("badge-\(name)")
+    }
+
+    @ViewBuilder private var uploadOverlay: some View {
+        switch uploadState {
+        case .uploading(let fraction):
+            ZStack {
+                Color.black.opacity(0.54)
+                VStack(spacing: 4) {
+                    ZStack {
+                        Circle()
+                            .stroke(.white.opacity(0.24), lineWidth: 3)
+                        Circle()
+                            .trim(from: 0, to: max(0.03, fraction))
+                            .stroke(.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .animation(.linear(duration: 0.2), value: fraction)
+                    }
+                    .frame(width: 36, height: 36)
+                    Text("\(Int(fraction * 100))%")
+                        .font(.caption2.weight(.bold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                }
+            }
+        case .failed:
+            ZStack {
+                Color.red.opacity(0.6)
+                VStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.system(size: 30))
+                    Text("Error")
+                        .font(.caption2.weight(.bold))
+                }
+                .foregroundStyle(.white)
+            }
+        case nil:
+            EmptyView()
+        }
     }
 }
