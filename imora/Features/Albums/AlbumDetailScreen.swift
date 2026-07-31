@@ -95,24 +95,6 @@ struct AlbumDetailScreen: View {
                 ShareLinksSheet(target: .album(album)) { await refreshAlbum() }
             }
         }
-        .confirmationDialog(
-            "Delete \"\(album.albumName)\"?",
-            isPresented: $showDeleteConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Album", role: .destructive) { Task { await deleteAlbum() } }
-        } message: {
-            Text("The album is removed for everyone. Photos stay in your library.")
-        }
-        .confirmationDialog(
-            "Leave \"\(album.albumName)\"?",
-            isPresented: $showLeaveConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("Leave Album", role: .destructive) { Task { await leaveAlbum() } }
-        } message: {
-            Text("You will no longer see this album.")
-        }
         .onDisappear { feedbackTask?.cancel() }
     }
 
@@ -175,6 +157,27 @@ struct AlbumDetailScreen: View {
             Image(systemName: "ellipsis.circle")
         }
         .accessibilityIdentifier("album-menu")
+        // ios 26 morphs a confirmation out of its source control; the menu item
+        // is gone by then, so the dialogs anchor to the menu button itself.
+        // attached to the screen root they float detached in the middle.
+        .confirmationDialog(
+            "Delete \"\(album.albumName)\"?",
+            isPresented: $showDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Album", role: .destructive) { Task { await deleteAlbum() } }
+        } message: {
+            Text("The album is removed for everyone. Photos stay in your library.")
+        }
+        .confirmationDialog(
+            "Leave \"\(album.albumName)\"?",
+            isPresented: $showLeaveConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Leave Album", role: .destructive) { Task { await leaveAlbum() } }
+        } message: {
+            Text("You will no longer see this album.")
+        }
     }
 
     // MARK: - actions

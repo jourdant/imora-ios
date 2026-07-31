@@ -181,11 +181,13 @@ struct TrashScreen: View {
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
-            }
-        }
-        .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
-            Button("Empty Trash", role: .destructive) {
-                Task { try? await session.client?.emptyTrash() }
+                // ios 26 morphs the dialog out of its source control, so it sits
+                // on the menu button - on the screen root it floats detached.
+                .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
+                    Button("Empty Trash", role: .destructive) {
+                        Task { try? await session.client?.emptyTrash() }
+                    }
+                }
             }
         }
     }

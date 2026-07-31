@@ -233,6 +233,17 @@ struct AssetEditScreen: View {
                         }
                     }
                     .accessibilityIdentifier("edit-cancel")
+                    // ios 26 morphs the dialog out of its source control, so it
+                    // belongs on Cancel - from the screen root it anchors to the
+                    // window and floats detached.
+                    .confirmationDialog(
+                        "Discard Edits?",
+                        isPresented: $showDiscard,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Discard Changes", role: .destructive) { finish(.cancelled) }
+                        Button("Keep Editing", role: .cancel) {}
+                    }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     if isSaving {
@@ -245,14 +256,6 @@ struct AssetEditScreen: View {
                             .accessibilityIdentifier("edit-done")
                     }
                 }
-            }
-            .confirmationDialog(
-                "Discard Edits?",
-                isPresented: $showDiscard,
-                titleVisibility: .visible
-            ) {
-                Button("Discard Changes", role: .destructive) { finish(.cancelled) }
-                Button("Keep Editing", role: .cancel) {}
             }
             .alert(saveError ?? "", isPresented: Binding(
                 get: { saveError != nil },

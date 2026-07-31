@@ -25,6 +25,33 @@ private enum ViewerConfirmation: Identifiable {
     }
 }
 
+/// ios 26 morphs a confirmation dialog out of the control that presented it, so
+/// the modifier has to live on that control - on the screen root it anchors to
+/// the whole window and the dialog floats in the middle pointing at nothing.
+/// every trigger tags its source and only the matching attachment presents.
+private enum ViewerConfirmationSource {
+    case toolbar
+    case menu
+}
+
+/// shared body for the viewer's per-source confirmation attachments.
+private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
+    @Binding var isPresented: Bool
+    let title: String
+    let message: String
+    @ViewBuilder let actions: () -> Actions
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            title,
+            isPresented: $isPresented,
+            titleVisibility: .visible,
+            actions: actions,
+            message: { Text(message) }
+        )
+    }
+}
+
 struct AssetViewerScreen: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -47,6 +74,7 @@ struct AssetViewerScreen: View {
     @State private var showEditor = false
     @State private var showProfileCrop = false
     @State private var confirmation: ViewerConfirmation?
+    @State private var confirmationSource: ViewerConfirmationSource = .toolbar
     @State private var airPlayTrigger = 0
     @State private var currentPageZoomed = false
     /// device copy of the current asset, when the backup index proves one exists.
@@ -241,16 +269,6 @@ struct AssetViewerScreen: View {
         ) {
             Button("OK", role: .cancel) {}
         }
-        .confirmationDialog(
-            confirmationTitle,
-            isPresented: Binding(
-                get: { confirmation != nil },
-                set: { if !$0 { confirmation = nil } }
-            ),
-            titleVisibility: .visible,
-            actions: { confirmationActions },
-            message: { Text(confirmationMessage) }
-        )
         .overlay(alignment: .top) {
             if let toast {
                 ToastBanner(text: toast) { self.toast = nil }
@@ -359,11 +377,12 @@ struct AssetViewerScreen: View {
         ToolbarItem(placement: .bottomBar) {
             if ownsCurrent {
                 Button(role: .destructive) {
-                    confirmation = .trash
+                    ask(.trash, from: .toolbar)
                 } label: {
                     Image(systemName: "trash")
                 }
                 .accessibilityIdentifier("viewer-trash")
+                .modifier(confirmationDialog(from: .toolbar))
             }
         }
     }
@@ -384,10 +403,11 @@ struct AssetViewerScreen: View {
 
         ToolbarItem(placement: .bottomBar) {
             Button(role: .destructive) {
-                confirmation = .deletePermanently
+                ask(.deletePermanently, from: .toolbar)
             } label: {
                 Image(systemName: "trash")
             }
+            .modifier(confirmationDialog(from: .toolbar))
         }
     }
 
@@ -409,10 +429,11 @@ struct AssetViewerScreen: View {
 
         ToolbarItem(placement: .bottomBar) {
             Button(role: .destructive) {
-                confirmation = .deleteFromDevice
+                ask(.deleteFromDevice, from: .toolbar)
             } label: {
                 Image(systemName: "trash")
             }
+            .modifier(confirmationDialog(from: .toolbar))
         }
     }
 
@@ -502,21 +523,21 @@ struct AssetViewerScreen: View {
 
                 Section {
                     Button(role: .destructive) {
-                        confirmation = .trash
+                        ask(.trash, from: .menu)
                     } label: {
                         Label("Move to Trash", systemImage: "trash")
                     }
                     .accessibilityIdentifier("viewer-delete")
                     if localIdentifier != nil {
                         Button(role: .destructive) {
-                            confirmation = .deleteFromDevice
+                            ask(.deleteFromDevice, from: .menu)
                         } label: {
                             Label("Delete from Device Only", systemImage: "iphone.slash")
                         }
                         .accessibilityIdentifier("viewer-delete-device")
                     }
                     Button(role: .destructive) {
-                        confirmation = .deletePermanently
+                        ask(.deletePermanently, from: .menu)
                     } label: {
                         Label("Delete Permanently", systemImage: "trash.slash")
                     }
@@ -525,6 +546,8 @@ struct AssetViewerScreen: View {
         } label: {
             Image(systemName: "ellipsis.circle")
         }
+        // the dialog anchors to the menu button, not to the vanished menu item.
+        .modifier(confirmationDialog(from: .menu))
     }
 
     private func backupStatePill(_ current: Asset) -> some View {
@@ -553,6 +576,23 @@ struct AssetViewerScreen: View {
     private var currentIsTrashed: Bool { current?.isTrashed == true }
 
     // MARK: - confirmation dialogs
+
+    private func ask(_ kind: ViewerConfirmation, from source: ViewerConfirmationSource) {
+        confirmationSource = source
+        confirmation = kind
+    }
+
+    private func confirmationDialog(from source: ViewerConfirmationSource) -> some ViewModifier {
+        ViewerConfirmationDialog(
+            isPresented: Binding(
+                get: { confirmation != nil && confirmationSource == source },
+                set: { if !$0 { confirmation = nil } }
+            ),
+            title: confirmationTitle,
+            message: confirmationMessage,
+            actions: { confirmationActions }
+        )
+    }
 
     private var confirmationTitle: String {
         let noun = current?.isVideo == true ? "Video" : "Photo"

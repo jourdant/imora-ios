@@ -207,33 +207,6 @@ struct AlbumOptionsSheet: View {
                     dismiss()
                 }
             }
-            .confirmationDialog(
-                "Remove \(userToRemove?.name ?? "")?",
-                isPresented: .init(
-                    get: { userToRemove != nil },
-                    set: { if !$0 { userToRemove = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                Button("Remove from Album", role: .destructive) {
-                    if let user = userToRemove {
-                        Task { await remove(user) }
-                    }
-                }
-            } message: {
-                Text("They will no longer see this album.")
-            }
-            .confirmationDialog(
-                "Leave \"\(album.albumName)\"?",
-                isPresented: $showLeaveConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Leave Album", role: .destructive) {
-                    Task { await leave() }
-                }
-            } message: {
-                Text("You will no longer see this album.")
-            }
         }
     }
 
@@ -278,6 +251,36 @@ struct AlbumOptionsSheet: View {
             } else if canLeave {
                 showLeaveConfirm = true
             }
+        }
+        // ios 26 morphs the dialog out of its source control, so it belongs on
+        // the tapped row - on the list root it floats detached.
+        .confirmationDialog(
+            "Remove \(user.name)?",
+            isPresented: .init(
+                get: { userToRemove?.id == user.id },
+                set: { if !$0 { userToRemove = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove from Album", role: .destructive) {
+                Task { await remove(user) }
+            }
+        } message: {
+            Text("They will no longer see this album.")
+        }
+        .confirmationDialog(
+            "Leave \"\(album.albumName)\"?",
+            isPresented: .init(
+                get: { showLeaveConfirm && canLeave },
+                set: { if !$0 { showLeaveConfirm = false } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Leave Album", role: .destructive) {
+                Task { await leave() }
+            }
+        } message: {
+            Text("You will no longer see this album.")
         }
     }
 

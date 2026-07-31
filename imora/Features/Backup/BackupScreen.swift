@@ -146,6 +146,23 @@ struct BackupScreen: View {
                 }
                 .disabled(backup.isRunning)
                 .accessibilityIdentifier("backup-cleanup")
+                // ios 26 morphs the dialog out of its source control, so it sits
+                // on the row - on the section it floats detached.
+                .confirmationDialog(
+                    confirmTitle,
+                    isPresented: $confirmCleanup,
+                    titleVisibility: .visible
+                ) {
+                    if case .ready(let report) = cleanup {
+                        Button("Delete \(report.eligible.count) Items", role: .destructive) {
+                            performCleanup(backup, report: report)
+                        }
+                        .accessibilityIdentifier("backup-cleanup-confirm")
+                        Button("Cancel", role: .cancel) {
+                            cleanup = .idle
+                        }
+                    }
+                }
             }
 
             if let summary = cleanupSummary {
@@ -158,21 +175,6 @@ struct BackupScreen: View {
             Text("Device Storage")
         } footer: {
             Text("Removes device copies of photos already backed up to your server. Photos not yet backed up stay on this device.")
-        }
-        .confirmationDialog(
-            confirmTitle,
-            isPresented: $confirmCleanup,
-            titleVisibility: .visible
-        ) {
-            if case .ready(let report) = cleanup {
-                Button("Delete \(report.eligible.count) Items", role: .destructive) {
-                    performCleanup(backup, report: report)
-                }
-                .accessibilityIdentifier("backup-cleanup-confirm")
-                Button("Cancel", role: .cancel) {
-                    cleanup = .idle
-                }
-            }
         }
     }
 

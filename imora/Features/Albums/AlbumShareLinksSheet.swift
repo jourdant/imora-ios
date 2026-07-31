@@ -132,22 +132,6 @@ struct ShareLinksSheet: View {
                 }
             }
             .task { await load() }
-            .confirmationDialog(
-                "Delete this shared link?",
-                isPresented: .init(
-                    get: { linkToDelete != nil },
-                    set: { if !$0 { linkToDelete = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                Button("Delete Link", role: .destructive) {
-                    if let link = linkToDelete {
-                        Task { await delete(link) }
-                    }
-                }
-            } message: {
-                Text("People with this link will lose access.")
-            }
         }
     }
 
@@ -189,6 +173,22 @@ struct ShareLinksSheet: View {
             } label: {
                 Label("Delete Link", systemImage: "trash")
             }
+        }
+        // ios 26 morphs the dialog out of its source control, so it belongs on
+        // the row that was swiped - on the list root it floats detached.
+        .confirmationDialog(
+            "Delete this shared link?",
+            isPresented: .init(
+                get: { linkToDelete?.id == link.id },
+                set: { if !$0 { linkToDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Link", role: .destructive) {
+                Task { await delete(link) }
+            }
+        } message: {
+            Text("People with this link will lose access.")
         }
     }
 

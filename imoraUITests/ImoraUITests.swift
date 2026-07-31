@@ -376,6 +376,7 @@ final class ImoraUITests: XCTestCase {
             snap("viewer-editor-square")
             control("edit-cancel", in: app).tap()
             XCTAssertTrue(app.buttons["Discard Changes"].firstMatch.waitForExistence(timeout: 4), "discard dialog did not appear")
+            snap("edit-discard-confirm")
             app.buttons["Discard Changes"].firstMatch.tap()
             XCTAssertTrue(waitForDisappearance(app.navigationBars["Edit"], timeout: 4), "editor did not close")
         } else {

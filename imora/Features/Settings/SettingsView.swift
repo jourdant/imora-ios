@@ -97,6 +97,14 @@ struct SettingsView: View {
                     } label: {
                         Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
                     }
+                    // ios 26 morphs the dialog out of its source control, so it
+                    // sits on the row - on the screen root it floats detached.
+                    .confirmationDialog("Sign out of this server?", isPresented: $confirmLogout, titleVisibility: .visible) {
+                        Button("Sign Out", role: .destructive) {
+                            dismiss()
+                            Task { await session.logOut() }
+                        }
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -117,12 +125,6 @@ struct SettingsView: View {
                 async let aboutTask = try? client.serverAbout()
                 storage = await storageTask
                 about = await aboutTask
-            }
-            .confirmationDialog("Sign out of this server?", isPresented: $confirmLogout, titleVisibility: .visible) {
-                Button("Sign Out", role: .destructive) {
-                    dismiss()
-                    Task { await session.logOut() }
-                }
             }
         }
     }
