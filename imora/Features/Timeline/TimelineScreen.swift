@@ -5,6 +5,17 @@ private struct TimelineScrollState: Equatable {
     let scrollableHeight: CGFloat
 }
 
+/// plain box written from scroll callbacks and read when a realtime rows
+/// update lands. nothing here is observed, so per-frame writes never
+/// re-render anything.
+@MainActor
+private final class ScrollContext {
+    var offsetY: CGFloat = 0
+    var firstVisibleRowID: String?
+    var isIdle = true
+    var viewportWidth: CGFloat = 0
+}
+
 /// scroll-driven values live here instead of screen @state so per-frame
 /// updates only re-render the scrubber overlay, never the whole grid body.
 @Observable @MainActor
@@ -35,6 +46,10 @@ struct TimelineScreen<Header: View>: View {
     var showsLargeTitle = true
     /// main photos tab only: weave in device photos and show backup badges.
     var mergesLocalPhotos = false
+    /// hosts bump this after mutating the grid's contents server-side, e.g.
+    /// adding album photos. the model resyncs in place with an animated
+    /// reflow instead of the host remounting the whole screen.
+    var resyncTrigger = 0
     let header: Header
 
     @State private var model: TimelineModel
@@ -47,6 +62,7 @@ struct TimelineScreen<Header: View>: View {
     @State private var scrubberGrabbable = false
     @State private var scrubberHideTask: Task<Void, Never>?
     @State private var scrub = ScrubberState()
+    @State private var scrollContext = ScrollContext()
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
     @State private var columnCount = 3
@@ -60,6 +76,7 @@ struct TimelineScreen<Header: View>: View {
         emptyMessage: String = "No photos yet",
         showsLargeTitle: Bool = true,
         mergesLocalPhotos: Bool = false,
+        resyncTrigger: Int = 0,
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
         self.title = title
@@ -68,6 +85,7 @@ struct TimelineScreen<Header: View>: View {
         self.emptyMessage = emptyMessage
         self.showsLargeTitle = showsLargeTitle
         self.mergesLocalPhotos = mergesLocalPhotos
+        self.resyncTrigger = resyncTrigger
         self.header = header()
         _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
@@ -105,6 +123,7 @@ struct TimelineScreen<Header: View>: View {
             .scrollPosition($scrollPosition)
             .scrollIndicators(.hidden)
             .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
+                scrollContext.firstVisibleRowID = rowIDs.first
                 let month = rowIDs.first.flatMap { model.monthByRowID[$0] }
                 guard month != scrub.visibleMonth else { return }
                 // deferred one tick so the write never lands in the same
@@ -131,7 +150,18 @@ struct TimelineScreen<Header: View>: View {
             } action: { _, state in
                 scrub.update(with: state)
             }
+            // precise offset for scroll compensation; the quantized fraction
+            // above is too coarse to re-anchor by. plain box write, no render.
+            .onScrollGeometryChange(for: CGFloat.self) { scroll in
+                scroll.contentOffset.y
+            } action: { _, offset in
+                scrollContext.offsetY = offset
+            }
+            .onChange(of: geometry.size.width, initial: true) { _, width in
+                scrollContext.viewportWidth = width
+            }
             .onScrollPhaseChange { _, newPhase in
+                scrollContext.isIdle = newPhase == .idle
                 if newPhase == .idle {
                     scheduleScrubberHide()
                 } else {
@@ -192,8 +222,19 @@ struct TimelineScreen<Header: View>: View {
             if let client = session.client {
                 model.attach(client, backup: session.backup, hub: session.realtime)
                 model.columns = columnCount
+                // capture list only - a self capture would cycle through the
+                // @state storage that owns the model and leak it on pop.
+                model.applyRowsUpdate = { [weak model, context = scrollContext, position = _scrollPosition] old, new, apply in
+                    Self.applyRowsChange(
+                        old: old, new: new, apply: apply,
+                        model: model, context: context, position: position
+                    )
+                }
                 await model.load()
             }
+        }
+        .onChange(of: resyncTrigger) {
+            model.requestResync()
         }
         // full screen cover keeps the grid and its bars on screen behind the
         // zoom morph, exactly like the system photos app; a navigation push
@@ -217,6 +258,42 @@ struct TimelineScreen<Header: View>: View {
     }
 
     // MARK: - rows
+
+    /// lands a realtime rows swap the way the official clients do: content
+    /// that changed above the viewport applies instantly with the scroll
+    /// offset shifted by the exact height delta, so visible photos never
+    /// move; changes in or below the viewport reflow with an animation.
+    private static func applyRowsChange(
+        old: [TimelineRow],
+        new: [TimelineRow],
+        apply: () -> Void,
+        model: TimelineModel?,
+        context: ScrollContext,
+        position: State<ScrollPosition>
+    ) {
+        if context.isIdle,
+           let model,
+           context.viewportWidth > 0,
+           let anchor = context.firstVisibleRowID {
+            let side = (context.viewportWidth - CGFloat(model.columns - 1) * 2) / CGFloat(model.columns)
+            if let oldStart = TimelineModel.rowStart(of: anchor, in: old, tileSide: side),
+               let newStart = TimelineModel.rowStart(of: anchor, in: new, tileSide: side),
+               abs(newStart - oldStart) > 0.5 {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    apply()
+                    position.wrappedValue.scrollTo(y: max(0, context.offsetY + newStart - oldStart))
+                }
+                return
+            }
+        }
+        if UIAccessibility.isReduceMotionEnabled || !context.isIdle {
+            apply()
+        } else {
+            withAnimation(.smooth(duration: 0.3)) { apply() }
+        }
+    }
 
     @ViewBuilder private func rowView(_ row: TimelineRow, side: CGFloat) -> some View {
         switch row {
@@ -257,6 +334,10 @@ struct TimelineScreen<Header: View>: View {
                 ForEach(assets) { asset in
                     tile(asset)
                         .frame(width: side, height: side)
+                        // plain crossfade: an uploaded photo swaps its local
+                        // tile for the server twin with identical pixels, and
+                        // any scale effect would read as a pulse.
+                        .transition(.opacity)
                 }
                 if assets.count < columnCount {
                     Spacer(minLength: 0)

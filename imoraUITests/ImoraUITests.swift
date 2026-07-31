@@ -571,16 +571,33 @@ final class ImoraUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
         sleep(3)
 
+        // a tile already on screen is the witness that updates land in
+        // place: it must keep its loaded thumbnail through both resyncs
+        // instead of the grid visibly reloading around it.
+        let loadedTile = app.descendants(matching: .any)
+            .matching(identifier: "asset-tile")
+            .matching(NSPredicate(format: "value CONTAINS '|loaded'"))
+            .firstMatch
+        XCTAssertTrue(loadedTile.waitForExistence(timeout: 15), "no loaded tile to witness with")
+        let witnessId = String((loadedTile.value as? String ?? "").split(separator: "|").first ?? "")
+        XCTAssertFalse(witnessId.isEmpty, "witness tile had no asset id")
+        let witness = app.descendants(matching: .any)
+            .matching(identifier: "asset-tile")
+            .matching(NSPredicate(format: "value BEGINSWITH %@", "\(witnessId)|loaded"))
+            .firstMatch
+
         // upload from the outside, like another device would.
         let assetId = try await server.uploadTinyImage()
         let tile = tileForAsset(assetId, in: app)
         XCTAssertTrue(tile.waitForExistence(timeout: 25), "uploaded asset never appeared in the timeline")
+        XCTAssertTrue(witness.waitForExistence(timeout: 5), "existing tile lost its thumbnail during the insert")
         snap("realtime-appeared")
 
         // trash from the outside; the tile must vanish on its own.
         try await server.trash(ids: [assetId])
         let gone = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: tile)
         await fulfillment(of: [gone], timeout: 25)
+        XCTAssertTrue(witness.waitForExistence(timeout: 5), "existing tile lost its thumbnail during the removal")
         snap("realtime-removed")
     }
 

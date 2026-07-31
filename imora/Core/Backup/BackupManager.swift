@@ -74,6 +74,10 @@ final class BackupManager {
     /// remote ids proven to be fully backed up from this device, for the
     /// merged cloud badge on remote tiles.
     private(set) var backedUpRemoteIds: Set<String> = []
+    /// synchronous remote-to-device lookup so a tile whose device photo just
+    /// finished uploading keeps rendering the same local thumbnail while the
+    /// server thumbnail loads - the swap never flashes.
+    private(set) var localIdentifierByRemoteId: [String: String] = [:]
     /// wired by sessionstore to the realtime hub, which debounces.
     var onLocalChange: (() -> Void)?
 
@@ -186,6 +190,7 @@ final class BackupManager {
         Task { [weak self] in
             guard let self else { return }
             self.backedUpRemoteIds = await self.index.backedUpRemoteIds()
+            self.localIdentifierByRemoteId = await self.index.remoteToLocalMap()
             self.onLocalChange?()
         }
     }
@@ -196,6 +201,7 @@ final class BackupManager {
         guard let userId else { return }
         await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
         backedUpRemoteIds = await index.backedUpRemoteIds()
+        localIdentifierByRemoteId = await index.remoteToLocalMap()
         updateChangeObserver()
         onLocalChange?()
     }

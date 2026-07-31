@@ -9,6 +9,10 @@ struct RemoteImage: View {
     var thumbhash: String?
     var fallbackURL: URL?
     var fallbackTargetPixelSize: CGFloat?
+    /// device twin of a server asset. its cached thumbnail - the same pixels
+    /// the tile showed before the upload - stands in until the remote loads,
+    /// so the local-to-server swap never flashes a placeholder.
+    var localFallbackIdentifier: String?
     var contentMode: ContentMode = .fill
     /// reports loaded, fallback, placeholder or empty so hosts can expose the
     /// state to ui tests without altering this view's accessibility tree.
@@ -30,6 +34,14 @@ struct RemoteImage: View {
         "\(requestKey)|\(thumbhash ?? "")"
     }
 
+    private var cachedLocalFallback: UIImage? {
+        guard let localFallbackIdentifier else { return nil }
+        return LocalImageLoader.shared.cachedImage(
+            localIdentifier: localFallbackIdentifier,
+            targetPixelSize: targetPixelSize
+        )
+    }
+
     var body: some View {
         let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
         let loaded = image?.key == requestKey ? image?.image : cached
@@ -39,9 +51,10 @@ struct RemoteImage: View {
                 targetPixelSize: fallbackTargetPixelSize ?? targetPixelSize
             )
         }
+        let localFallback = cachedLocalFallback
         let decodedPlaceholder = placeholder?.key == requestKey ? placeholder?.image : nil
-        let displayImage = loaded ?? fallback ?? decodedPlaceholder
-        let phase = loaded != nil ? "loaded" : fallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
+        let displayImage = loaded ?? fallback ?? localFallback ?? decodedPlaceholder
+        let phase = loaded != nil ? "loaded" : fallback != nil || localFallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
 
         ZStack {
             if let displayImage {
@@ -63,7 +76,8 @@ struct RemoteImage: View {
 
             let key = requestKey
             let start = ContinuousClock.now
-            if let thumbhash, placeholder?.key != key {
+            // real pixels from the device twin beat a thumbhash blur.
+            if let thumbhash, placeholder?.key != key, cachedLocalFallback == nil {
                 let decodeTask = Task.detached(priority: .utility) {
                     Thumbhash.image(fromBase64: thumbhash)
                 }
@@ -163,6 +177,9 @@ struct AssetTile: View {
                         url: client.thumbnailURL(assetID: asset.id),
                         targetPixelSize: 640,
                         thumbhash: asset.thumbhash,
+                        localFallbackIdentifier: showsBackupBadge
+                            ? session.backup?.localIdentifierByRemoteId[asset.id]
+                            : nil,
                         onPhaseChange: { thumbnailPhase = $0 }
                     )
                 }

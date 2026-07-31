@@ -195,6 +195,12 @@ actor BackupIndex {
         remoteToLocal[remoteId]
     }
 
+    /// remote-to-device pairing snapshot so tiles can reuse the device
+    /// thumbnail as an instant placeholder for their server twin.
+    func remoteToLocalMap() -> [String: String] {
+        remoteToLocal
+    }
+
     /// remote ids of assets that exist on this device and are fully backed
     /// up. drives the merged cloud badge on timeline tiles.
     func backedUpRemoteIds() -> Set<String> {

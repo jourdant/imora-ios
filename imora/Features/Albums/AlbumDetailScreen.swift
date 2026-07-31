@@ -6,8 +6,10 @@ struct AlbumDetailScreen: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var album: Album
-    /// bumping recreates the timeline so new photos or a new order load.
+    /// bumping recreates the timeline; only the order toggle needs it since
+    /// the filter is captured at init. content changes resync in place.
     @State private var timelineGeneration = 0
+    @State private var resyncTrigger = 0
     @State private var activeSheet: AlbumSheet?
     @State private var showDeleteConfirm = false
     @State private var showLeaveConfirm = false
@@ -34,7 +36,8 @@ struct AlbumDetailScreen: View {
             filter: TimelineFilter(visibility: nil, albumId: album.id, order: album.order),
             emptyIcon: "rectangle.stack",
             emptyMessage: "This album is empty",
-            showsLargeTitle: false
+            showsLargeTitle: false,
+            resyncTrigger: resyncTrigger
         ) {
             AlbumHeader(album: album) { activeSheet = .options }
         }
@@ -71,7 +74,9 @@ struct AlbumDetailScreen: View {
                 AlbumAddAssetsSheet(album: album) { added in
                     await refreshAlbum()
                     if added > 0 {
-                        timelineGeneration += 1
+                        // in-place animated resync; a generation bump would
+                        // remount and visibly reload the whole grid.
+                        resyncTrigger += 1
                         showFeedback("Added \(added) photo\(added == 1 ? "" : "s")")
                     }
                 }

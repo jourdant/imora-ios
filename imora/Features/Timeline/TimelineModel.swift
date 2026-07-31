@@ -75,6 +75,12 @@ final class TimelineModel {
         didSet { if columns != oldValue { rebuildRows() } }
     }
 
+    /// screen-injected hook that decides how a realtime rows swap lands:
+    /// animated reflow when the change is visible, or an instant apply plus
+    /// scroll compensation when it happens above the viewport. nil applies
+    /// directly. the apply closure must run synchronously.
+    @ObservationIgnored var applyRowsUpdate: ((_ old: [TimelineRow], _ new: [TimelineRow], _ apply: () -> Void) -> Void)?
+
     private var client: ImmichClient?
     private var backup: BackupManager?
     private var inflightBuckets: Set<String> = []
@@ -205,7 +211,7 @@ final class TimelineModel {
 
     // MARK: - rows
 
-    private func rebuildRows(rebuildAssets: Bool = false) {
+    private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false) {
         var result: [TimelineRow] = []
         var monthByRowID: [String: String] = [:]
         var flattened: [Asset] = []
@@ -269,17 +275,35 @@ final class TimelineModel {
             tileRows += sectionTileRows
         }
 
-        rows = result
-        self.monthByRowID = monthByRowID
-        if rebuildAssets {
-            flatAssets = flattened
-            flatAssetIndexByID = flattenedIndex
+        let commit = {
+            self.rows = result
+            self.monthByRowID = monthByRowID
+            if rebuildAssets {
+                self.flatAssets = flattened
+                self.flatAssetIndexByID = flattenedIndex
+            }
+            self.monthCount = months
+            self.dayHeaderCount = dayHeaders
+            self.tileRowCount = tileRows
+            self.tailDayHeaders = sectionDayHeaders
+            self.tailTileRows = sectionTileRows
         }
-        monthCount = months
-        dayHeaderCount = dayHeaders
-        tileRowCount = tileRows
-        tailDayHeaders = sectionDayHeaders
-        tailTileRows = sectionTileRows
+        if animated, rows != result, !rows.isEmpty, let applyRowsUpdate {
+            applyRowsUpdate(rows, result, commit)
+        } else {
+            commit()
+        }
+    }
+
+    /// offset of a row's top edge within the rows stack. deterministic heights
+    /// make this exact, which is what scroll compensation relies on.
+    static func rowStart(of id: String, in rows: [TimelineRow], tileSide: CGFloat) -> CGFloat? {
+        var y: CGFloat = 0
+        for row in rows {
+            if row.id == id { return y }
+            y += row.height(tileSide: tileSide)
+        }
+        return nil
     }
 
     /// exact grid height thanks to deterministic row heights.
@@ -416,7 +440,7 @@ final class TimelineModel {
                     sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
                 }
             }
-            rebuildRows(rebuildAssets: true)
+            rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
             await refreshLocalItems()
         } catch {
             // stale is fine; the next event, tick or foreground pass retries.
@@ -433,7 +457,7 @@ final class TimelineModel {
         if isViewerSuspended {
             rebuildPending = true
         } else {
-            rebuildRows(rebuildAssets: true)
+            rebuildRows(rebuildAssets: true, animated: true)
         }
     }
 
@@ -593,7 +617,7 @@ final class TimelineModel {
             sections[s].days = filtered
         }
         sections.removeAll { $0.isLoaded && ($0.days?.isEmpty ?? false) }
-        rebuildRows(rebuildAssets: true)
+        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
     }
 
     // MARK: - grouping helpers
