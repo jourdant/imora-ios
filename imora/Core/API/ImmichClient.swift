@@ -547,6 +547,15 @@ nonisolated final class ImmichClient: Sendable {
         try await mutate("people/\(id)", method: "PUT", body: ["name": name])
     }
 
+    // MARK: - map
+
+    /// every geotagged asset the filter allows, one point each. the server has
+    /// no bounds parameter here - official clients fetch the whole set once and
+    /// cluster it client side.
+    func mapMarkers(_ options: MapMarkerOptions) async throws -> [MapMarker] {
+        try await get("map/markers", query: options.queryItems)
+    }
+
     // MARK: - memories
 
     func memories(for date: Date) async throws -> [Memory] {
@@ -678,12 +687,15 @@ nonisolated struct TimelineFilter: Hashable {
     var order: String?
     /// takenAt (default) or createdAt for upload-time ordering.
     var orderBy: String?
+    /// "west,south,east,north" - restricts the buckets to a map area.
+    var bbox: String?
 
     /// recently-added screens bucket and group by upload time.
     var groupsByUploadDate: Bool { orderBy == "createdAt" }
 
     var queryItems: [URLQueryItem] {
         var items: [URLQueryItem] = []
+        if let bbox { items.append(.init(name: "bbox", value: bbox)) }
         if let visibility { items.append(.init(name: "visibility", value: visibility.rawValue)) }
         if withPartners { items.append(.init(name: "withPartners", value: "true")) }
         if withStacked { items.append(.init(name: "withStacked", value: "true")) }
@@ -694,6 +706,32 @@ nonisolated struct TimelineFilter: Hashable {
         if let userId { items.append(.init(name: "userId", value: userId)) }
         if let order { items.append(.init(name: "order", value: order)) }
         if let orderBy { items.append(.init(name: "orderBy", value: orderBy)) }
+        return items
+    }
+}
+
+// MARK: - map marker options
+
+/// query side of GET /map/markers. flags are only sent when true, matching the
+/// official web client - the server treats a missing flag as "no".
+nonisolated struct MapMarkerOptions: Hashable, Sendable {
+    var isFavorite = false
+    var isArchived = false
+    var withPartners = false
+    var withSharedAlbums = false
+    var createdAfter: Date?
+    var createdBefore: Date?
+
+    var queryItems: [URLQueryItem] {
+        var items: [URLQueryItem] = []
+        if isFavorite { items.append(.init(name: "isFavorite", value: "true")) }
+        if isArchived { items.append(.init(name: "isArchived", value: "true")) }
+        if withPartners { items.append(.init(name: "withPartners", value: "true")) }
+        if withSharedAlbums { items.append(.init(name: "withSharedAlbums", value: "true")) }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        if let createdAfter { items.append(.init(name: "fileCreatedAfter", value: iso.string(from: createdAfter))) }
+        if let createdBefore { items.append(.init(name: "fileCreatedBefore", value: iso.string(from: createdBefore))) }
         return items
     }
 }

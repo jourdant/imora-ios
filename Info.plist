@@ -4,6 +4,8 @@
 <dict>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>imora backs up your photo library to your Immich server and removes device copies only when you ask it to.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>imora shows where you are on the photo map. Your location never leaves the device.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

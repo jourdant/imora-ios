@@ -1,3 +1,5 @@
+import CoreLocation
+import MapKit
 import SwiftUI
 
 struct LibraryTab: View {
@@ -81,7 +83,7 @@ struct LibraryTab: View {
                 PersonScreen(person: person)
             }
             .navigationDestination(for: PlaceLink.self) { place in
-                PlaceScreen(city: place.city)
+                PlaceScreen(city: place.city, coordinate: place.coordinate)
             }
             .task {
                 if let response = try? await session.client?.people() {
@@ -99,34 +101,66 @@ nonisolated enum LibraryDestination: Hashable {
     case trash
 }
 
-/// searchable list of cities, one representative photo each.
+/// map of every geotagged photo on top, searchable list of cities below - the
+/// same shape the official mobile client gives its places page.
 struct PlacesScreen: View {
     @Environment(SessionStore.self) private var session
 
     @State private var places: [(city: String, asset: AssetDetail)] = []
     @State private var isLoading = true
     @State private var searchText = ""
+    @State private var markers: [MapMarker] = []
+    @State private var showMap = false
 
     private var visible: [(city: String, asset: AssetDetail)] {
         guard !searchText.isEmpty else { return places }
         return places.filter { $0.city.localizedStandardContains(searchText) }
     }
 
+    private var showsMapHeader: Bool {
+        searchText.isEmpty && !markers.isEmpty && session.features?.map != false
+    }
+
     var body: some View {
-        List(visible, id: \.city) { place in
-            NavigationLink(value: PlaceLink(city: place.city)) {
-                HStack(spacing: 14) {
-                    if let client = session.client {
-                        RemoteImage(
-                            url: client.thumbnailURL(assetID: place.asset.id),
-                            targetPixelSize: 240,
-                            thumbhash: place.asset.thumbhash
-                        )
-                        .frame(width: 64, height: 64)
-                        .clipShape(.rect(cornerRadius: 14))
+        List {
+            if showsMapHeader {
+                Section {
+                    Button {
+                        showMap = true
+                    } label: {
+                        // the map inside refuses hits so it never eats the tap,
+                        // which leaves the button with no shape of its own.
+                        PlacesMapHeader(markers: markers)
+                            .contentShape(.rect(cornerRadius: 20))
                     }
-                    Text(place.city)
-                        .font(.body.weight(.medium))
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    .listRowSeparator(.hidden)
+                    .accessibilityIdentifier("places-map")
+                }
+            }
+
+            Section {
+                ForEach(visible, id: \.city) { place in
+                    NavigationLink(value: PlaceLink(
+                        city: place.city,
+                        latitude: place.asset.exifInfo?.latitude,
+                        longitude: place.asset.exifInfo?.longitude
+                    )) {
+                        HStack(spacing: 14) {
+                            if let client = session.client {
+                                RemoteImage(
+                                    url: client.thumbnailURL(assetID: place.asset.id),
+                                    targetPixelSize: 240,
+                                    thumbhash: place.asset.thumbhash
+                                )
+                                .frame(width: 64, height: 64)
+                                .clipShape(.rect(cornerRadius: 14))
+                            }
+                            Text(place.city)
+                                .font(.body.weight(.medium))
+                        }
+                    }
                 }
             }
         }
@@ -134,10 +168,13 @@ struct PlacesScreen: View {
         .navigationTitle("Places")
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, prompt: "Filter places")
+        .navigationDestination(isPresented: $showMap) {
+            MapScreen()
+        }
         .overlay {
             if isLoading {
                 ProgressView()
-            } else if places.isEmpty {
+            } else if places.isEmpty && markers.isEmpty {
                 ContentUnavailableView("No places", systemImage: "mappin.slash")
             }
         }
@@ -149,6 +186,54 @@ struct PlacesScreen: View {
                 return (city: city, asset: asset)
             }
             isLoading = false
+        }
+        .task {
+            guard markers.isEmpty, session.features?.map != false, let client = session.client else { return }
+            // primes the cache the map screen reads, so opening it is instant.
+            markers = (try? await MapMarkerCache.shared.markers(
+                client: client,
+                options: MapSettings.load().markerOptions
+            )) ?? []
+        }
+    }
+}
+
+/// non-interactive preview of the photo map, coarse enough that it reads as a
+/// density plot rather than a pin soup.
+private struct PlacesMapHeader: View {
+    private let dots: [MapCluster]
+    private let focus: MapBoundingBox?
+
+    init(markers: [MapMarker]) {
+        let clusters = MapClustering.clusters(markers: markers, zoom: 4)
+            .sorted { $0.count > $1.count }
+        dots = Array(clusters.prefix(60))
+        focus = MapClustering.focusBounds(of: clusters, coverage: 0.75)?.scaled(by: 1.5)
+    }
+
+    var body: some View {
+        Map(initialPosition: focus.map { .rect($0.mapRect) } ?? .automatic, interactionModes: []) {
+            ForEach(dots) { dot in
+                Annotation("", coordinate: dot.coordinate) {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: 10, height: 10)
+                        .overlay { Circle().strokeBorder(.white.opacity(0.9), lineWidth: 1.5) }
+                }
+            }
+            .annotationTitles(.hidden)
+        }
+        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+        .frame(height: 180)
+        .clipShape(.rect(cornerRadius: 20))
+        .allowsHitTesting(false)
+        .overlay(alignment: .bottomTrailing) {
+            Label("Open Map", systemImage: "map")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .glassEffect(.regular, in: .capsule)
+                .padding(10)
         }
     }
 }

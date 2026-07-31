@@ -668,6 +668,99 @@ final class ImoraUITests: XCTestCase {
         snap("album-deleted")
     }
 
+    @MainActor
+    func testPlacesMap() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+
+        app.tabBars.buttons["Library"].tap()
+        let places = app.buttons["Places"].firstMatch
+        XCTAssertTrue(places.waitForExistence(timeout: 10), "places row missing")
+        places.tap()
+
+        // the map header sits above the city list and opens the full map.
+        let header = control("places-map", in: app)
+        XCTAssertTrue(header.waitForExistence(timeout: 25), "places map header missing")
+        snap("places-with-map")
+        header.tap()
+
+        XCTAssertTrue(app.navigationBars["Map"].waitForExistence(timeout: 15), "map screen did not open")
+        let marker = app.descendants(matching: .any).matching(identifier: "map-marker").firstMatch
+        XCTAssertTrue(marker.waitForExistence(timeout: 25), "no markers rendered")
+        // the camera settles into place before the annotations are final.
+        sleep(3)
+        snap("map")
+        XCTAssertTrue(control("map-locate", in: app).exists, "my location button missing")
+
+        // tapping a group zooms into it, which changes what is in view; a lone
+        // marker opens its photo instead.
+        let browseBefore = control("map-browse", in: app).label
+        if let target = onScreenMarker(in: app) {
+            target.tap()
+            sleep(3)
+            if app.navigationBars["Map"].exists {
+                XCTAssertNotEqual(
+                    browseBefore,
+                    control("map-browse", in: app).label,
+                    "tapping a cluster did not move the camera"
+                )
+                snap("map-cluster-zoomed")
+            } else {
+                let viewer = control("asset-viewer", in: app)
+                XCTAssertTrue(viewer.waitForExistence(timeout: 15), "marker opened nothing")
+                snap("map-marker-photo")
+                control("viewer-close", in: app).tap()
+                sleep(2)
+            }
+        }
+
+        // settings sheet carries the same filters the official clients expose.
+        control("map-settings", in: app).tap()
+        XCTAssertTrue(app.staticTexts["Map Settings"].waitForExistence(timeout: 5), "map settings missing")
+        XCTAssertTrue(app.switches["Only Favorites"].exists, "favorites filter missing")
+        snap("map-settings")
+        control("map-settings-done", in: app).tap()
+        sleep(1)
+
+        // the browse pill hands the visible box to a normal timeline grid.
+        let browse = control("map-browse", in: app)
+        XCTAssertTrue(browse.waitForExistence(timeout: 15), "browse button missing")
+        browse.tap()
+        let tile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(tile.waitForExistence(timeout: 25), "map area grid stayed empty")
+        snap("map-area-grid")
+
+        // a city carries the coordinates of its cover photo, so its screen
+        // offers the map centered there.
+        app.navigationBars.buttons.firstMatch.tap()
+        sleep(2)
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Places"].waitForExistence(timeout: 10), "did not return to places")
+        let city = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Amsterdam")).firstMatch
+        XCTAssertTrue(city.waitForExistence(timeout: 10), "city row missing")
+        city.tap()
+        XCTAssertTrue(
+            control("place-map", in: app).waitForExistence(timeout: 15),
+            "city screen has no map shortcut"
+        )
+        snap("place-with-map-shortcut")
+    }
+
+    /// first map annotation whose frame sits inside the window. annotations
+    /// just outside the viewport stay mounted, and tapping one throws.
+    @MainActor
+    private func onScreenMarker(in app: XCUIApplication) -> XCUIElement? {
+        let window = app.windows.firstMatch.frame.insetBy(dx: 20, dy: 120)
+        let markers = app.descendants(matching: .any).matching(identifier: "map-marker")
+        for index in 0..<min(markers.count, 12) {
+            let marker = markers.element(boundBy: index)
+            guard marker.exists, window.contains(marker.frame) else { continue }
+            return marker
+        }
+        return nil
+    }
+
     /// horizontally scrolls a chip row until the chip's frame is on screen.
     /// hittability queries throw for off-screen elements, frames do not.
     @MainActor

@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 
 struct SearchTab: View {
@@ -399,9 +400,13 @@ struct PersonScreen: View {
 struct PlaceScreen: View {
     @Environment(SessionStore.self) private var session
     let city: String
+    /// where the city sits, taken from its representative photo. drives the
+    /// map shortcut in the toolbar.
+    var coordinate: CLLocationCoordinate2D?
 
     @State private var model = SearchModel()
     @State private var viewer = ViewerPresentation()
+    @State private var showMap = false
     @Namespace private var zoomNamespace
 
     var body: some View {
@@ -414,6 +419,21 @@ struct PlaceScreen: View {
         }
         .navigationTitle(city)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if coordinate != nil, session.features?.map != false {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showMap = true
+                    } label: {
+                        Image(systemName: "map")
+                    }
+                    .accessibilityIdentifier("place-map")
+                }
+            }
+        }
+        .navigationDestination(isPresented: $showMap) {
+            MapScreen(initialCoordinate: coordinate)
+        }
         .task {
             if let client = session.client { model.attach(client) }
             var filter = SearchFilter()
@@ -438,4 +458,11 @@ struct PlaceScreen: View {
 
 nonisolated struct PlaceLink: Hashable {
     let city: String
+    var latitude: Double?
+    var longitude: Double?
+
+    var coordinate: CLLocationCoordinate2D? {
+        guard let latitude, let longitude else { return nil }
+        return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
 }

@@ -520,6 +520,26 @@ nonisolated struct ExploreResponse: Codable {
     let items: [ExploreItem]
 }
 
+// MARK: - map
+
+/// one geotagged asset as returned by GET /map/markers.
+nonisolated struct MapMarker: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let lat: Double
+    let lon: Double
+    let city: String?
+    let state: String?
+    let country: String?
+
+    /// city, state or country, whichever the server knows first.
+    var placeName: String? {
+        [city, state, country].compactMap { value in
+            guard let value, !value.isEmpty else { return nil }
+            return value
+        }.first
+    }
+}
+
 // MARK: - memories
 
 nonisolated struct Memory: Codable, Identifiable {

@@ -13,6 +13,7 @@ This is a rewrite of the official Flutter mobile app as a fully native iOS exper
 - Albums: list with filter chips, album detail grids with description header and shared avatars, create / edit / delete, add and remove photos, invite people, options with activity toggle and people management, leave shared albums, public shared links (create / edit / delete with password, custom URL and expiry)
 - Search: CLIP smart search with paging, people and places discovery
 - Library: favorites, archive and trash management, people browsing
+- Places: an Apple Maps photo map with client-side clustering, marker thumbnails, filters (favorites, archive, partners, shared albums, date range) and a grid of everything inside the visible area
 - Multi-select everywhere with a Liquid Glass action bar: favorite, archive, add to album, trash, restore
 - Thumbhash placeholders, downsampled decoding and a 1 GiB disk cache for fast scrolling
 
@@ -43,7 +44,7 @@ imora/
     Images/       ImageLoader (memory + disk cache), thumbhash decoder
     Storage/      keychain wrapper
   DesignSystem/   RemoteImage, asset tiles
-  Features/       Auth, Timeline, Viewer, Albums, Search, Library, Settings
+  Features/       Auth, Timeline, Viewer, Albums, Search, Library, Map, Settings
 ```
 
 The timeline mirrors the server's bucket API: `GET /timeline/buckets` returns month buckets, each grid section fetches `GET /timeline/bucket` on demand and decodes the columnar (struct-of-arrays) payload into assets.
