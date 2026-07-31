@@ -351,7 +351,56 @@ nonisolated struct Album: Codable, Identifiable, Hashable {
     let order: String?
 
     /// spec guarantees the first album user is the owner.
-    var owner: User? { albumUsers.first?.user }
+    var owner: User? {
+        albumUsers.first { $0.role == "owner" }?.user ?? albumUsers.first?.user
+    }
+
+    /// everyone except the owner, i.e. the people the album is shared with.
+    var sharedUsers: [AlbumUser] {
+        albumUsers.filter { $0.role != "owner" }
+    }
+
+    func role(of userID: String?) -> String? {
+        guard let userID else { return nil }
+        return albumUsers.first { $0.user.id == userID }?.role
+    }
+}
+
+/// per-item result of album asset add and remove calls.
+nonisolated struct BulkIdResult: Decodable {
+    let id: String
+    let success: Bool
+    /// duplicate, no_permission, not_found, unknown or validation.
+    let error: String?
+}
+
+// MARK: - shared links
+
+nonisolated struct SharedLink: Codable, Identifiable, Hashable {
+    let id: String
+    let key: String
+    let slug: String?
+    let type: String
+    let description: String?
+    let password: String?
+    let expiresAt: String?
+    let allowUpload: Bool
+    let allowDownload: Bool
+    let showMetadata: Bool
+    let createdAt: String
+
+    /// public path relative to the server web root.
+    var sharePath: String {
+        if let slug, !slug.isEmpty { return "s/\(slug)" }
+        return "share/\(key)"
+    }
+
+    var expiryDate: Date? { expiresAt.flatMap { APIDate.parse($0) } }
+
+    var isExpired: Bool {
+        guard let expiryDate else { return false }
+        return expiryDate < Date()
+    }
 }
 
 // MARK: - people and search

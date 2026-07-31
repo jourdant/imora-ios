@@ -10,7 +10,7 @@ This is a rewrite of the official Flutter mobile app as a fully native iOS exper
 - Bucketed photo timeline with month sections, day groups, lazy loading, pull-to-refresh and a drag scrubber
 - Memories carousel ("x years ago") above the timeline
 - Full-screen asset viewer: pinch zoom, paging, video playback, favorite / archive / trash, share of originals, EXIF info sheet with map
-- Albums: list with filter chips, album detail grids, create / delete, add assets from multi-select
+- Albums: list with filter chips, album detail grids with description header and shared avatars, create / edit / delete, add and remove photos, invite people, options with activity toggle and people management, leave shared albums, public shared links (create / edit / delete with password, custom URL and expiry)
 - Search: CLIP smart search with paging, people and places discovery
 - Library: favorites, archive and trash management, people browsing
 - Multi-select everywhere with a Liquid Glass action bar: favorite, archive, add to album, trash, restore

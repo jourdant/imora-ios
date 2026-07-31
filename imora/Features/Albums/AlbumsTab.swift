@@ -58,6 +58,7 @@ struct AlbumsTab: View {
                     } label: {
                         Image(systemName: "plus")
                     }
+                    .accessibilityIdentifier("albums-create")
                 }
             }
             .overlay {
@@ -69,6 +70,13 @@ struct AlbumsTab: View {
             }
             .refreshable { await load() }
             .task { await load() }
+            // reloads after returning from a detail where the album may have
+            // been renamed or deleted. the initial load stays with .task.
+            .onAppear {
+                if !albums.isEmpty {
+                    Task { await load() }
+                }
+            }
             .alert("New Album", isPresented: $showCreate) {
                 TextField("Album name", text: $newAlbumName)
                 Button("Create") {
@@ -163,40 +171,6 @@ struct AlbumCard: View {
     }
 }
 
-struct AlbumDetailScreen: View {
-    @Environment(SessionStore.self) private var session
-    @Environment(\.dismiss) private var dismiss
-    let album: Album
-
-    var body: some View {
-        TimelineScreen(
-            title: album.albumName,
-            filter: TimelineFilter(visibility: nil, albumId: album.id, order: album.order),
-            emptyIcon: "rectangle.stack",
-            emptyMessage: "This album is empty",
-            showsLargeTitle: false
-        )
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    if album.owner?.id == session.user?.id {
-                        Button(role: .destructive) {
-                            Task {
-                                try? await session.client?.deleteAlbum(id: album.id)
-                                dismiss()
-                            }
-                        } label: {
-                            Label("Delete Album", systemImage: "trash")
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-            }
-        }
-    }
-}
-
 /// sheet used by multi-select to add assets to an album.
 struct AlbumPickerSheet: View {
     @Environment(SessionStore.self) private var session
@@ -268,7 +242,7 @@ struct AlbumPickerSheet: View {
     }
 
     private func add(to albumID: String) async {
-        try? await session.client?.addAssets(albumID: albumID, ids: assetIDs)
+        _ = try? await session.client?.addAssets(albumID: albumID, ids: assetIDs)
         dismiss()
         onDone()
     }

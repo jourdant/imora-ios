@@ -24,15 +24,18 @@ final class SearchModel {
 
     /// applies a new filter: identical filters are a no-op, empty filters
     /// reset to the suggestions state, anything else restarts the search.
-    func apply(_ newFilter: SearchFilter) {
-        guard newFilter != filter else { return }
+    /// allowEmpty turns an empty filter into a whole-library query instead,
+    /// used by pickers that page over everything.
+    func apply(_ newFilter: SearchFilter, allowEmpty: Bool = false) {
+        let searchable = allowEmpty || !newFilter.isEmpty
+        guard newFilter != filter || searchable != hasActiveSearch else { return }
         filter = newFilter
         generation += 1
         searchTask?.cancel()
         assets = []
         nextPage = 1
         isLoading = false
-        hasActiveSearch = !newFilter.isEmpty
+        hasActiveSearch = searchable
         guard hasActiveSearch else { return }
         let requested = generation
         searchTask = Task { await loadNextPage(requested) }

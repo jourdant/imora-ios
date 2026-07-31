@@ -379,6 +379,148 @@ final class ImoraUITests: XCTestCase {
         sleep(1)
     }
 
+    @MainActor
+    func testAlbumManagement() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+
+        // albums tab.
+        app.tabBars.buttons["Albums"].tap()
+        XCTAssertTrue(app.navigationBars["Albums"].waitForExistence(timeout: 10), "albums list missing")
+
+        // create a scratch album to exercise every management feature on.
+        let albumName = "imora e2e \(UInt32.random(in: 1000..<10_000_000))"
+        app.descendants(matching: .any).matching(identifier: "albums-create").firstMatch.tap()
+        let createAlert = app.alerts["New Album"]
+        XCTAssertTrue(createAlert.waitForExistence(timeout: 5), "create alert missing")
+        createAlert.textFields.firstMatch.tap()
+        createAlert.textFields.firstMatch.typeText(albumName)
+        createAlert.buttons["Create"].tap()
+        sleep(3)
+
+        // open it.
+        let albumCell = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", albumName)).firstMatch
+        XCTAssertTrue(albumCell.waitForExistence(timeout: 10), "created album not in list")
+        albumCell.tap()
+        let menu = app.descendants(matching: .any).matching(identifier: "album-menu").firstMatch
+        XCTAssertTrue(menu.waitForExistence(timeout: 10), "album menu missing")
+        snap("album-created")
+
+        // edit: add a description and confirm the header shows it.
+        menu.tap()
+        let editItem = app.buttons["Edit Album"].firstMatch
+        XCTAssertTrue(editItem.waitForExistence(timeout: 5), "edit menu item missing")
+        editItem.tap()
+        let descriptionField = app.descendants(matching: .any).matching(identifier: "album-edit-description").firstMatch
+        XCTAssertTrue(descriptionField.waitForExistence(timeout: 5), "edit sheet missing")
+        descriptionField.tap()
+        descriptionField.typeText("Managed by the imora ui test")
+        app.descendants(matching: .any).matching(identifier: "album-edit-save").firstMatch.tap()
+        let description = app.staticTexts["Managed by the imora ui test"]
+        XCTAssertTrue(description.waitForExistence(timeout: 10), "description not shown after edit")
+        snap("album-edited")
+
+        // add photos: pick the first two tiles from the library picker.
+        menu.tap()
+        let addPhotos = app.buttons["Add Photos"].firstMatch
+        XCTAssertTrue(addPhotos.waitForExistence(timeout: 5), "add photos menu item missing")
+        addPhotos.tap()
+        let pickerTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(pickerTile.waitForExistence(timeout: 20), "picker grid empty")
+        sleep(1)
+        let tiles = app.descendants(matching: .any).matching(identifier: "asset-tile")
+        tiles.element(boundBy: 0).tap()
+        if tiles.count > 1 {
+            tiles.element(boundBy: 1).tap()
+        }
+        app.descendants(matching: .any).matching(identifier: "album-picker-add").firstMatch.tap()
+        let feedback = app.descendants(matching: .any).matching(identifier: "album-feedback").firstMatch
+        XCTAssertTrue(feedback.waitForExistence(timeout: 15), "no feedback after adding photos")
+        let albumTile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(albumTile.waitForExistence(timeout: 15), "album grid empty after add")
+        snap("album-photos-added")
+
+        // invite sheet opens and lists the server's users; do not actually
+        // invite anyone on the shared demo server.
+        menu.tap()
+        let invite = app.buttons["Invite People"].firstMatch
+        XCTAssertTrue(invite.waitForExistence(timeout: 5), "invite menu item missing")
+        invite.tap()
+        XCTAssertTrue(app.navigationBars["Invite to Album"].waitForExistence(timeout: 10), "invite sheet missing")
+        snap("album-invite")
+        app.buttons["Cancel"].firstMatch.tap()
+        sleep(1)
+
+        // options: activity toggle is present for the owner and flips.
+        menu.tap()
+        let options = app.buttons["Options"].firstMatch
+        XCTAssertTrue(options.waitForExistence(timeout: 5), "options menu item missing")
+        options.tap()
+        let activityToggle = app.descendants(matching: .any).matching(identifier: "album-activity-toggle").firstMatch
+        XCTAssertTrue(activityToggle.waitForExistence(timeout: 10), "activity toggle missing")
+        let activitySwitch = activityToggle.switches.firstMatch
+        if activitySwitch.exists {
+            activitySwitch.tap()
+            sleep(2)
+        }
+        snap("album-options")
+        app.buttons["Done"].firstMatch.tap()
+        sleep(1)
+
+        // shared link: create one, confirm the url appears, then delete it.
+        menu.tap()
+        let shareLink = app.buttons["Share Link"].firstMatch
+        XCTAssertTrue(shareLink.waitForExistence(timeout: 5), "share link menu item missing")
+        shareLink.tap()
+        let newLink = app.descendants(matching: .any).matching(identifier: "album-share-new").firstMatch
+        XCTAssertTrue(newLink.waitForExistence(timeout: 10), "share sheet missing")
+        newLink.tap()
+        let saveLink = app.descendants(matching: .any).matching(identifier: "share-link-save").firstMatch
+        XCTAssertTrue(saveLink.waitForExistence(timeout: 5), "link form missing")
+        // let the push transition settle, a toolbar tap mid-morph can miss.
+        sleep(2)
+        saveLink.tap()
+        let created = app.descendants(matching: .any).matching(identifier: "album-share-created").firstMatch
+        if !created.waitForExistence(timeout: 8) && saveLink.exists {
+            snap("album-share-form-stuck")
+            saveLink.tap()
+        }
+        XCTAssertTrue(created.waitForExistence(timeout: 15), "created link banner missing")
+        snap("album-share-link")
+        let linkRow = app.cells.matching(NSPredicate(format: "label CONTAINS 'Public link'")).firstMatch
+        if linkRow.exists {
+            linkRow.swipeLeft()
+            let deleteAction = app.buttons["Delete"].firstMatch
+            if deleteAction.waitForExistence(timeout: 3) {
+                deleteAction.tap()
+                let confirmDelete = app.buttons["Delete Link"].firstMatch
+                if confirmDelete.waitForExistence(timeout: 3) {
+                    confirmDelete.tap()
+                    sleep(2)
+                }
+            }
+        }
+        app.buttons["Done"].firstMatch.tap()
+        sleep(1)
+
+        // delete the album and land back on the refreshed list.
+        menu.tap()
+        let deleteItem = app.buttons["Delete Album"].firstMatch
+        XCTAssertTrue(deleteItem.waitForExistence(timeout: 5), "delete menu item missing")
+        deleteItem.tap()
+        let confirm = app.buttons["Delete Album"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5), "delete confirmation missing")
+        confirm.tap()
+        XCTAssertTrue(app.navigationBars["Albums"].waitForExistence(timeout: 10), "did not return to albums list")
+        sleep(3)
+        XCTAssertFalse(
+            app.buttons.matching(NSPredicate(format: "label CONTAINS %@", albumName)).firstMatch.exists,
+            "album still listed after delete"
+        )
+        snap("album-deleted")
+    }
+
     /// horizontally scrolls a chip row until the chip's frame is on screen.
     /// hittability queries throw for off-screen elements, frames do not.
     @MainActor

@@ -323,23 +323,91 @@ nonisolated final class ImmichClient: Sendable {
         ])
     }
 
-    func addAssets(albumID: String, ids: [String]) async throws {
-        try await mutate("albums/\(albumID)/assets", method: "PUT", body: ["ids": ids])
+    @discardableResult
+    func addAssets(albumID: String, ids: [String]) async throws -> [BulkIdResult] {
+        try await request("albums/\(albumID)/assets", method: "PUT", body: ["ids": ids])
     }
 
-    func removeAssets(albumID: String, ids: [String]) async throws {
-        try await mutate("albums/\(albumID)/assets", method: "DELETE", body: ["ids": ids])
+    @discardableResult
+    func removeAssets(albumID: String, ids: [String]) async throws -> [BulkIdResult] {
+        try await request("albums/\(albumID)/assets", method: "DELETE", body: ["ids": ids])
     }
 
     func deleteAlbum(id: String) async throws {
         try await mutate("albums/\(id)", method: "DELETE", body: Optional<Int>.none)
     }
 
-    func updateAlbum(id: String, name: String?, description: String?) async throws {
+    func updateAlbum(
+        id: String,
+        name: String? = nil,
+        description: String? = nil,
+        thumbnailAssetId: String? = nil,
+        isActivityEnabled: Bool? = nil,
+        order: String? = nil
+    ) async throws {
         var body: [String: AnyEncodable] = [:]
         if let name { body["albumName"] = AnyEncodable(name) }
         if let description { body["description"] = AnyEncodable(description) }
+        if let thumbnailAssetId { body["albumThumbnailAssetId"] = AnyEncodable(thumbnailAssetId) }
+        if let isActivityEnabled { body["isActivityEnabled"] = AnyEncodable(isActivityEnabled) }
+        if let order { body["order"] = AnyEncodable(order) }
         try await mutate("albums/\(id)", method: "PATCH", body: body)
+    }
+
+    /// invites users; the server defaults their role to editor, same as the
+    /// official mobile client.
+    func addAlbumUsers(albumID: String, userIDs: [String]) async throws {
+        let users = userIDs.map { ["userId": $0] }
+        try await mutate("albums/\(albumID)/users", method: "PUT", body: ["albumUsers": users])
+    }
+
+    func updateAlbumUserRole(albumID: String, userID: String, role: String) async throws {
+        try await mutate("albums/\(albumID)/user/\(userID)", method: "PUT", body: ["role": role])
+    }
+
+    /// removes a shared user; passing your own id leaves the album.
+    func removeAlbumUser(albumID: String, userID: String) async throws {
+        try await mutate("albums/\(albumID)/user/\(userID)", method: "DELETE", body: Optional<Int>.none)
+    }
+
+    /// every visible server user, used by the invite picker.
+    func allUsers() async throws -> [User] { try await get("users") }
+
+    // MARK: - shared links
+
+    func sharedLinks(albumID: String? = nil) async throws -> [SharedLink] {
+        var query: [URLQueryItem] = []
+        if let albumID { query.append(URLQueryItem(name: "albumId", value: albumID)) }
+        return try await get("shared-links", query: query)
+    }
+
+    func createSharedLink(albumID: String, options: SharedLinkOptions) async throws -> SharedLink {
+        var body = options.bodyFields(explicitNulls: false)
+        body["type"] = AnyEncodable("ALBUM")
+        body["albumId"] = AnyEncodable(albumID)
+        return try await request("shared-links", method: "POST", body: body)
+    }
+
+    func updateSharedLink(id: String, options: SharedLinkOptions) async throws -> SharedLink {
+        try await request("shared-links/\(id)", method: "PATCH", body: options.bodyFields(explicitNulls: true))
+    }
+
+    func deleteSharedLink(id: String) async throws {
+        try await mutate("shared-links/\(id)", method: "DELETE", body: Optional<Int>.none)
+    }
+
+    /// base for public share urls: the external domain when the admin set one,
+    /// else the api url with its /api suffix stripped.
+    func serverWebURL() async -> URL {
+        if let config = try? await Self.publicConfig(apiURL: apiURL),
+           let domain = config.externalDomain, !domain.isEmpty,
+           let url = URL(string: domain), url.host() != nil {
+            return url
+        }
+        if apiURL.lastPathComponent == "api" {
+            return apiURL.deletingLastPathComponent()
+        }
+        return apiURL
     }
 
     // MARK: - search
@@ -561,6 +629,55 @@ nonisolated struct AssetUploadResult: Decodable, Sendable {
     let status: String
 
     var isDuplicate: Bool { status == "duplicate" }
+}
+
+// MARK: - shared link options
+
+/// editable fields of a shared link. create omits empty optionals, edit sends
+/// explicit nulls so clearing a password or expiry sticks.
+nonisolated struct SharedLinkOptions: Sendable {
+    var description = ""
+    var password = ""
+    var slug = ""
+    var showMetadata = true
+    var allowDownload = true
+    var allowUpload = false
+    var expiresAt: Date?
+
+    init() {}
+
+    init(from link: SharedLink) {
+        description = link.description ?? ""
+        password = link.password ?? ""
+        slug = link.slug ?? ""
+        showMetadata = link.showMetadata
+        allowDownload = link.allowDownload
+        allowUpload = link.allowUpload
+        expiresAt = link.expiryDate
+    }
+
+    func bodyFields(explicitNulls: Bool) -> [String: AnyEncodable] {
+        var fields: [String: AnyEncodable] = [
+            "showMetadata": AnyEncodable(showMetadata),
+            "allowDownload": AnyEncodable(allowDownload),
+            "allowUpload": AnyEncodable(allowUpload),
+        ]
+        for (key, value) in [("description", description), ("password", password), ("slug", slug)] {
+            if !value.isEmpty {
+                fields[key] = AnyEncodable(value)
+            } else if explicitNulls {
+                fields[key] = AnyEncodable(Optional<String>.none)
+            }
+        }
+        if let expiresAt {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            fields["expiresAt"] = AnyEncodable(iso.string(from: expiresAt))
+        } else if explicitNulls {
+            fields["expiresAt"] = AnyEncodable(Optional<String>.none)
+        }
+        return fields
+    }
 }
 
 // MARK: - helpers

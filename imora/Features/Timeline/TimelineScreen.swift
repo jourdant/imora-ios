@@ -176,6 +176,7 @@ struct TimelineScreen<Header: View>: View {
                     onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
                     onTrash: { await applyTrash() },
                     onRestore: filter.isTrashed == true ? { await applyRestore() } : nil,
+                    onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
                     onAddToAlbum: { pendingAlbumAssets = Array(selection) }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -472,6 +473,13 @@ struct TimelineScreen<Header: View>: View {
         exitSelection()
     }
 
+    private func applyRemoveFromAlbum() async {
+        guard let client = session.client, let albumID = filter.albumId else { return }
+        _ = try? await client.removeAssets(albumID: albumID, ids: Array(selection))
+        model.removeAssets(ids: selection)
+        exitSelection()
+    }
+
     private func showScrubber() {
         guard !viewer.isTransitioning else { return }
         scrubberHideTask?.cancel()
@@ -545,6 +553,7 @@ private struct SelectionActionBar: View {
     let onArchive: () async -> Void
     let onTrash: () async -> Void
     var onRestore: (() async -> Void)?
+    var onRemoveFromAlbum: (() async -> Void)?
     let onAddToAlbum: () -> Void
 
     var body: some View {
@@ -559,6 +568,10 @@ private struct SelectionActionBar: View {
 
                 if let onRestore {
                     barButton("arrow.uturn.backward", "Restore") { Task { await onRestore() } }
+                } else if let onRemoveFromAlbum {
+                    barButton("heart", "Favorite") { Task { await onFavorite() } }
+                    barButton("rectangle.stack.badge.plus", "Album", action: onAddToAlbum)
+                    barButton("rectangle.stack.badge.minus", "Remove") { Task { await onRemoveFromAlbum() } }
                 } else {
                     barButton("heart", "Favorite") { Task { await onFavorite() } }
                     barButton(filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox", "Archive") { Task { await onArchive() } }
