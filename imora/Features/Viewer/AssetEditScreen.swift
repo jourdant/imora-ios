@@ -465,8 +465,17 @@ struct AssetEditScreen: View {
                 edits = []
             }
 
+            let (width, height) = Self.resolveOriginalSize(detail: detail, image: image)
+            // an existing crop that cannot be placed would be seeded as the
+            // full frame and then written back as none, quietly undoing it.
+            let hasCrop = edits.contains { if case .crop = $0 { true } else { false } }
+            guard width > 0 || !hasCrop else {
+                loadState = .failed("This photo's original dimensions are unknown, so its crop can't be edited.")
+                return
+            }
+
             self.image = image
-            (originalWidth, originalHeight) = Self.resolveOriginalSize(detail: detail, image: image)
+            (originalWidth, originalHeight) = (width, height)
             let seeded = EditTransform.state(from: edits, originalWidth: originalWidth, originalHeight: originalHeight)
             state = seeded
             initialState = seeded
@@ -477,13 +486,21 @@ struct AssetEditScreen: View {
         }
     }
 
-    /// crop parameters are pixels in the upright original. the server dims
-    /// can be pre-rotation, so trust whichever orientation matches the
-    /// upright render. zeros mean unknown - the preview is downsampled, so
-    /// its own size would put crops in the wrong space entirely.
+    /// crop parameters are pixels in the upright original, so exif is the
+    /// source of truth: the asset's own width and height already describe the
+    /// EDITED output, and normalizing a stored crop against those would place
+    /// it in a space that no longer exists. the asset dims are only a safe
+    /// fallback while nothing is applied on top. the exif pair can be
+    /// pre-rotation, so trust whichever orientation matches the upright
+    /// render. zeros mean unknown - the preview is downsampled, so its own
+    /// size would put crops in the wrong space entirely.
     private static func resolveOriginalSize(detail: AssetDetail, image: UIImage) -> (Int, Int) {
-        var width = detail.width ?? Int(detail.exifInfo?.exifImageWidth ?? 0)
-        var height = detail.height ?? Int(detail.exifInfo?.exifImageHeight ?? 0)
+        var width = Int(detail.exifInfo?.exifImageWidth ?? 0)
+        var height = Int(detail.exifInfo?.exifImageHeight ?? 0)
+        if width <= 0 || height <= 0, detail.isEdited != true {
+            width = detail.width ?? 0
+            height = detail.height ?? 0
+        }
         guard width > 0, height > 0 else { return (0, 0) }
         let imageAspect = Double(image.size.width / max(image.size.height, 1))
         let straight = Double(width) / Double(height)
