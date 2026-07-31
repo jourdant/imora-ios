@@ -36,6 +36,12 @@ final class RealtimeHub {
     private(set) var albumsGeneration = 0
     private(set) var isConnected = false
 
+    private struct EventWaiter {
+        let names: Set<String>
+        let assetID: String?
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private let client: ImmichClient
     private var listeners: [WeakListener] = []
     private var active = false
@@ -44,6 +50,7 @@ final class RealtimeHub {
     private var lastResyncFlush: Date = .distantPast
     private var localDebounce: Task<Void, Never>?
     private var safetyTick: Task<Void, Never>?
+    private var waiters: [UUID: EventWaiter] = [:]
 
     /// coalescing window for bursts of server events.
     private static let resyncDelay: Duration = .milliseconds(1_500)
@@ -101,6 +108,25 @@ final class RealtimeHub {
             self.localDebounce = nil
             self.broadcast { $0.realtimeLocalChanged() }
         }
+    }
+
+    /// suspends until one of `names` arrives for `assetID` - any asset when
+    /// nil - or the timeout passes; returns whether the event was seen. used
+    /// to hold the editor spinner until the server re-rendered derivatives.
+    func waitForAssetEvent(named names: Set<String>, assetID: String?, timeout: Duration) async -> Bool {
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            waiters[id] = EventWaiter(names: names, assetID: assetID, continuation: continuation)
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.resolveWaiter(id, with: false)
+            }
+        }
+    }
+
+    private func resolveWaiter(_ id: UUID, with result: Bool) {
+        guard let waiter = waiters.removeValue(forKey: id) else { return }
+        waiter.continuation.resume(returning: result)
     }
 
     // MARK: - broadcasting
@@ -206,6 +232,15 @@ final class RealtimeHub {
     /// both the modern sync events and the legacy per-asset events are
     /// registered; servers emit whichever set their version supports.
     private func handleEvent(_ name: String, payload: Any?) {
+        if !waiters.isEmpty {
+            let eventAssetIDs = Self.assetIDs(from: payload)
+            for (id, waiter) in waiters where waiter.names.contains(name) {
+                if waiter.assetID == nil || eventAssetIDs.contains(waiter.assetID!) {
+                    resolveWaiter(id, with: true)
+                }
+            }
+        }
+
         switch name {
         case "AssetUploadReadyV1", "AssetUploadReadyV2", "AssetEditReadyV1", "AssetEditReadyV2", "on_upload_success", "on_asset_restore":
             scheduleResync()
@@ -242,7 +277,7 @@ final class RealtimeHub {
         case let ids as [String]:
             return Set(ids)
         case let object as [String: Any]:
-            for key in ["assetIds", "ids", "assetId", "id"] {
+            for key in ["assetIds", "ids", "assetId", "id", "asset"] {
                 if let ids = assetIDs(from: object[key]) as Set<String>?, !ids.isEmpty {
                     return ids
                 }

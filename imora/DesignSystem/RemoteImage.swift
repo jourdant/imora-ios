@@ -174,7 +174,7 @@ struct AssetTile: View {
                     )
                 } else if let client = session.client {
                     RemoteImage(
-                        url: client.thumbnailURL(assetID: asset.id),
+                        url: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
                         targetPixelSize: 640,
                         thumbhash: asset.thumbhash,
                         localFallbackIdentifier: showsBackupBadge

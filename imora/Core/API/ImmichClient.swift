@@ -263,8 +263,49 @@ nonisolated final class ImmichClient: Sendable {
 
     func assetDetail(id: String) async throws -> AssetDetail { try await get("assets/\(id)") }
 
+    /// partial update of one asset. only provided fields are sent, so a nil
+    /// leaves the server value untouched.
+    @discardableResult
+    func updateAsset(
+        id: String,
+        description: String? = nil,
+        dateTimeOriginal: String? = nil,
+        latitude: Double? = nil,
+        longitude: Double? = nil,
+        rating: Int? = nil
+    ) async throws -> AssetDetail {
+        var body: [String: AnyEncodable] = [:]
+        if let description { body["description"] = AnyEncodable(description) }
+        if let dateTimeOriginal { body["dateTimeOriginal"] = AnyEncodable(dateTimeOriginal) }
+        if let latitude { body["latitude"] = AnyEncodable(latitude) }
+        if let longitude { body["longitude"] = AnyEncodable(longitude) }
+        if let rating { body["rating"] = AnyEncodable(rating) }
+        return try await request("assets/\(id)", method: "PUT", body: body)
+    }
+
     func setFavorite(ids: [String], _ value: Bool) async throws {
         try await mutate("assets", method: "PUT", body: ["ids": AnyEncodable(ids), "isFavorite": AnyEncodable(value)])
+    }
+
+    // MARK: - asset edits, server-side non-destructive since v2.6
+
+    func assetEdits(id: String) async throws -> [AssetEdit] {
+        struct Envelope: Decodable { let edits: [AssetEdit] }
+        let data = try await send(path: "assets/\(id)/edits")
+        do {
+            return try JSONDecoder().decode(Envelope.self, from: data).edits
+        } catch {
+            throw ImmichError.decoding("\(error)")
+        }
+    }
+
+    /// replaces the asset's whole edit list; the server re-renders derivatives.
+    func applyEdits(id: String, edits: [AssetEdit]) async throws {
+        try await mutate("assets/\(id)/edits", method: "PUT", body: ["edits": edits])
+    }
+
+    func clearEdits(id: String) async throws {
+        try await mutate("assets/\(id)/edits", method: "DELETE", body: Optional<Int>.none)
     }
 
     func setVisibility(ids: [String], _ value: AssetVisibility) async throws {
@@ -284,12 +325,33 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - media urls
 
-    func thumbnailURL(assetID: String, size: String = "thumbnail") -> URL {
-        apiURL.appending(path: "assets/\(assetID)/thumbnail").appending(queryItems: [URLQueryItem(name: "size", value: size)])
+    /// edited defaults to true so renders reflect server-side edits; pass
+    /// false to fetch the untouched picture, e.g. inside the editor.
+    /// cacheKey is the thumbhash, the official cache-buster: it changes when
+    /// derivatives are re-rendered, so edits invalidate stale cached thumbs.
+    func thumbnailURL(assetID: String, size: String = "thumbnail", edited: Bool = true, cacheKey: String? = nil) -> URL {
+        var query = [
+            URLQueryItem(name: "size", value: size),
+            URLQueryItem(name: "edited", value: edited ? "true" : "false"),
+        ]
+        if let cacheKey, !cacheKey.isEmpty {
+            query.append(URLQueryItem(name: "c", value: cacheKey))
+        }
+        return apiURL.appending(path: "assets/\(assetID)/thumbnail").appending(queryItems: query)
     }
 
+    /// raw original bytes. no edited param: backup dedup and download both
+    /// verify checksums computed over these exact bytes.
     func originalURL(assetID: String) -> URL {
         apiURL.appending(path: "assets/\(assetID)/original")
+    }
+
+    /// original with server-side edits applied when there are any; the right
+    /// choice for share and open-style features.
+    func editedOriginalURL(assetID: String) -> URL {
+        apiURL.appending(path: "assets/\(assetID)/original").appending(queryItems: [
+            URLQueryItem(name: "edited", value: "true"),
+        ])
     }
 
     func playbackURL(assetID: String) -> URL {
@@ -306,10 +368,11 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - albums
 
-    func albums(isShared: Bool? = nil, isOwned: Bool? = nil) async throws -> [Album] {
+    func albums(isShared: Bool? = nil, isOwned: Bool? = nil, assetID: String? = nil) async throws -> [Album] {
         var query: [URLQueryItem] = []
         if let isShared { query.append(URLQueryItem(name: "isShared", value: isShared ? "true" : "false")) }
         if let isOwned { query.append(URLQueryItem(name: "isOwned", value: isOwned ? "true" : "false")) }
+        if let assetID { query.append(URLQueryItem(name: "assetId", value: assetID)) }
         return try await get("albums", query: query)
     }
 
@@ -373,6 +436,26 @@ nonisolated final class ImmichClient: Sendable {
     /// every visible server user, used by the invite picker.
     func allUsers() async throws -> [User] { try await get("users") }
 
+    /// uploads a new profile image for the current user.
+    func setProfileImage(data: Data, filename: String, mimeType: String) async throws {
+        let boundary = "imora-\(UUID().uuidString)"
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8))
+        body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
+        body.append(data)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        var request = URLRequest(url: apiURL.appending(path: "users/profile-image"))
+        request.httpMethod = "POST"
+        request.setValue(MultipartBody.contentType(boundary: boundary), forHTTPHeaderField: "Content-Type")
+        let (respData, response) = try await session.upload(for: request, from: body)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ImmichError.http(http.statusCode, Self.serverMessage(from: respData))
+        }
+    }
+
+
     // MARK: - shared links
 
     func sharedLinks(albumID: String? = nil) async throws -> [SharedLink] {
@@ -385,6 +468,14 @@ nonisolated final class ImmichClient: Sendable {
         var body = options.bodyFields(explicitNulls: false)
         body["type"] = AnyEncodable("ALBUM")
         body["albumId"] = AnyEncodable(albumID)
+        return try await request("shared-links", method: "POST", body: body)
+    }
+
+    /// public link for a hand-picked set of assets, type INDIVIDUAL.
+    func createSharedLink(assetIDs: [String], options: SharedLinkOptions) async throws -> SharedLink {
+        var body = options.bodyFields(explicitNulls: false)
+        body["type"] = AnyEncodable("INDIVIDUAL")
+        body["assetIds"] = AnyEncodable(assetIDs)
         return try await request("shared-links", method: "POST", body: body)
     }
 

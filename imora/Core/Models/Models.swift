@@ -167,9 +167,9 @@ nonisolated struct Asset: Identifiable, Hashable {
     var isFavorite: Bool
     var isTrashed: Bool
     var visibility: AssetVisibility
-    let thumbhash: String?
-    let fileCreatedAt: Date
-    let localOffsetHours: Double
+    var thumbhash: String?
+    var fileCreatedAt: Date
+    var localOffsetHours: Double
     /// milliseconds, nil for stills.
     let duration: Int?
     let livePhotoVideoId: String?
@@ -277,6 +277,7 @@ nonisolated struct ExifInfo: Codable, Hashable {
     let dateTimeOriginal: String?
     let timeZone: String?
     let description: String?
+    let rating: Double?
 }
 
 nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
@@ -301,7 +302,10 @@ nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
     let exifInfo: ExifInfo?
     let livePhotoVideoId: String?
     let people: [Person]?
+    let tags: [Tag]?
     let checksum: String?
+    /// true once the asset has server-side edits applied.
+    let isEdited: Bool?
 
     func asAsset() -> Asset {
         let local = APIDate.parse(localDateTime) ?? .distantPast
@@ -331,6 +335,63 @@ nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
             country: exifInfo?.country,
             createdAt: createdAt.flatMap { APIDate.parse($0) }
         )
+    }
+}
+
+// MARK: - asset edits
+
+/// one step of the server-side non-destructive edit list. crop coordinates
+/// are pixels in the original, orientation-corrected image.
+nonisolated enum AssetEdit: Codable, Equatable, Sendable {
+    case crop(x: Int, y: Int, width: Int, height: Int)
+    case mirror(axis: String)
+    case rotate(angle: Double)
+
+    private enum CodingKeys: String, CodingKey { case action, parameters }
+    private enum ParameterKeys: String, CodingKey { case x, y, width, height, axis, angle }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let action = try container.decode(String.self, forKey: .action)
+        let parameters = try container.nestedContainer(keyedBy: ParameterKeys.self, forKey: .parameters)
+        switch action {
+        case "crop":
+            self = .crop(
+                x: try parameters.decode(Int.self, forKey: .x),
+                y: try parameters.decode(Int.self, forKey: .y),
+                width: try parameters.decode(Int.self, forKey: .width),
+                height: try parameters.decode(Int.self, forKey: .height)
+            )
+        case "mirror":
+            self = .mirror(axis: try parameters.decode(String.self, forKey: .axis))
+        case "rotate":
+            self = .rotate(angle: try parameters.decode(Double.self, forKey: .angle))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .action,
+                in: container,
+                debugDescription: "unknown edit action \(action)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        var parameters = container.nestedContainer(keyedBy: ParameterKeys.self, forKey: .parameters)
+        switch self {
+        case .crop(let x, let y, let width, let height):
+            try container.encode("crop", forKey: .action)
+            try parameters.encode(x, forKey: .x)
+            try parameters.encode(y, forKey: .y)
+            try parameters.encode(width, forKey: .width)
+            try parameters.encode(height, forKey: .height)
+        case .mirror(let axis):
+            try container.encode("mirror", forKey: .action)
+            try parameters.encode(axis, forKey: .axis)
+        case .rotate(let angle):
+            try container.encode("rotate", forKey: .action)
+            try parameters.encode(angle, forKey: .angle)
+        }
     }
 }
 
@@ -395,6 +456,8 @@ nonisolated struct SharedLink: Codable, Identifiable, Hashable {
     let allowDownload: Bool
     let showMetadata: Bool
     let createdAt: String
+    /// populated for INDIVIDUAL links; used to find links containing an asset.
+    let assets: [AssetDetail]?
 
     /// public path relative to the server web root.
     var sharePath: String {

@@ -194,7 +194,7 @@ final class ImoraUITests: XCTestCase {
             let viewer = app.descendants(matching: .any)["asset-viewer"]
             XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not open")
             XCTAssertEqual(viewer.value as? String, assetID, "viewer did not open on the tapped asset")
-            let close = app.descendants(matching: .any)["viewer-close"]
+            let close = control("viewer-close", in: app)
             XCTAssertTrue(close.waitForExistence(timeout: 2), "viewer close button did not appear")
             close.tap()
 
@@ -220,7 +220,7 @@ final class ImoraUITests: XCTestCase {
             tile.tap()
             let viewer = app.descendants(matching: .any)["asset-viewer"]
             XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer did not open in burst round \(round)")
-            let close = app.descendants(matching: .any)["viewer-close"]
+            let close = control("viewer-close", in: app)
             XCTAssertTrue(close.waitForExistence(timeout: 2), "close missing in burst round \(round)")
             close.tap()
         }
@@ -237,7 +237,7 @@ final class ImoraUITests: XCTestCase {
             // fall back to the close button when the synthesized gesture does
             // not engage the system dismissal in the simulator.
             viewer.tap()
-            let close = app.descendants(matching: .any)["viewer-close"]
+            let close = control("viewer-close", in: app)
             XCTAssertTrue(close.waitForExistence(timeout: 2), "chrome did not return for fallback close")
             close.tap()
             XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close")
@@ -246,8 +246,8 @@ final class ImoraUITests: XCTestCase {
         let reopenedTile = tileForAsset()
         XCTAssertTrue(reopenedTile.waitForExistence(timeout: 2) && reopenedTile.isHittable, "tile was not available after drag dismissal")
         reopenedTile.tap()
-        XCTAssertTrue(app.descendants(matching: .any)["viewer-close"].waitForExistence(timeout: 2), "viewer chrome stayed hidden after reopening")
-        XCTAssertTrue(app.descendants(matching: .any)["viewer-info"].waitForExistence(timeout: 2), "viewer info stayed hidden after reopening")
+        XCTAssertTrue(control("viewer-close", in: app).waitForExistence(timeout: 2), "viewer chrome stayed hidden after reopening")
+        XCTAssertTrue(control("viewer-info", in: app).waitForExistence(timeout: 2), "viewer info stayed hidden after reopening")
     }
 
     @MainActor
@@ -272,10 +272,151 @@ final class ImoraUITests: XCTestCase {
         sleep(2)
         snap("viewer-page-back")
 
-        let close = app.descendants(matching: .any)["viewer-close"]
+        let close = control("viewer-close", in: app)
         XCTAssertTrue(close.waitForExistence(timeout: 2), "close button missing after paging")
         close.tap()
         XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close after paging")
+    }
+
+    /// walks every viewer action surface without mutating the shared demo
+    /// library: dialogs are cancelled, the editor is discarded.
+    @MainActor
+    func testViewerActionsAndInfoPanel() throws {
+        let app = launchDemoApp()
+
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+        let tile = app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch
+        XCTAssertTrue(tile.waitForExistence(timeout: 20), "no tiles loaded")
+        tile.tap()
+
+        let viewer = app.descendants(matching: .any)["asset-viewer"]
+        XCTAssertTrue(viewer.waitForExistence(timeout: 5), "viewer did not open")
+
+        // share and info are offered for every photo, including a partner's.
+        XCTAssertTrue(control("viewer-share", in: app).waitForExistence(timeout: 5), "share button missing")
+        XCTAssertTrue(control("viewer-info", in: app).waitForExistence(timeout: 5), "info button missing")
+
+        // the main timeline includes partner photos, and their owner-only
+        // actions are deliberately hidden, so page until an owned one is up.
+        // which photos are whose changes on the shared demo server, so this
+        // cannot assume the first tile is the signed-in user's.
+        var ownedPhotoFound = false
+        for _ in 0..<10 {
+            if control("viewer-favorite", in: app).waitForExistence(timeout: 2) {
+                ownedPhotoFound = true
+                break
+            }
+            viewer.swipeLeft()
+        }
+        XCTAssertTrue(ownedPhotoFound, "no photo owned by the signed-in user in the first pages")
+        XCTAssertTrue(control("viewer-trash", in: app).waitForExistence(timeout: 3), "trash button missing")
+        snap("viewer-chrome")
+
+        // trash asks first, and cancel leaves everything untouched.
+        control("viewer-trash", in: app).tap()
+        XCTAssertTrue(app.buttons["Move to Trash"].firstMatch.waitForExistence(timeout: 4), "trash confirmation did not appear")
+        snap("viewer-trash-confirm")
+        dismissConfirmation(in: app)
+        XCTAssertTrue(waitForDisappearance(app.buttons["Move to Trash"], timeout: 3), "trash confirmation did not close")
+
+        // the more menu carries the full action set.
+        let menu = control("viewer-menu", in: app)
+        XCTAssertTrue(menu.waitForExistence(timeout: 3), "more menu missing")
+        menu.tap()
+        XCTAssertTrue(app.buttons["Add to Album"].firstMatch.waitForExistence(timeout: 4), "menu did not open")
+        for label in ["Share Link", "Cast", "View Similar", "Set as Profile Picture", "Download", "Open in Browser", "Archive", "Move to Trash", "Delete Permanently"] {
+            XCTAssertTrue(app.buttons[label].exists, "menu item \(label) missing")
+        }
+        snap("viewer-menu")
+
+        // add to album sheet, cancelled.
+        app.buttons["Add to Album"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Add to Album"].waitForExistence(timeout: 6), "add-to-album sheet did not open")
+        XCTAssertTrue(control("add-to-album-new", in: app).waitForExistence(timeout: 4), "new album row missing")
+        snap("viewer-add-to-album")
+        app.buttons["Cancel"].firstMatch.tap()
+        XCTAssertTrue(waitForDisappearance(app.navigationBars["Add to Album"], timeout: 3), "add-to-album sheet did not close")
+
+        // share link sheet, closed without creating anything.
+        menu.tap()
+        XCTAssertTrue(app.buttons["Share Link"].firstMatch.waitForExistence(timeout: 4), "menu did not reopen")
+        app.buttons["Share Link"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Share Link"].waitForExistence(timeout: 6), "share link sheet did not open")
+        XCTAssertTrue(control("album-share-new", in: app).waitForExistence(timeout: 4), "new link row missing")
+        snap("viewer-share-link")
+        app.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(waitForDisappearance(app.navigationBars["Share Link"], timeout: 3), "share link sheet did not close")
+
+        // view similar results load through smart search.
+        menu.tap()
+        XCTAssertTrue(app.buttons["View Similar"].firstMatch.waitForExistence(timeout: 4), "menu did not reopen for similar")
+        app.buttons["View Similar"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Similar Photos"].waitForExistence(timeout: 6), "similar sheet did not open")
+        XCTAssertTrue(
+            app.descendants(matching: .any).matching(identifier: "asset-tile").firstMatch.waitForExistence(timeout: 15),
+            "similar results never loaded"
+        )
+        snap("viewer-similar")
+        app.navigationBars["Similar Photos"].swipeDown(velocity: .fast)
+        if app.navigationBars["Similar Photos"].exists {
+            app.swipeDown(velocity: .fast)
+        }
+        XCTAssertTrue(waitForDisappearance(app.navigationBars["Similar Photos"], timeout: 4), "similar sheet did not close")
+
+        // the editor opens for images; discard leaves the photo untouched.
+        menu.tap()
+        XCTAssertTrue(app.buttons["Cast"].firstMatch.waitForExistence(timeout: 4), "menu did not reopen for edit")
+        if app.buttons["Edit"].firstMatch.exists {
+            app.buttons["Edit"].firstMatch.tap()
+            XCTAssertTrue(app.navigationBars["Edit"].waitForExistence(timeout: 10), "editor did not open")
+            XCTAssertTrue(control("edit-reset", in: app).waitForExistence(timeout: 10), "editor controls missing")
+            snap("viewer-editor")
+            app.buttons["Square"].firstMatch.tap()
+            sleep(1)
+            snap("viewer-editor-square")
+            control("edit-cancel", in: app).tap()
+            XCTAssertTrue(app.buttons["Discard Changes"].firstMatch.waitForExistence(timeout: 4), "discard dialog did not appear")
+            app.buttons["Discard Changes"].firstMatch.tap()
+            XCTAssertTrue(waitForDisappearance(app.navigationBars["Edit"], timeout: 4), "editor did not close")
+        } else {
+            // video page: dismiss the menu without touching anything.
+            app.buttons["Cast"].firstMatch.tap()
+            sleep(1)
+        }
+
+        // swiping the picture up reveals the info panel, photos style.
+        XCTAssertTrue(viewer.waitForExistence(timeout: 3), "viewer lost after editor")
+        viewer.swipeUp(velocity: .fast)
+        let details = app.descendants(matching: .any)["asset-details"]
+        if !details.waitForExistence(timeout: 3) {
+            // fall back to the info button when the synthesized swipe missed.
+            control("viewer-info", in: app).tap()
+        }
+        XCTAssertTrue(details.waitForExistence(timeout: 5), "info panel did not appear")
+        XCTAssertTrue(app.staticTexts["Details"].waitForExistence(timeout: 8), "details section missing")
+        XCTAssertTrue(control("info-caption", in: app).waitForExistence(timeout: 8), "caption field missing")
+        snap("viewer-info-panel")
+
+        // adjust date sheet opens and cancels.
+        let adjustDate = control("info-adjust-date", in: app)
+        XCTAssertTrue(adjustDate.waitForExistence(timeout: 8), "adjust date button missing")
+        adjustDate.tap()
+        XCTAssertTrue(app.navigationBars["Adjust Date & Time"].waitForExistence(timeout: 6), "adjust date sheet did not open")
+        snap("viewer-adjust-date")
+        app.buttons["Cancel"].firstMatch.tap()
+        XCTAssertTrue(waitForDisappearance(app.navigationBars["Adjust Date & Time"], timeout: 3), "adjust date sheet did not close")
+
+        XCTAssertTrue(app.buttons["Done"].firstMatch.waitForExistence(timeout: 3), "info panel toolbar missing")
+        app.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(waitForDisappearance(details, timeout: 3), "info panel did not close")
+
+        let close = control("viewer-close", in: app)
+        if !close.exists {
+            viewer.tap()
+        }
+        XCTAssertTrue(close.waitForExistence(timeout: 3), "close button missing at the end")
+        close.tap()
+        XCTAssertTrue(waitForDisappearance(viewer, timeout: 3), "viewer did not close")
     }
 
     @MainActor
@@ -546,6 +687,23 @@ final class ImoraUITests: XCTestCase {
     }
 
     @MainActor
+    /// toolbar-hosted controls expose their identifier on both the bar item
+    /// and the inner button, so strict single-match lookups throw.
+    private func control(_ identifier: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// ios 26 confirmation dialogs may render without a cancel row; tapping
+    /// outside the card dismisses them.
+    private func dismissConfirmation(in app: XCUIApplication) {
+        let cancel = app.buttons["Cancel"].firstMatch
+        if cancel.waitForExistence(timeout: 1), cancel.isHittable {
+            cancel.tap()
+        } else {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.1)).tap()
+        }
+    }
+
     private func waitForValuePrefix(_ value: String, on element: XCUIElement, timeout: TimeInterval) -> Bool {
         let predicate = NSPredicate(format: "value BEGINSWITH %@", value)
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
@@ -599,6 +757,87 @@ final class ImoraUITests: XCTestCase {
         await fulfillment(of: [gone], timeout: 25)
         XCTAssertTrue(witness.waitForExistence(timeout: 5), "existing tile lost its thumbnail during the removal")
         snap("realtime-removed")
+    }
+
+    /// exercises the destructive and mutating viewer actions against the
+    /// disposable server: favorite, caption, server-side edit, trash.
+    @MainActor
+    func testViewerMutationsEndToEnd() async throws {
+        try skipUnlessE2E()
+        let server = try await E2EServer.logIn()
+        let assetId = try await server.uploadTinyImage()
+
+        let app = launchE2EApp()
+        XCTAssertTrue(app.navigationBars["Photos"].waitForExistence(timeout: 30), "timeline did not appear")
+
+        let tile = tileForAsset(assetId, in: app)
+        XCTAssertTrue(tile.waitForExistence(timeout: 25), "uploaded asset never appeared")
+        tile.tap()
+        let viewer = app.descendants(matching: .any)["asset-viewer"]
+        XCTAssertTrue(viewer.waitForExistence(timeout: 5), "viewer did not open")
+
+        // favorite lands on the server.
+        control("viewer-favorite", in: app).tap()
+        try await pollServer(timeout: 15, message: "favorite never reached the server") {
+            try await server.assetInfo(assetId)["isFavorite"] as? Bool == true
+        }
+
+        // caption saves from the info panel.
+        control("viewer-info", in: app).tap()
+        let caption = control("info-caption", in: app)
+        XCTAssertTrue(caption.waitForExistence(timeout: 8), "caption field missing")
+        caption.tap()
+        caption.typeText("hello from e2e")
+        XCTAssertTrue(app.buttons["Done"].firstMatch.waitForExistence(timeout: 3), "info done missing")
+        app.buttons["Done"].firstMatch.tap()
+        try await pollServer(timeout: 15, message: "caption never reached the server") {
+            let info = try await server.assetInfo(assetId)
+            let exif = info["exifInfo"] as? [String: Any]
+            return exif?["description"] as? String == "hello from e2e"
+        }
+
+        // a rotate edit persists through the server-side edit list.
+        let menu = control("viewer-menu", in: app)
+        XCTAssertTrue(menu.waitForExistence(timeout: 5), "menu missing")
+        menu.tap()
+        XCTAssertTrue(app.buttons["Edit"].firstMatch.waitForExistence(timeout: 4), "edit item missing")
+        app.buttons["Edit"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Edit"].waitForExistence(timeout: 10), "editor did not open")
+        XCTAssertTrue(control("edit-reset", in: app).waitForExistence(timeout: 10), "editor did not load")
+        app.buttons["Rotate right"].firstMatch.tap()
+        sleep(1)
+        let done = control("edit-done", in: app)
+        XCTAssertTrue(done.waitForExistence(timeout: 3), "editor done missing")
+        done.tap()
+        XCTAssertTrue(waitForDisappearance(app.navigationBars["Edit"], timeout: 20), "editor did not close after save")
+        try await pollServer(timeout: 15, message: "edit never reached the server") {
+            try await server.assetInfo(assetId)["isEdited"] as? Bool == true
+        }
+        snap("e2e-edited")
+
+        // trash asks first, then the asset really moves to the trash.
+        control("viewer-trash", in: app).tap()
+        XCTAssertTrue(app.buttons["Move to Trash"].firstMatch.waitForExistence(timeout: 4), "trash confirmation missing")
+        app.buttons["Move to Trash"].firstMatch.tap()
+        try await pollServer(timeout: 15, message: "trash never reached the server") {
+            try await server.assetInfo(assetId)["isTrashed"] as? Bool == true
+        }
+        let gone = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: tileForAsset(assetId, in: app))
+        await fulfillment(of: [gone], timeout: 20)
+        snap("e2e-trashed")
+    }
+
+    private func pollServer(
+        timeout: TimeInterval,
+        message: String,
+        _ check: () async throws -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (try? await check()) == true { return }
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        XCTFail(message)
     }
 
     /// enables backup, grants photo access, and expects device photos to end
@@ -794,6 +1033,20 @@ private struct E2EServer {
             ])
         }
         return id
+    }
+
+    func assetInfo(_ id: String) async throws -> [String: Any] {
+        var request = URLRequest(url: Self.api.appending(path: "assets/\(id)"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw NSError(domain: "e2e", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "asset info failed: \(String(data: data, encoding: .utf8) ?? "")",
+            ])
+        }
+        return object
     }
 
     func trash(ids: [String]) async throws {

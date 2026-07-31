@@ -45,13 +45,19 @@ private enum LinkExpiry: String, CaseIterable, Identifiable {
     }
 }
 
-/// lists the album's public links and hosts the create and edit form.
-struct AlbumShareLinksSheet: View {
+/// what a public link points at: a whole album or a hand-picked asset set.
+nonisolated enum ShareLinkTarget {
+    case album(Album)
+    case assets([String])
+}
+
+/// lists the target's public links and hosts the create and edit form.
+struct ShareLinksSheet: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.dismiss) private var dismiss
 
-    let album: Album
-    let onChanged: () async -> Void
+    let target: ShareLinkTarget
+    var onChanged: () async -> Void = {}
 
     @State private var links: [SharedLink] = []
     @State private var isLoading = true
@@ -59,6 +65,13 @@ struct AlbumShareLinksSheet: View {
     @State private var createdURL: URL?
     @State private var linkToDelete: SharedLink?
     @State private var error: String?
+
+    private var title: String {
+        switch target {
+        case .album: "Share Album"
+        case .assets: "Share Link"
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -81,7 +94,7 @@ struct AlbumShareLinksSheet: View {
 
                 Section {
                     NavigationLink {
-                        SharedLinkForm(album: album, existing: nil) { link in
+                        SharedLinkForm(target: target, existing: nil) { link in
                             await handleCreated(link)
                         }
                     } label: {
@@ -111,7 +124,7 @@ struct AlbumShareLinksSheet: View {
                     ProgressView()
                 }
             }
-            .navigationTitle("Share Album")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -140,7 +153,7 @@ struct AlbumShareLinksSheet: View {
 
     @ViewBuilder private func linkRow(_ link: SharedLink) -> some View {
         NavigationLink {
-            SharedLinkForm(album: album, existing: link) { _ in
+            SharedLinkForm(target: target, existing: link) { _ in
                 await reload()
             }
         } label: {
@@ -218,7 +231,19 @@ struct AlbumShareLinksSheet: View {
     private func reload() async {
         guard let client = session.client else { return }
         do {
-            links = try await client.sharedLinks(albumID: album.id)
+            switch target {
+            case .album(let album):
+                links = try await client.sharedLinks(albumID: album.id)
+            case .assets(let ids):
+                // the api has no asset filter; keep individual links whose
+                // asset set contains every requested id.
+                let wanted = Set(ids)
+                links = try await client.sharedLinks().filter { link in
+                    guard link.type == "INDIVIDUAL" else { return false }
+                    let contained = Set((link.assets ?? []).map(\.id))
+                    return wanted.isSubset(of: contained)
+                }
+            }
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -254,7 +279,7 @@ private struct SharedLinkForm: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.dismiss) private var dismiss
 
-    let album: Album
+    let target: ShareLinkTarget
     let existing: SharedLink?
     let onSaved: (SharedLink) async -> Void
 
@@ -263,8 +288,8 @@ private struct SharedLinkForm: View {
     @State private var isSaving = false
     @State private var error: String?
 
-    init(album: Album, existing: SharedLink?, onSaved: @escaping (SharedLink) async -> Void) {
-        self.album = album
+    init(target: ShareLinkTarget, existing: SharedLink?, onSaved: @escaping (SharedLink) async -> Void) {
+        self.target = target
         self.existing = existing
         self.onSaved = onSaved
         _options = State(initialValue: existing.map(SharedLinkOptions.init(from:)) ?? SharedLinkOptions())
@@ -354,7 +379,12 @@ private struct SharedLinkForm: View {
             if let existing {
                 saved = try await client.updateSharedLink(id: existing.id, options: resolved)
             } else {
-                saved = try await client.createSharedLink(albumID: album.id, options: resolved)
+                switch target {
+                case .album(let album):
+                    saved = try await client.createSharedLink(albumID: album.id, options: resolved)
+                case .assets(let ids):
+                    saved = try await client.createSharedLink(assetIDs: ids, options: resolved)
+                }
             }
             dismiss()
             await onSaved(saved)

@@ -69,6 +69,8 @@ nonisolated struct SearchFilter: Equatable {
     var ocr = ""
     /// bcp47-ish tag sent with smart search, e.g. "en-US".
     var language: String?
+    /// smart search by visual similarity to this asset instead of a query.
+    var queryAssetID: String?
 
     var people: [Person] = []
     var tags: [Tag] = []
@@ -87,10 +89,10 @@ nonisolated struct SearchFilter: Equatable {
     var isFavorite = false
     var mediaType: MediaType = .all
 
-    var usesSmartSearch: Bool { !context.isEmpty }
+    var usesSmartSearch: Bool { !context.isEmpty || queryAssetID != nil }
 
     var isEmpty: Bool {
-        context.isEmpty && filename.isEmpty && descriptionText.isEmpty && ocr.isEmpty
+        context.isEmpty && filename.isEmpty && descriptionText.isEmpty && ocr.isEmpty && queryAssetID == nil
             && people.isEmpty && tags.isEmpty
             && country == nil && state == nil && city == nil
             && make == nil && model == nil
@@ -131,7 +133,7 @@ nonisolated struct SearchRequestBody: Encodable {
     let page: Int
 
     private enum CodingKeys: String, CodingKey {
-        case query, language, originalFileName, description, ocr
+        case query, queryAssetId, language, originalFileName, description, ocr
         case country, state, city, make, model
         case takenAfter, takenBefore
         case visibility, rating, isFavorite, isNotInAlbum
@@ -142,7 +144,11 @@ nonisolated struct SearchRequestBody: Encodable {
         var container = encoder.container(keyedBy: CodingKeys.self)
 
         if filter.usesSmartSearch {
-            try container.encode(filter.context, forKey: .query)
+            if let queryAssetID = filter.queryAssetID {
+                try container.encode(queryAssetID, forKey: .queryAssetId)
+            } else {
+                try container.encode(filter.context, forKey: .query)
+            }
             if let language = filter.language {
                 try container.encode(language, forKey: .language)
             }

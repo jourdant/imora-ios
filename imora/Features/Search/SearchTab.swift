@@ -84,6 +84,10 @@ struct SearchTab: View {
                         model.updateAssets(ids: [id]) { $0.isFavorite = value }
                     case .localDeleted:
                         break
+                    case .edited(let id, let thumbhash):
+                        model.updateAssets(ids: [id]) { asset in
+                            if let thumbhash { asset.thumbhash = thumbhash }
+                        }
                     }
                 }
             }
@@ -332,6 +336,10 @@ struct SearchResultsScreen: View {
                     model.updateAssets(ids: [id]) { $0.isFavorite = value }
                 case .localDeleted:
                     break
+                case .edited(let id, let thumbhash):
+                    model.updateAssets(ids: [id]) { asset in
+                        if let thumbhash { asset.thumbhash = thumbhash }
+                    }
                 }
             }
         }

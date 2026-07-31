@@ -506,6 +506,10 @@ struct TimelineScreen<Header: View>: View {
         case .localDeleted:
             // the server copy remains, so the timeline keeps the asset.
             break
+        case .edited(let id, let thumbhash):
+            model.updateAssets(ids: [id]) { asset in
+                if let thumbhash { asset.thumbhash = thumbhash }
+            }
         }
     }
 

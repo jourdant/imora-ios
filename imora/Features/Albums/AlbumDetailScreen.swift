@@ -92,7 +92,7 @@ struct AlbumDetailScreen: View {
                     onLeft: { dismiss() }
                 )
             case .shareLinks:
-                AlbumShareLinksSheet(album: album) { await refreshAlbum() }
+                ShareLinksSheet(target: .album(album)) { await refreshAlbum() }
             }
         }
         .confirmationDialog(
