@@ -37,7 +37,8 @@ struct AlbumDetailScreen: View {
             emptyIcon: "rectangle.stack",
             emptyMessage: "This album is empty",
             showsLargeTitle: false,
-            resyncTrigger: resyncTrigger
+            resyncTrigger: resyncTrigger,
+            albumOwnerID: album.owner?.id
         ) {
             AlbumHeader(album: album) { activeSheet = .options }
         }

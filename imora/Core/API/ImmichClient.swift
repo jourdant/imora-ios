@@ -378,16 +378,35 @@ nonisolated final class ImmichClient: Sendable {
 
     func album(id: String) async throws -> Album { try await get("albums/\(id)") }
 
-    /// ids of everything already in the album. the album endpoint answers with
-    /// full asset dtos; only the ids are decoded so a thousand-photo album
-    /// costs one request and almost no parsing.
+    /// ids of everything already in the album. AlbumResponseDto carries no
+    /// asset list - verified against v3.1 - and walking the album's time
+    /// buckets costs one request per month, which is how the web client pays
+    /// for it lazily. a metadata search scoped to the album answers a thousand
+    /// at a time instead, and only the ids are decoded.
     func albumAssetIDs(id: String) async throws -> Set<String> {
-        struct Members: Codable {
-            struct Member: Codable { let id: String }
-            let assets: [Member]
+        struct Page: Decodable {
+            struct Assets: Decodable {
+                struct Item: Decodable { let id: String }
+                let items: [Item]
+                let nextPage: String?
+            }
+            let assets: Assets
         }
-        let members: Members = try await get("albums/\(id)")
-        return Set(members.assets.map(\.id))
+
+        var ids: Set<String> = []
+        var page = 1
+        while true {
+            try Task.checkCancellation()
+            let body: [String: AnyEncodable] = [
+                "albumIds": AnyEncodable([id]),
+                "size": AnyEncodable(1_000),
+                "page": AnyEncodable(page),
+            ]
+            let result: Page = try await request("search/metadata", method: "POST", body: body)
+            ids.formUnion(result.assets.items.map(\.id))
+            guard result.assets.nextPage != nil else { return ids }
+            page += 1
+        }
     }
 
     func createAlbum(name: String, description: String = "", assetIds: [String] = []) async throws -> Album {

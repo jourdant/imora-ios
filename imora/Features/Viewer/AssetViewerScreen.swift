@@ -10,6 +10,13 @@ nonisolated enum AssetChange {
     case edited(String, thumbhash: String?)
 }
 
+/// the album a grid belongs to, when it belongs to one. carries the owner so
+/// the viewer can offer removal to the same people the server accepts it from.
+nonisolated struct AlbumContext: Equatable {
+    let id: String
+    let ownerID: String?
+}
+
 /// destructive flows that need a confirmation dialog before running.
 private enum ViewerConfirmation: Identifiable {
     case trash
@@ -71,6 +78,8 @@ struct AssetViewerScreen: View {
     let onDismissed: () -> Void
     let presentationID: UUID
     let zoomNamespace: Namespace.ID?
+    /// set when the grid behind is an album, which adds removal to the menu.
+    let album: AlbumContext?
 
     @State private var assets: [Asset]
     @State private var currentIndex: Int
@@ -100,6 +109,7 @@ struct AssetViewerScreen: View {
         initialIndex: Int,
         presentationID: UUID,
         zoomNamespace: Namespace.ID? = nil,
+        album: AlbumContext? = nil,
         onDismissed: @escaping () -> Void,
         onChange: @escaping (AssetChange) -> Void
     ) {
@@ -109,6 +119,7 @@ struct AssetViewerScreen: View {
         _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
         self.presentationID = presentationID
         self.zoomNamespace = zoomNamespace
+        self.album = album
         self.onDismissed = onDismissed
         self.onChange = onChange
     }
@@ -123,6 +134,14 @@ struct AssetViewerScreen: View {
         guard let asset = current else { return false }
         guard let userID = session.user?.id else { return true }
         return asset.ownerId == userID
+    }
+
+    /// the server takes a removal from the album's owner or from the owner of
+    /// the photo, and the web client offers it to exactly those two.
+    private var canRemoveFromAlbum: Bool {
+        guard let album, let asset = current, !asset.isLocal else { return false }
+        guard let userID = session.user?.id else { return true }
+        return asset.ownerId == userID || album.ownerID == userID
     }
 
     @ViewBuilder var body: some View {
@@ -487,6 +506,14 @@ struct AssetViewerScreen: View {
                     Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
                 }
                 .accessibilityIdentifier("viewer-add-to-album")
+                if canRemoveFromAlbum {
+                    Button {
+                        Task { await removeFromAlbum() }
+                    } label: {
+                        Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                    }
+                    .accessibilityIdentifier("viewer-remove-from-album")
+                }
                 if ownsCurrent {
                     Button {
                         showShareLinks = true
@@ -736,6 +763,20 @@ struct AssetViewerScreen: View {
         try? await client.setVisibility(ids: [asset.id], .archive)
         onChange(.removed(asset.id))
         removeCurrent()
+    }
+
+    /// takes the photo out of the album only - it stays in the library, which
+    /// is why this needs no confirmation, matching the official mobile client.
+    private func removeFromAlbum() async {
+        guard let client = session.client, let album, let asset = current else { return }
+        do {
+            try await client.removeAssets(albumID: album.id, ids: [asset.id])
+            onChange(.removed(asset.id))
+            removeCurrent()
+            toast = "Removed from the album"
+        } catch {
+            actionError = "Could not remove from the album: \(error.localizedDescription)"
+        }
     }
 
     private func restore() async {

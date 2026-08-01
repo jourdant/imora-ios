@@ -53,6 +53,9 @@ struct TimelineScreen<Header: View>: View {
     /// adding album photos. the model resyncs in place with an animated
     /// reflow instead of the host remounting the whole screen.
     var resyncTrigger = 0
+    /// album grids pass their owner so the viewer can offer removal to the
+    /// people the server accepts it from. the id itself comes from the filter.
+    var albumOwnerID: String?
     let header: Header
 
     @State private var model: TimelineModel
@@ -81,6 +84,7 @@ struct TimelineScreen<Header: View>: View {
         showsLargeTitle: Bool = true,
         mergesLocalPhotos: Bool = false,
         resyncTrigger: Int = 0,
+        albumOwnerID: String? = nil,
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
         self.title = title
@@ -90,6 +94,7 @@ struct TimelineScreen<Header: View>: View {
         self.showsLargeTitle = showsLargeTitle
         self.mergesLocalPhotos = mergesLocalPhotos
         self.resyncTrigger = resyncTrigger
+        self.albumOwnerID = albumOwnerID
         self.header = header()
         _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
@@ -267,6 +272,7 @@ struct TimelineScreen<Header: View>: View {
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
+                album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
                 onDismissed: { finishViewer(route.id) }
             ) { change in
                 handleViewerChange(change)

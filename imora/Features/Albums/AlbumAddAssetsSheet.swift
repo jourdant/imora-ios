@@ -13,9 +13,11 @@ struct AlbumAddAssetsSheet: View {
     @State private var selection = Set<String>()
     @State private var isAdding = false
     @State private var error: String?
-    /// what the album already holds, so the picker can say so instead of
-    /// letting the user pick photos the server will just reject as duplicates.
+    /// what the album already holds. both official clients show these in the
+    /// picker as already ticked and locked, so the grid reads as the album's
+    /// contents plus whatever else you are adding.
     @State private var existingIDs: Set<String> = []
+    @State private var membershipFailed = false
 
     private let columns = [GridItem(.adaptive(minimum: 100, maximum: 180), spacing: 2)]
 
@@ -27,6 +29,15 @@ struct AlbumAddAssetsSheet: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 120)
                 } else {
+                    if membershipFailed {
+                        Label("Couldn't check what's already in this album", systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
+                    }
+
                     LazyVGrid(columns: columns, spacing: 2) {
                         ForEach(Array(model.assets.enumerated()), id: \.element.id) { index, asset in
                             tile(asset)
@@ -71,56 +82,47 @@ struct AlbumAddAssetsSheet: View {
                 guard let client = session.client else { return }
                 model.attach(client)
                 model.apply(SearchFilter(), allowEmpty: true)
-                existingIDs = (try? await client.albumAssetIDs(id: album.id)) ?? []
+                do {
+                    let members = try await client.albumAssetIDs(id: album.id)
+                    existingIDs = members
+                    // anything ticked before the album answered is already in it.
+                    selection.subtract(members)
+                } catch {
+                    // saying so beats a grid that silently claims the album is
+                    // empty; adding still works, the server rejects duplicates.
+                    membershipFailed = true
+                }
             }
         }
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {
         let isMember = existingIDs.contains(asset.id)
-        let isSelected = selection.contains(asset.id)
+        // a member reads as ticked like anything else picked in this session,
+        // just in grey and immovable - the immich clients both inset and lock
+        // these rather than hiding them.
+        let isTicked = isMember || selection.contains(asset.id)
+        let tint = isMember ? Color.secondary : Color.accentColor
         AssetTile(asset: asset)
-            // dimmed rather than hidden: seeing what is already in the album
-            // is the point, and the grid keeps the order of the library.
-            .opacity(isMember ? 0.45 : 1)
+            // rounded first, then inset over a tinted cell: a ticked photo
+            // shrinks back to reveal the tint, the way both clients do it.
+            .clipShape(.rect(cornerRadius: isTicked ? 12 : 0))
+            .padding(isTicked ? 6 : 0)
+            .background(isTicked ? tint.opacity(isMember ? 0.22 : 0.35) : .clear)
             .overlay(alignment: .topLeading) {
-                if isMember {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.title3)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, .secondary)
-                        .padding(6)
-                        .accessibilityIdentifier("album-picker-member")
-                } else {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, isSelected ? Color.accentColor : .black.opacity(0.25))
-                        .contentTransition(.symbolEffect(.replace))
-                        .animation(.snappy(duration: 0.22), value: isSelected)
-                        .padding(6)
-                }
+                Image(systemName: isTicked ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.white, isTicked ? tint : .black.opacity(0.25))
+                    .contentTransition(.symbolEffect(.replace))
+                    .padding(6)
+                    .accessibilityIdentifier(isMember ? "album-picker-member" : "album-picker-tick")
             }
-            .overlay(alignment: .bottomLeading) {
-                if isMember {
-                    Text("In album")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.black.opacity(0.45), in: .capsule)
-                        .padding(5)
-                }
-            }
-            .overlay {
-                if isSelected, !isMember {
-                    Rectangle().stroke(Color.accentColor, lineWidth: 3)
-                }
-            }
+            .animation(.snappy(duration: 0.22), value: isTicked)
             .contentShape(.rect)
             .onTapGesture {
                 guard !isMember else { return }
-                if isSelected {
+                if selection.contains(asset.id) {
                     selection.remove(asset.id)
                 } else {
                     selection.insert(asset.id)
