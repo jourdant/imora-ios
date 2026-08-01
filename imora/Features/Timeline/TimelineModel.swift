@@ -507,7 +507,7 @@ final class TimelineModel {
         var merged: [TimelineSection] = []
         var remainingMonths = Set(byMonth.keys)
         for section in sections {
-            let key = Self.bucketDate(section.id).map(Self.monthKey(for:)) ?? section.id
+            let key = Self.bucketDate(section.id).map { Self.monthKey(for: $0) } ?? section.id
             if let locals = byMonth[key], section.days != nil {
                 merged.append(Self.mergeSection(section, locals: locals))
                 remainingMonths.remove(key)

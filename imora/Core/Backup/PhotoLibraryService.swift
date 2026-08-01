@@ -105,7 +105,8 @@ nonisolated enum PhotoLibraryService {
         fetchPHAsset(localIdentifier).map(snapshot)
     }
 
-    static func assetExists(localIdentifier: String) -> Bool {
+    @concurrent
+    static func assetExists(localIdentifier: String) async -> Bool {
         fetchPHAsset(localIdentifier) != nil
     }
 

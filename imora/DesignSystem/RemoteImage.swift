@@ -20,6 +20,7 @@ struct RemoteImage: View {
 
     @State private var image: KeyedImage?
     @State private var placeholder: KeyedImage?
+    @State private var fallbackImage: KeyedImage?
 
     private struct KeyedImage {
         let key: String
@@ -34,6 +35,10 @@ struct RemoteImage: View {
         "\(requestKey)|\(thumbhash ?? "")"
     }
 
+    private var fallbackPixelSize: CGFloat {
+        fallbackTargetPixelSize ?? targetPixelSize
+    }
+
     private var cachedLocalFallback: UIImage? {
         guard let localFallbackIdentifier else { return nil }
         return LocalImageLoader.shared.cachedImage(
@@ -45,12 +50,10 @@ struct RemoteImage: View {
     var body: some View {
         let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
         let loaded = image?.key == requestKey ? image?.image : cached
-        let fallback = fallbackURL.flatMap {
-            ImageLoader.shared.cachedImage(
-                for: $0,
-                targetPixelSize: fallbackTargetPixelSize ?? targetPixelSize
-            )
-        }
+        let fallback = (fallbackImage?.key == requestKey ? fallbackImage?.image : nil)
+            ?? fallbackURL.flatMap {
+                ImageLoader.shared.cachedImage(for: $0, targetPixelSize: fallbackPixelSize)
+            }
         let localFallback = cachedLocalFallback
         let decodedPlaceholder = placeholder?.key == requestKey ? placeholder?.image : nil
         let displayImage = loaded ?? fallback ?? localFallback ?? decodedPlaceholder
@@ -104,6 +107,22 @@ struct RemoteImage: View {
                 withAnimation(.easeIn(duration: 0.15)) { image = keyed }
             }
         }
+        // the smaller render of the same photo - the one the grid showed - is
+        // usually a disk cache hit, so it paints the view while the full size
+        // is still on the wire instead of leaving a flat placeholder.
+        .task(id: taskID) {
+            guard let fallbackURL, image?.key != requestKey else { return }
+            let key = requestKey
+            guard ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) == nil,
+                  ImageLoader.shared.cachedImage(for: fallbackURL, targetPixelSize: fallbackPixelSize) == nil
+            else { return }
+            let loaded = try? await ImageLoader.shared.image(
+                for: fallbackURL,
+                targetPixelSize: fallbackPixelSize
+            )
+            guard !Task.isCancelled, let loaded, image?.key != key else { return }
+            fallbackImage = KeyedImage(key: key, image: loaded)
+        }
     }
 }
 
@@ -111,6 +130,10 @@ struct RemoteImage: View {
 struct LocalPhotoImage: View {
     let localIdentifier: String
     var targetPixelSize: CGFloat = 640
+    /// smaller render of the same asset, taken from the cache only. the viewer
+    /// points it at the grid's size so a page opens on the tile's pixels
+    /// instead of a placeholder while photokit produces the big one.
+    var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
     var onPhaseChange: ((String) -> Void)?
 
@@ -125,9 +148,17 @@ struct LocalPhotoImage: View {
         "\(localIdentifier)#\(Int(targetPixelSize))"
     }
 
+    private var cachedFallback: UIImage? {
+        guard let fallbackTargetPixelSize else { return nil }
+        return LocalImageLoader.shared.cachedImage(
+            localIdentifier: localIdentifier,
+            targetPixelSize: fallbackTargetPixelSize
+        )
+    }
+
     var body: some View {
         let cached = LocalImageLoader.shared.cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize)
-        let display = image?.key == requestKey ? image?.image : cached
+        let display = (image?.key == requestKey ? image?.image : cached) ?? cachedFallback
         ZStack {
             if let display {
                 Image(uiImage: display)

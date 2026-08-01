@@ -19,6 +19,10 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     /// photokit only ever answers through a callback.
     private let cache: NSCache<NSString, UIImage>
     private let assets = OSAllocatedUnfairLock<[String: PHAsset]>(initialState: [:])
+    /// a window can be eighty identifiers wide and every miss is a synchronous
+    /// library query, so the bookkeeping stays off the caller's thread. serial
+    /// keeps a stop from overtaking the start it cancels.
+    private let cachingQueue = DispatchQueue(label: "app.imora.local-image-caching", qos: .userInitiated)
 
     private init() {
         cache = NSCache()
@@ -59,6 +63,11 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         cache.object(forKey: key(localIdentifier, targetPixelSize))
     }
 
+    /// concurrent so the photokit fetch never runs inline on the caller. under
+    /// approachable concurrency a plain nonisolated async body stays on the
+    /// caller's actor, which put a synchronous library query on the main
+    /// thread every time a page or tile asked for its image.
+    @concurrent
     func image(localIdentifier: String, targetPixelSize: CGFloat) async -> UIImage? {
         if let cached = cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize) {
             return cached
@@ -82,11 +91,15 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     // MARK: - prefetching
 
     func startCaching(localIdentifiers: [String], targetPixelSize: CGFloat) {
-        setCaching(true, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+        cachingQueue.async { [self] in
+            setCaching(true, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+        }
     }
 
     func stopCaching(localIdentifiers: [String], targetPixelSize: CGFloat) {
-        setCaching(false, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+        cachingQueue.async { [self] in
+            setCaching(false, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+        }
     }
 
     private func setCaching(_ caching: Bool, localIdentifiers: [String], targetPixelSize: CGFloat) {

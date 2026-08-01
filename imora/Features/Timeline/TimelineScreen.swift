@@ -225,11 +225,13 @@ struct TimelineScreen<Header: View>: View {
                 model.attach(client, backup: session.backup, hub: session.realtime)
                 model.columns = columnCount
                 // capture list only - a self capture would cycle through the
-                // @state storage that owns the model and leak it on pop.
-                model.applyRowsUpdate = { [weak model, context = scrollContext, position = _scrollPosition] old, new, apply in
+                // @state storage that owns the model and leak it on pop. the
+                // weak capture is renamed so it does not shadow the strong
+                // reference this task already holds.
+                model.applyRowsUpdate = { [weak weakModel = model, context = scrollContext, position = _scrollPosition] old, new, apply in
                     Self.applyRowsChange(
                         old: old, new: new, apply: apply,
-                        model: model, context: context, position: position
+                        model: weakModel, context: context, position: position
                     )
                 }
                 await model.load()

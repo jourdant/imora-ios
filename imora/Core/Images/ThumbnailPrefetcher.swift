@@ -46,6 +46,12 @@ final class ThumbnailPrefetcher {
         apply(remote: remote, local: local)
     }
 
+    /// warms an explicit window, for hosts that already know theirs: the
+    /// viewer pages a flat list and picks its own thumbnail size.
+    func warm(remote: Set<URL>, local: Set<String>) {
+        apply(remote: remote, local: local)
+    }
+
     func cancel() {
         apply(remote: [], local: [])
     }

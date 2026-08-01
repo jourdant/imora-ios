@@ -372,7 +372,7 @@ final class LocationSearchModel: NSObject, MKLocalSearchCompleterDelegate {
     func resolve(_ completion: MKLocalSearchCompletion) async -> CLLocationCoordinate2D? {
         let search = MKLocalSearch(request: MKLocalSearch.Request(completion: completion))
         let response = try? await search.start()
-        return response?.mapItems.first?.placemark.coordinate
+        return response?.mapItems.first?.location.coordinate
     }
 
     nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {

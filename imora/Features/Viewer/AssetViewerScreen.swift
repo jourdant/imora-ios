@@ -52,7 +52,16 @@ private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
     }
 }
 
+/// pixels a page asks for. every warm-up has to name the same size to land on
+/// the request the page will make, so it lives next to both.
+private let pagePixelSize: CGFloat = 2048
+
 struct AssetViewerScreen: View {
+    /// pages either side of the current one kept warm. the pager mounts a page
+    /// as it scrolls in, which on a quick swipe leaves no time for a download,
+    /// so the neighbours are fetched while the current one is being looked at.
+    private static let warmRadius = 2
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.openURL) private var openURL
@@ -84,6 +93,7 @@ struct AssetViewerScreen: View {
     @State private var toast: String?
     @State private var isDismissing = false
     @State private var didNotifyDismissal = false
+    @State private var prefetcher = ThumbnailPrefetcher(targetPixelSize: pagePixelSize)
 
     init(
         assets: [Asset],
@@ -115,13 +125,6 @@ struct AssetViewerScreen: View {
         return asset.ownerId == userID
     }
 
-    private var loadedPageIDs: Set<String> {
-        guard assets.indices.contains(currentIndex) else { return [] }
-        let lower = max(0, currentIndex - 1)
-        let upper = min(assets.count - 1, currentIndex + 1)
-        return Set(assets[lower...upper].map(\.id))
-    }
-
     @ViewBuilder var body: some View {
         // zooming out targets the currently paged asset's tile when visible.
         if let zoomNamespace, !reduceMotion {
@@ -148,7 +151,6 @@ struct AssetViewerScreen: View {
                 // dismissal state changes in this screen never re-diff the pages.
                 AssetPager(
                     assets: assets,
-                    loadedIDs: loadedPageIDs,
                     selection: $selectedAssetID
                 ) { id, isZoomed in
                     guard id == selectedAssetID else { return }
@@ -186,6 +188,7 @@ struct AssetViewerScreen: View {
             currentPageZoomed = false
         }
         .onDisappear {
+            prefetcher.cancel()
             guard !didNotifyDismissal else { return }
             didNotifyDismissal = true
             currentPageZoomed = false
@@ -254,6 +257,7 @@ struct AssetViewerScreen: View {
             }
         }
         .task(id: current?.id) {
+            warmNeighbours()
             localIdentifier = nil
             guard let asset = current, !asset.isLocal, let backup = session.backup else { return }
             let identifier = await backup.localIdentifier(forRemote: asset.id)
@@ -274,6 +278,30 @@ struct AssetViewerScreen: View {
                 ToastBanner(text: toast) { self.toast = nil }
             }
         }
+    }
+
+    // MARK: - prefetching
+
+    /// downloads and decodes the pages around the current one so a swipe lands
+    /// on pixels instead of a placeholder. videos are skipped - their page
+    /// streams from the server and never asks for a still.
+    private func warmNeighbours() {
+        guard assets.indices.contains(currentIndex) else { return prefetcher.cancel() }
+        let lower = max(0, currentIndex - Self.warmRadius)
+        let upper = min(assets.count - 1, currentIndex + Self.warmRadius)
+
+        var remote: Set<URL> = []
+        var local: Set<String> = []
+        for asset in assets[lower...upper] where !asset.isVideo {
+            if let localIdentifier = asset.localIdentifier {
+                local.insert(localIdentifier)
+            } else if let client = session.client {
+                remote.insert(
+                    client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash)
+                )
+            }
+        }
+        prefetcher.warm(remote: remote, local: local)
     }
 
     // MARK: - gestures
@@ -895,7 +923,6 @@ private struct AirPlayRoutePicker: UIViewRepresentable {
 /// o(library) like the page style tabview, which froze the zoom transition.
 private struct AssetPager: View {
     let assets: [Asset]
-    let loadedIDs: Set<String>
     @Binding var selection: String?
     let onZoomChanged: (String, Bool) -> Void
 
@@ -903,11 +930,7 @@ private struct AssetPager: View {
         ScrollView(.horizontal) {
             LazyHStack(spacing: 0) {
                 ForEach(assets) { asset in
-                    AssetPage(
-                        asset: asset,
-                        isActive: asset.id == selection,
-                        shouldLoad: loadedIDs.contains(asset.id)
-                    ) { isZoomed in
+                    AssetPage(asset: asset, isActive: asset.id == selection) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
                     .containerRelativeFrame([.horizontal, .vertical])
@@ -927,18 +950,17 @@ private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
-    let shouldLoad: Bool
     let onZoomChanged: (Bool) -> Void
 
     var body: some View {
-        // stable single container so the pager keeps this page's identity
-        // while heavy content mounts and unmounts with the load window. kept
-        // transparent so the screen backdrop still fades during drag dismiss.
+        // content mounts with the page, on the lazy stack's schedule - as it
+        // scrolls in, not once the pager has settled on it. gating on the
+        // selection instead built the hosting controller mid-swipe, which is
+        // exactly when a stall shows. kept transparent so the screen backdrop
+        // still fades during drag dismiss.
         ZStack {
             Color.clear
-            if shouldLoad {
-                pageContent
-            }
+            pageContent
         }
     }
 
@@ -950,7 +972,8 @@ private struct AssetPage: View {
                 ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
                     LocalPhotoImage(
                         localIdentifier: localId,
-                        targetPixelSize: 2048,
+                        targetPixelSize: pagePixelSize,
+                        fallbackTargetPixelSize: 640,
                         contentMode: .fit
                     )
                 }
@@ -962,7 +985,7 @@ private struct AssetPage: View {
             ZoomableScrollView(contentID: "\(asset.id)#\(asset.thumbhash ?? "")", onZoomChanged: onZoomChanged) {
                 RemoteImage(
                     url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash),
-                    targetPixelSize: 2048,
+                    targetPixelSize: pagePixelSize,
                     thumbhash: asset.thumbhash,
                     fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
                     fallbackTargetPixelSize: 640,

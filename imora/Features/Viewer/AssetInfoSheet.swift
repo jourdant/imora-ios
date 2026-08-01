@@ -408,8 +408,8 @@ struct AssetInfoSheet: View {
     }
 
     private func openInMaps(coordinate: CLLocationCoordinate2D, name: String) {
-        let placemark = MKPlacemark(coordinate: coordinate)
-        let item = MKMapItem(placemark: placemark)
+        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        let item = MKMapItem(location: location, address: nil)
         item.name = name.isEmpty ? "Photo Location" : name
         item.openInMaps()
     }

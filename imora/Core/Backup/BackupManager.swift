@@ -374,13 +374,16 @@ final class BackupManager {
         let scratch = Self.scratchDirectory
         var quotaMessage: String?
         let progress: @Sendable (String, Double) -> Void = { [weak self] localId, fraction in
-            Task { @MainActor in self?.noteUploadProgress(localId, fraction) }
+            // bound once here: the nested task cannot capture the weak slot,
+            // which is mutable and could be zeroed mid-flight.
+            guard let self else { return }
+            Task { @MainActor in self.noteUploadProgress(localId, fraction) }
         }
 
         await withTaskGroup(of: (String, UploadOutcome).self) { group in
             var next = 0
             var done = 0
-            func addNext() {
+            @MainActor func addNext() {
                 guard next < queue.count, quotaMessage == nil else { return }
                 let asset = queue[next]
                 next += 1
@@ -560,7 +563,7 @@ final class BackupManager {
         guard PhotoLibraryService.hasFullAccess, let userId else { return nil }
         await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
         guard let localId = await index.localId(forRemote: remoteId) else { return nil }
-        return PhotoLibraryService.assetExists(localIdentifier: localId) ? localId : nil
+        return await PhotoLibraryService.assetExists(localIdentifier: localId) ? localId : nil
     }
 
     func noteLocalDeletion(_ localIds: [String]) {
