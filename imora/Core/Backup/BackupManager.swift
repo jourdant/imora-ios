@@ -190,8 +190,21 @@ final class BackupManager {
         Task { [weak self] in
             guard let self else { return }
             self.backedUpRemoteIds = await self.index.backedUpRemoteIds()
-            self.localIdentifierByRemoteId = await self.index.remoteToLocalMap()
+            self.localIdentifierByRemoteId = await self.index.renderableRemoteToLocalMap()
             self.onLocalChange?()
+        }
+    }
+
+    /// the server repainted these assets, so their device twins are stale
+    /// pixels. the pairing itself survives - deletes still cascade - but grids
+    /// and the viewer go back to the server render for them.
+    func noteRemoteEdits(_ remoteIds: Set<String>) {
+        guard !remoteIds.isEmpty else { return }
+        for id in remoteIds { localIdentifierByRemoteId[id] = nil }
+        Task { [weak self] in
+            guard let self, await self.index.markRemoteEdited(remoteIds) else { return }
+            await self.index.save()
+            self.localIdentifierByRemoteId = await self.index.renderableRemoteToLocalMap()
         }
     }
 
@@ -201,7 +214,7 @@ final class BackupManager {
         guard let userId else { return }
         await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
         backedUpRemoteIds = await index.backedUpRemoteIds()
-        localIdentifierByRemoteId = await index.remoteToLocalMap()
+        localIdentifierByRemoteId = await index.renderableRemoteToLocalMap()
         updateChangeObserver()
         onLocalChange?()
     }

@@ -19,8 +19,6 @@ struct RootView: View {
     var body: some View {
         Group {
             switch session.state {
-            case .restoring:
-                ProgressView()
             case .loggedOut:
                 LoginFlowView()
             case .loggedIn:
@@ -28,7 +26,6 @@ struct RootView: View {
             }
         }
         .animation(.smooth, value: session.state)
-        .task { await session.restore() }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:

@@ -35,6 +35,9 @@ final class RealtimeHub {
     /// bumped after album events so album lists reload without a listener.
     private(set) var albumsGeneration = 0
     private(set) var isConnected = false
+    /// wired by sessionstore to the backup manager, which retires the device
+    /// twins of assets the server has repainted.
+    @ObservationIgnored var onRemoteEdit: ((Set<String>) -> Void)?
 
     private struct EventWaiter {
         let names: Set<String>
@@ -242,7 +245,13 @@ final class RealtimeHub {
         }
 
         switch name {
-        case "AssetUploadReadyV1", "AssetUploadReadyV2", "AssetEditReadyV1", "AssetEditReadyV2", "on_upload_success", "on_asset_restore":
+        case "AssetEditReadyV1", "AssetEditReadyV2":
+            // an edit anywhere - web, another phone - repaints the server copy,
+            // so any device twin stops being a valid stand-in for it.
+            onRemoteEdit?(Self.assetIDs(from: payload))
+            scheduleResync()
+
+        case "AssetUploadReadyV1", "AssetUploadReadyV2", "on_upload_success", "on_asset_restore":
             scheduleResync()
 
         case "on_asset_delete", "on_asset_trash", "on_asset_hidden":

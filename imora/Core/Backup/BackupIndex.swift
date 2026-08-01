@@ -50,6 +50,8 @@ actor BackupIndex {
         var serverHost: String
         var userId: String
         var entries: [String: BackupEntry]
+        /// optional so snapshots written before edit tracking still decode.
+        var editedRemoteIds: [String]?
     }
 
     private let fileURL: URL
@@ -57,6 +59,10 @@ actor BackupIndex {
     private var userId = ""
     private var entries: [String: BackupEntry] = [:]
     private var remoteToLocal: [String: String] = [:]
+    /// server copies that were edited after upload. the pairing stays - a
+    /// delete still has to cascade to the device - but the device bytes are no
+    /// longer what the server shows, so they must not be rendered.
+    private var editedRemoteIds: Set<String> = []
     private var loaded = false
 
     init(fileURL: URL = BackupIndex.defaultFileURL) {
@@ -76,12 +82,14 @@ actor BackupIndex {
         self.userId = userId
         entries = [:]
         remoteToLocal = [:]
+        editedRemoteIds = []
         loaded = true
         guard let data = try? Data(contentsOf: fileURL),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
               snapshot.serverHost == serverHost, snapshot.userId == userId
         else { return }
         entries = snapshot.entries
+        editedRemoteIds = Set(snapshot.editedRemoteIds ?? [])
         for (localId, entry) in entries {
             if let remoteId = entry.primaryRemoteId {
                 remoteToLocal[remoteId] = localId
@@ -90,7 +98,12 @@ actor BackupIndex {
     }
 
     func save() {
-        let snapshot = Snapshot(serverHost: serverHost, userId: userId, entries: entries)
+        let snapshot = Snapshot(
+            serverHost: serverHost,
+            userId: userId,
+            entries: entries,
+            editedRemoteIds: editedRemoteIds.isEmpty ? nil : Array(editedRemoteIds)
+        )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         let directory = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -199,6 +212,23 @@ actor BackupIndex {
     /// thumbnail as an instant placeholder for their server twin.
     func remoteToLocalMap() -> [String: String] {
         remoteToLocal
+    }
+
+    /// pairings safe to render from the device: everything the server has not
+    /// repainted since the upload.
+    func renderableRemoteToLocalMap() -> [String: String] {
+        guard !editedRemoteIds.isEmpty else { return remoteToLocal }
+        return remoteToLocal.filter { !editedRemoteIds.contains($0.key) }
+    }
+
+    /// server-side edit landed: the device copy still exists and still has to
+    /// be deleted along with the server one, it just no longer looks like it.
+    /// returns true when this is news, so the caller can refresh and save.
+    func markRemoteEdited(_ remoteIds: Set<String>) -> Bool {
+        let known = remoteIds.filter { remoteToLocal[$0] != nil }
+        guard !known.isSubset(of: editedRemoteIds) else { return false }
+        editedRemoteIds.formUnion(known)
+        return true
     }
 
     /// remote ids of assets that exist on this device and are fully backed

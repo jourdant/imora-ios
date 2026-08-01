@@ -117,10 +117,13 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         }
     }
 
-    func playerItem(localIdentifier: String) async -> AVPlayerItem? {
+    /// `allowsNetwork` is false when the caller has a server copy to fall back
+    /// on: pulling the original down from icloud would be the slower of the
+    /// two, and "available on device" should mean actually on the device.
+    func playerItem(localIdentifier: String, allowsNetwork: Bool = true) async -> AVPlayerItem? {
         guard let asset = fetchAsset(localIdentifier) else { return nil }
         let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = allowsNetwork
         return await withCheckedContinuation { continuation in
             manager.requestPlayerItem(forVideo: asset, options: options) { item, _ in
                 continuation.resume(returning: item)

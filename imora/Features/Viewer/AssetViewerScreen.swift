@@ -293,7 +293,7 @@ struct AssetViewerScreen: View {
         var remote: Set<URL> = []
         var local: Set<String> = []
         for asset in assets[lower...upper] where !asset.isVideo {
-            if let localIdentifier = asset.localIdentifier {
+            if let localIdentifier = asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id] {
                 local.insert(localIdentifier)
             } else if let client = session.client {
                 remote.insert(
@@ -716,6 +716,9 @@ struct AssetViewerScreen: View {
             if let index = assets.firstIndex(where: { $0.id == id }), let thumbhash {
                 assets[index].thumbhash = thumbhash
             }
+            // the device copy is now the pre-edit original, so it stops
+            // standing in for this asset anywhere in the app.
+            session.backup?.noteRemoteEdits([id])
         }
         onChange(change)
     }
@@ -952,6 +955,17 @@ private struct AssetPage: View {
     let isActive: Bool
     let onZoomChanged: (Bool) -> Void
 
+    /// photokit could not serve the device copy after all; the page falls back
+    /// to the server for the rest of its life.
+    @State private var localUnavailable = false
+
+    /// full-size pixels already on the device beat a download of the same
+    /// photo. the index only pairs assets whose server copy still matches.
+    private var deviceIdentifier: String? {
+        guard !localUnavailable else { return nil }
+        return asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
+    }
+
     var body: some View {
         // content mounts with the page, on the lazy stack's schedule - as it
         // scrolls in, not once the pager has settled on it. gating on the
@@ -965,16 +979,22 @@ private struct AssetPage: View {
     }
 
     @ViewBuilder private var pageContent: some View {
-        if let localId = asset.localIdentifier {
+        if let localId = deviceIdentifier {
             if asset.isVideo {
-                LocalVideoPage(localIdentifier: localId, isActive: isActive)
+                LocalVideoPage(
+                    localIdentifier: localId,
+                    isActive: isActive,
+                    allowsNetwork: asset.isLocal,
+                    onUnavailable: { localUnavailable = true }
+                )
             } else {
                 ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
                     LocalPhotoImage(
                         localIdentifier: localId,
                         targetPixelSize: pagePixelSize,
                         fallbackTargetPixelSize: 640,
-                        contentMode: .fit
+                        contentMode: .fit,
+                        onUnavailable: { localUnavailable = true }
                     )
                 }
             }
@@ -1000,6 +1020,10 @@ private struct AssetPage: View {
 private struct LocalVideoPage: View {
     let localIdentifier: String
     let isActive: Bool
+    /// device-only assets have nowhere else to go, so they may pull from
+    /// icloud; a backed-up one falls back to the server stream instead.
+    var allowsNetwork = true
+    var onUnavailable: (() -> Void)?
     @State private var player: AVPlayer?
 
     var body: some View {
@@ -1015,8 +1039,16 @@ private struct LocalVideoPage: View {
                 tearDownPlayer()
                 return
             }
-            if player == nil,
-               let item = await LocalImageLoader.shared.playerItem(localIdentifier: localIdentifier) {
+            if player == nil {
+                let loaded = await LocalImageLoader.shared.playerItem(
+                    localIdentifier: localIdentifier,
+                    allowsNetwork: allowsNetwork
+                )
+                guard let item = loaded else {
+                    // the device copy is gone or stuck in icloud - stream the
+                    // server one rather than spinning forever.
+                    return onUnavailable?() ?? ()
+                }
                 player = AVPlayer(playerItem: item)
             }
             player?.play()
@@ -1089,6 +1121,11 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.backgroundColor = .clear
         scrollView.contentInsetAdjustmentBehavior = .never
+        // a page at rest fills the frame and has nothing to pan, but its scroll
+        // view still claims the touch and only hands it over once it decides it
+        // cannot scroll. that hand-off is the lag before a flick pages or a
+        // swipe down starts the dismissal, so panning is off until zoomed in.
+        scrollView.panGestureRecognizer.isEnabled = false
 
         let hosted = context.coordinator.hostingController
         hosted.view.backgroundColor = .clear
@@ -1116,6 +1153,7 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         context.coordinator.hostingController.rootView = content
         context.coordinator.resetZoomReporting()
         scrollView.setZoomScale(scrollView.minimumZoomScale, animated: false)
+        scrollView.panGestureRecognizer.isEnabled = false
     }
 
     static func dismantleUIView(_ scrollView: UIScrollView, coordinator: Coordinator) {
@@ -1152,6 +1190,7 @@ private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
 
         func scrollViewDidZoom(_ scrollView: UIScrollView) {
             let isZoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+            scrollView.panGestureRecognizer.isEnabled = isZoomed
             guard isZoomed != lastReportedZoomed else { return }
             lastReportedZoomed = isZoomed
             onZoomChanged(isZoomed)

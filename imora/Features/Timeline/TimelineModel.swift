@@ -103,6 +103,13 @@ final class TimelineModel {
     init(filter: TimelineFilter, mergesLocal: Bool = false) {
         self.filter = filter
         self.mergesLocal = mergesLocal
+        // built in init, not in load(): a task runs after the first frame, and
+        // that frame is exactly the spinner this is here to avoid.
+        if let host = UserDefaults.standard.url(forKey: "imora.serverURL")?.host(),
+           let cached = TimelineCache.buckets(for: filter, account: SessionCache.accountKey(host: host)) {
+            sections = Self.sections(from: cached)
+            rebuildRows(rebuildAssets: true)
+        }
     }
 
     deinit {
@@ -145,9 +152,8 @@ final class TimelineModel {
         }
     }
 
-    private func reloadSections(using client: ImmichClient) async throws {
-        let buckets = try await client.timeBuckets(filter)
-        sections = buckets.map { bucket in
+    private static func sections(from buckets: [TimeBucket]) -> [TimelineSection] {
+        buckets.map { bucket in
             TimelineSection(
                 id: bucket.timeBucket,
                 monthTitle: Self.monthTitle(for: bucket.timeBucket),
@@ -155,6 +161,14 @@ final class TimelineModel {
                 days: nil
             )
         }
+    }
+
+    private func reloadSections(using client: ImmichClient) async throws {
+        let buckets = try await client.timeBuckets(filter)
+        if let host = client.apiURL.host() {
+            TimelineCache.store(buckets, for: filter, account: SessionCache.accountKey(host: host))
+        }
+        sections = Self.sections(from: buckets)
         rebuildRows(rebuildAssets: true)
         if let first = sections.first { await loadBucket(first.id) }
         startPrefetch()
@@ -355,9 +369,11 @@ final class TimelineModel {
     func resumeAfterViewer() {
         guard isViewerSuspended else { return }
         isViewerSuspended = false
+        // debounced rather than immediate: an o(library) rebuild the instant
+        // the cover leaves lands on the first frames the grid is touchable
+        // again, and reads as the viewer refusing to let go.
         if rebuildPending {
-            rebuildPending = false
-            rebuildRows(rebuildAssets: true)
+            scheduleRebuild()
         }
         startPrefetch()
         if resyncPending {

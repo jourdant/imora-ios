@@ -13,6 +13,9 @@ struct AlbumAddAssetsSheet: View {
     @State private var selection = Set<String>()
     @State private var isAdding = false
     @State private var error: String?
+    /// what the album already holds, so the picker can say so instead of
+    /// letting the user pick photos the server will just reject as duplicates.
+    @State private var existingIDs: Set<String> = []
 
     private let columns = [GridItem(.adaptive(minimum: 100, maximum: 180), spacing: 2)]
 
@@ -65,31 +68,58 @@ struct AlbumAddAssetsSheet: View {
                 Text(error ?? "")
             }
             .task {
-                if let client = session.client { model.attach(client) }
+                guard let client = session.client else { return }
+                model.attach(client)
                 model.apply(SearchFilter(), allowEmpty: true)
+                existingIDs = (try? await client.albumAssetIDs(id: album.id)) ?? []
             }
         }
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {
+        let isMember = existingIDs.contains(asset.id)
         let isSelected = selection.contains(asset.id)
         AssetTile(asset: asset)
+            // dimmed rather than hidden: seeing what is already in the album
+            // is the point, and the grid keeps the order of the library.
+            .opacity(isMember ? 0.45 : 1)
             .overlay(alignment: .topLeading) {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.title3)
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, isSelected ? Color.accentColor : .black.opacity(0.25))
-                    .contentTransition(.symbolEffect(.replace))
-                    .animation(.snappy(duration: 0.22), value: isSelected)
-                    .padding(6)
+                if isMember {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .secondary)
+                        .padding(6)
+                        .accessibilityIdentifier("album-picker-member")
+                } else {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, isSelected ? Color.accentColor : .black.opacity(0.25))
+                        .contentTransition(.symbolEffect(.replace))
+                        .animation(.snappy(duration: 0.22), value: isSelected)
+                        .padding(6)
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
+                if isMember {
+                    Text("In album")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.black.opacity(0.45), in: .capsule)
+                        .padding(5)
+                }
             }
             .overlay {
-                if isSelected {
+                if isSelected, !isMember {
                     Rectangle().stroke(Color.accentColor, lineWidth: 3)
                 }
             }
             .contentShape(.rect)
             .onTapGesture {
+                guard !isMember else { return }
                 if isSelected {
                     selection.remove(asset.id)
                 } else {

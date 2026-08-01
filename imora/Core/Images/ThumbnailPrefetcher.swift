@@ -23,7 +23,7 @@ final class ThumbnailPrefetcher {
     }
 
     /// anchors on the first visible tile row and warms the assets around it.
-    func update(visibleRowIDs: [String], model: TimelineModel, client: ImmichClient?) {
+    func update(visibleRowIDs: [String], model: TimelineModel, client: ImmichClient?, backup: BackupManager?) {
         guard let client,
               let anchorID = visibleRowIDs.lazy.compactMap({ model.firstAssetIDByRowID[$0] }).first,
               let anchor = model.flatAssetIndex(for: anchorID)
@@ -37,7 +37,9 @@ final class ThumbnailPrefetcher {
         var remote: Set<URL> = []
         var local: Set<String> = []
         for asset in assets[lower..<upper] {
-            if let localIdentifier = asset.localIdentifier {
+            // tiles render the device copy when one is paired, so warm the
+            // same source the tile will actually ask for.
+            if let localIdentifier = asset.localIdentifier ?? backup?.localIdentifierByRemoteId[asset.id] {
                 local.insert(localIdentifier)
             } else {
                 remote.insert(client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash))

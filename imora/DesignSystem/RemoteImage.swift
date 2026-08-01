@@ -9,10 +9,6 @@ struct RemoteImage: View {
     var thumbhash: String?
     var fallbackURL: URL?
     var fallbackTargetPixelSize: CGFloat?
-    /// device twin of a server asset. its cached thumbnail - the same pixels
-    /// the tile showed before the upload - stands in until the remote loads,
-    /// so the local-to-server swap never flashes a placeholder.
-    var localFallbackIdentifier: String?
     var contentMode: ContentMode = .fill
     /// reports loaded, fallback, placeholder or empty so hosts can expose the
     /// state to ui tests without altering this view's accessibility tree.
@@ -39,14 +35,6 @@ struct RemoteImage: View {
         fallbackTargetPixelSize ?? targetPixelSize
     }
 
-    private var cachedLocalFallback: UIImage? {
-        guard let localFallbackIdentifier else { return nil }
-        return LocalImageLoader.shared.cachedImage(
-            localIdentifier: localFallbackIdentifier,
-            targetPixelSize: targetPixelSize
-        )
-    }
-
     var body: some View {
         let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
         let loaded = image?.key == requestKey ? image?.image : cached
@@ -54,10 +42,9 @@ struct RemoteImage: View {
             ?? fallbackURL.flatMap {
                 ImageLoader.shared.cachedImage(for: $0, targetPixelSize: fallbackPixelSize)
             }
-        let localFallback = cachedLocalFallback
         let decodedPlaceholder = placeholder?.key == requestKey ? placeholder?.image : nil
-        let displayImage = loaded ?? fallback ?? localFallback ?? decodedPlaceholder
-        let phase = loaded != nil ? "loaded" : fallback != nil || localFallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
+        let displayImage = loaded ?? fallback ?? decodedPlaceholder
+        let phase = loaded != nil ? "loaded" : fallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
 
         ZStack {
             if let displayImage {
@@ -79,8 +66,7 @@ struct RemoteImage: View {
 
             let key = requestKey
             let start = ContinuousClock.now
-            // real pixels from the device twin beat a thumbhash blur.
-            if let thumbhash, placeholder?.key != key, cachedLocalFallback == nil {
+            if let thumbhash, placeholder?.key != key {
                 let decodeTask = Task.detached(priority: .utility) {
                     Thumbhash.image(fromBase64: thumbhash)
                 }
@@ -136,6 +122,10 @@ struct LocalPhotoImage: View {
     var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
     var onPhaseChange: ((String) -> Void)?
+    /// photokit could not produce the asset - it was deleted from the library
+    /// behind our back, or is an icloud original that will not download. hosts
+    /// use this to fall back to the server copy instead of showing nothing.
+    var onUnavailable: (() -> Void)?
 
     @State private var image: KeyedImage?
 
@@ -178,7 +168,8 @@ struct LocalPhotoImage: View {
                 localIdentifier: localIdentifier,
                 targetPixelSize: targetPixelSize
             )
-            guard !Task.isCancelled, let loaded else { return }
+            guard !Task.isCancelled else { return }
+            guard let loaded else { return onUnavailable?() ?? () }
             image = KeyedImage(key: key, image: loaded)
         }
     }
@@ -193,24 +184,33 @@ struct AssetTile: View {
     var showsBackupBadge = false
 
     @State private var thumbnailPhase = "empty"
+    /// set when photokit cannot serve the paired device copy, so the tile
+    /// stops asking and renders the server thumbnail instead.
+    @State private var localUnavailable = false
+
+    /// the device copy is free, already decoded by photokit and needs no
+    /// network, so it wins whenever the backup index pairs one with this
+    /// asset. edited server copies are excluded from that map.
+    private var deviceIdentifier: String? {
+        guard !localUnavailable else { return nil }
+        return asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
+    }
 
     var body: some View {
         Color.clear
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let localId = asset.localIdentifier {
+                if let localId = deviceIdentifier {
                     LocalPhotoImage(
                         localIdentifier: localId,
-                        onPhaseChange: { thumbnailPhase = $0 }
+                        onPhaseChange: { thumbnailPhase = $0 },
+                        onUnavailable: { localUnavailable = true }
                     )
                 } else if let client = session.client {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
                         targetPixelSize: 640,
                         thumbhash: asset.thumbhash,
-                        localFallbackIdentifier: showsBackupBadge
-                            ? session.backup?.localIdentifierByRemoteId[asset.id]
-                            : nil,
                         onPhaseChange: { thumbnailPhase = $0 }
                     )
                 }

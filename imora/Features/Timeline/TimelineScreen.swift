@@ -12,6 +12,9 @@ private struct TimelineScrollState: Equatable {
 private final class ScrollContext {
     var offsetY: CGFloat = 0
     var firstVisibleRowID: String?
+    /// the whole visible run, not just the first row: only tile rows anchor a
+    /// prefetch window and the top row is usually a month header.
+    var visibleRowIDs: [String] = []
     var isIdle = true
     var viewportWidth: CGFloat = 0
 }
@@ -125,7 +128,8 @@ struct TimelineScreen<Header: View>: View {
             .scrollIndicators(.hidden)
             .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
                 scrollContext.firstVisibleRowID = rowIDs.first
-                prefetcher.update(visibleRowIDs: rowIDs, model: model, client: session.client)
+                scrollContext.visibleRowIDs = rowIDs
+                prefetcher.update(visibleRowIDs: rowIDs, model: model, client: session.client, backup: session.backup)
                 let month = rowIDs.first.flatMap { model.monthByRowID[$0] }
                 guard month != scrub.visibleMonth else { return }
                 // deferred one tick so the write never lands in the same
@@ -161,6 +165,17 @@ struct TimelineScreen<Header: View>: View {
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
                 scrollContext.viewportWidth = width
+            }
+            // the window is otherwise only recomputed while scrolling, so a
+            // grid that has just filled in sits with nothing warmed past the
+            // fold until the first drag.
+            .onChange(of: model.flatAssets.count) {
+                prefetcher.update(
+                    visibleRowIDs: scrollContext.visibleRowIDs,
+                    model: model,
+                    client: session.client,
+                    backup: session.backup
+                )
             }
             .onScrollPhaseChange { _, newPhase in
                 scrollContext.isIdle = newPhase == .idle
@@ -483,10 +498,10 @@ struct TimelineScreen<Header: View>: View {
     private func finishViewer(_ id: UUID) {
         viewer.complete(id)
         Task {
-            // let the zoom out settle before the o(library) row rebuild and
-            // prefetch restart, otherwise they land on the animation's last
-            // frames and read as a freeze.
-            try? await Task.sleep(for: .milliseconds(400))
+            // a short cushion past the zoom out, no more: the rebuild it used
+            // to guard against is debounced now, and the wait was long enough
+            // to be felt when reopening straight away.
+            try? await Task.sleep(for: .milliseconds(120))
             guard !viewer.isTransitioning else { return }
             model.resumeAfterViewer()
         }

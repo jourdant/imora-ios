@@ -378,6 +378,18 @@ nonisolated final class ImmichClient: Sendable {
 
     func album(id: String) async throws -> Album { try await get("albums/\(id)") }
 
+    /// ids of everything already in the album. the album endpoint answers with
+    /// full asset dtos; only the ids are decoded so a thousand-photo album
+    /// costs one request and almost no parsing.
+    func albumAssetIDs(id: String) async throws -> Set<String> {
+        struct Members: Codable {
+            struct Member: Codable { let id: String }
+            let assets: [Member]
+        }
+        let members: Members = try await get("albums/\(id)")
+        return Set(members.assets.map(\.id))
+    }
+
     func createAlbum(name: String, description: String = "", assetIds: [String] = []) async throws -> Album {
         try await request("albums", method: "POST", body: [
             "albumName": AnyEncodable(name),

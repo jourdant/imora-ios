@@ -5,12 +5,11 @@ import Observation
 @Observable
 final class SessionStore {
     enum State: Equatable {
-        case restoring
         case loggedOut
         case loggedIn
     }
 
-    private(set) var state: State = .restoring
+    private(set) var state: State = .loggedOut
     private(set) var client: ImmichClient?
     private(set) var user: CurrentUser?
     private(set) var features: ServerFeatures?
@@ -25,8 +24,11 @@ final class SessionStore {
         UserDefaults.standard.url(forKey: Self.serverKey)
     }
 
-    func restore() async {
-        guard state == .restoring else { return }
+    /// a stored session is adopted before the first frame, so there is no
+    /// launch spinner: the tabs come up on cached account details and the
+    /// server confirms them in the background. an expired token only shows
+    /// once the refresh comes back 401.
+    init() {
         #if DEBUG
         // ui test runs pin the server via env; a persisted session from a
         // different server must not win over it.
@@ -35,6 +37,7 @@ final class SessionStore {
            let stored = serverURL, stored.host() != envHost {
             UserDefaults.standard.removeObject(forKey: Self.serverKey)
             KeychainStore.delete(Self.tokenKey)
+            SessionCache.clear()
             state = .loggedOut
             return
         }
@@ -43,22 +46,16 @@ final class SessionStore {
             state = .loggedOut
             return
         }
-        let client = ImmichClient(apiURL: apiURL, accessToken: token)
-        do {
-            let user = try await client.currentUser()
-            adopt(client: client, user: user)
-        } catch ImmichError.http(401, _) {
-            KeychainStore.delete(Self.tokenKey)
-            state = .loggedOut
-        } catch {
-            // offline or transient failure: keep the session, features stay nil until refreshed.
-            adopt(client: client, user: nil)
-        }
+        let cached = apiURL.host().flatMap { SessionCache.load(host: $0) }
+        features = cached?.features
+        preferences = cached?.preferences
+        adopt(client: ImmichClient(apiURL: apiURL, accessToken: token), user: cached?.user)
     }
 
     func logIn(apiURL: URL, response: LoginResponse) async {
         UserDefaults.standard.set(apiURL, forKey: Self.serverKey)
         KeychainStore.set(response.accessToken, for: Self.tokenKey)
+        SessionCache.noteUserId(response.userId)
         let client = ImmichClient(apiURL: apiURL, accessToken: response.accessToken)
         let user = try? await client.currentUser()
         adopt(client: client, user: user)
@@ -69,6 +66,7 @@ final class SessionStore {
             await client.logout()
         }
         KeychainStore.delete(Self.tokenKey)
+        SessionCache.clear()
         realtime?.shutdown()
         realtime = nil
         backup?.shutdown()
@@ -81,16 +79,33 @@ final class SessionStore {
 
     func refreshUser() async {
         guard let client else { return }
-        async let userTask = try? client.currentUser()
-        async let featuresTask = try? client.serverFeatures()
-        async let preferencesTask = try? client.preferences()
-        if let user = await userTask {
+        // the user call doubles as the token check the launch no longer waits
+        // for: a rejected token ends the session here instead of leaving the
+        // app pointed at a server that will refuse everything.
+        do {
+            let user = try await client.currentUser()
             self.user = user
+            SessionCache.noteUserId(user.id)
             backup?.userId = user.id
             await backup?.primeLocalState()
+        } catch ImmichError.http(401, _) {
+            await logOut()
+            return
+        } catch {
+            // offline or transient: keep the cached account details.
         }
+        async let featuresTask = try? client.serverFeatures()
+        async let preferencesTask = try? client.preferences()
         if let features = await featuresTask { self.features = features }
         if let preferences = await preferencesTask { self.preferences = preferences }
+        cacheSnapshot()
+    }
+
+    private func cacheSnapshot() {
+        guard let host = client?.apiURL.host() else { return }
+        SessionCache.save(
+            SessionCache.Snapshot(host: host, user: user, features: features, preferences: preferences)
+        )
     }
 
     private func adopt(client: ImmichClient, user: CurrentUser?) {
@@ -102,6 +117,7 @@ final class SessionStore {
         self.backup = backup
         let hub = RealtimeHub(client: client)
         backup.onLocalChange = { [weak hub] in hub?.notifyLocalChange() }
+        hub.onRemoteEdit = { [weak backup] ids in backup?.noteRemoteEdits(ids) }
         realtime = hub
         state = .loggedIn
         Task { await refreshUser() }
