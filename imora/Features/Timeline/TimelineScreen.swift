@@ -67,6 +67,7 @@ struct TimelineScreen<Header: View>: View {
     @State private var pendingAlbumAssets: [String]?
     @State private var columnCount = 3
     @State private var pinchBaseColumns: Int?
+    @State private var prefetcher = ThumbnailPrefetcher()
     @Namespace private var zoomNamespace
 
     init(
@@ -124,6 +125,7 @@ struct TimelineScreen<Header: View>: View {
             .scrollIndicators(.hidden)
             .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
                 scrollContext.firstVisibleRowID = rowIDs.first
+                prefetcher.update(visibleRowIDs: rowIDs, model: model, client: session.client)
                 let month = rowIDs.first.flatMap { model.monthByRowID[$0] }
                 guard month != scrub.visibleMonth else { return }
                 // deferred one tick so the write never lands in the same
@@ -236,6 +238,9 @@ struct TimelineScreen<Header: View>: View {
         .onChange(of: resyncTrigger) {
             model.requestResync()
         }
+        // the pipeline outlives the screen, so a window left open would keep
+        // downloading tiles for a grid nobody is looking at.
+        .onDisappear { prefetcher.cancel() }
         // full screen cover keeps the grid and its bars on screen behind the
         // zoom morph, exactly like the system photos app; a navigation push
         // slides the source bars and stalls taps after the pop settles.

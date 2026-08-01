@@ -58,6 +58,9 @@ final class TimelineModel {
     private(set) var sections: [TimelineSection] = []
     private(set) var rows: [TimelineRow] = []
     private(set) var monthByRowID: [String: String] = [:]
+    /// anchors a visible row back into `flatAssets` so the prefetcher can size
+    /// its window in assets rather than rows.
+    private(set) var firstAssetIDByRowID: [String: String] = [:]
     private(set) var isLoading = false
     private(set) var loadError: String?
     private(set) var flatAssets: [Asset] = []
@@ -214,6 +217,7 @@ final class TimelineModel {
     private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false) {
         var result: [TimelineRow] = []
         var monthByRowID: [String: String] = [:]
+        var firstAssetIDByRowID: [String: String] = [:]
         var flattened: [Asset] = []
         var flattenedIndex: [String: Int] = [:]
         result.reserveCapacity(rows.count + 16)
@@ -258,6 +262,7 @@ final class TimelineModel {
                         let tileID = "t-\(section.id)-\(day.id)-\(rowIndex)"
                         result.append(.tiles(tileID, Array(day.assets[start..<end])))
                         monthByRowID[tileID] = section.monthTitle
+                        firstAssetIDByRowID[tileID] = day.assets[start].id
                         sectionTileRows += 1
                         start = end
                         rowIndex += 1
@@ -278,6 +283,7 @@ final class TimelineModel {
         let commit = {
             self.rows = result
             self.monthByRowID = monthByRowID
+            self.firstAssetIDByRowID = firstAssetIDByRowID
             if rebuildAssets {
                 self.flatAssets = flattened
                 self.flatAssetIndexByID = flattenedIndex

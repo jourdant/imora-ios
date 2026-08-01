@@ -6,19 +6,12 @@
 	objectVersion = 90;
 	objects = {
 
-/* Begin PBXContainerItemProxy section */
-		000000000000000000002001 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 000000000000000000000000 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 000000000000000100000000;
-			remoteInfo = imora;
-		};
-/* End PBXContainerItemProxy section */
+/* Begin PBXBuildFile section */
+		000000000000000170000000 /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000160000000 /* Nuke */; };
+/* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* imora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = imora.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		000000000000000000002002 /* imoraUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = imoraUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -27,22 +20,13 @@
 			path = imora;
 			sourceTree = "<group>";
 		};
-		000000000000000000002003 /* imoraUITests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = imoraUITests;
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		000000000000000000002021 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			files = (
-			);
-		};
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				000000000000000170000000 /* Nuke in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -52,7 +36,6 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000010 /* imora */,
-				000000000000000000002003 /* imoraUITests */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -61,7 +44,6 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000120 /* imora.app */,
-				000000000000000000002002 /* imoraUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -69,27 +51,6 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		000000000000000000002000 /* imoraUITests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 000000000000000000002010 /* Build configuration list for PBXNativeTarget "imoraUITests" */;
-			buildPhases = (
-				000000000000000000002020 /* Sources */,
-				000000000000000000002021 /* Frameworks */,
-				000000000000000000002022 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				000000000000000000002030 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				000000000000000000002003 /* imoraUITests */,
-			);
-			name = imoraUITests;
-			productName = imoraUITests;
-			productReference = 000000000000000000002002 /* imoraUITests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
 		000000000000000100000000 /* imora */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "imora" */;
@@ -104,6 +65,9 @@
 				000000000000000000000010 /* imora */,
 			);
 			name = imora;
+			packageProductDependencies = (
+				000000000000000160000000 /* Nuke */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* imora.app */;
 			productType = "com.apple.product-type.application";
@@ -118,10 +82,6 @@
 				LastSwiftUpdateCheck = 2630;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
-					000000000000000000002000 = {
-						CreatedOnToolsVersion = 26.3;
-						TestTargetID = 000000000000000100000000;
-					};
 					000000000000000100000000 = {
 						CreatedOnToolsVersion = 26.3;
 					};
@@ -136,23 +96,20 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				000000000000000150000000 /* XCRemoteSwiftPackageReference "Nuke" */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				000000000000000100000000 /* imora */,
-				000000000000000000002000 /* imoraUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		000000000000000000002022 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			files = (
-			);
-		};
 		000000000000000140000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
@@ -161,11 +118,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		000000000000000000002020 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			files = (
-			);
-		};
 		000000000000000120000000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
@@ -173,55 +125,7 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
-/* Begin PBXTargetDependency section */
-		000000000000000000002030 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 000000000000000100000000 /* imora */;
-			targetProxy = 000000000000000000002001 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
-
 /* Begin XCBuildConfiguration section */
-		000000000000000000002011 /* Debug configuration for PBXNativeTarget "imoraUITests" */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = WLAPHT4WXV;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).imoraUITests";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = imora;
-			};
-			name = Debug;
-		};
-		000000000000000000002012 /* Release configuration for PBXNativeTarget "imoraUITests" */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = WLAPHT4WXV;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).imoraUITests";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = imora;
-			};
-			name = Release;
-		};
 		000000000000000011000000 /* Debug configuration for PBXProject "imora" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -437,14 +341,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		000000000000000000002010 /* Build configuration list for PBXNativeTarget "imoraUITests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				000000000000000000002011 /* Debug configuration for PBXNativeTarget "imoraUITests" */,
-				000000000000000000002012 /* Release configuration for PBXNativeTarget "imoraUITests" */,
-			);
-			defaultConfigurationName = Release;
-		};
 		000000000000000010000000 /* Build configuration list for PBXProject "imora" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -462,6 +358,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		000000000000000150000000 /* XCRemoteSwiftPackageReference "Nuke" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/kean/Nuke";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 13.0.6;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		000000000000000160000000 /* Nuke */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 000000000000000150000000 /* XCRemoteSwiftPackageReference "Nuke" */;
+			productName = Nuke;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

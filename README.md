@@ -15,19 +15,27 @@ This is a rewrite of the official Flutter mobile app as a fully native iOS exper
 - Library: favorites, archive and trash management, people browsing
 - Places: an Apple Maps photo map with client-side clustering, marker thumbnails, filters (favorites, archive, partners, shared albums, date range) and a grid of everything inside the visible area
 - Multi-select everywhere with a Liquid Glass action bar: favorite, archive, add to album, trash, restore
-- Thumbhash placeholders, downsampled decoding and a 1 GiB disk cache for fast scrolling
+- Thumbhash placeholders, thumbnail-sized decoding and a 1 GiB disk cache for fast scrolling, with grids prefetching a rolling window of tiles ahead of the fold
 
 ## Requirements
 
 - Xcode 27 (iOS 26 SDK) or newer
 - An Immich server, v2.x/3.x API
 
+## Dependencies
+
+Resolved by Swift Package Manager on first build:
+
+- [Nuke](https://github.com/kean/Nuke) 13 - the image pipeline behind every thumbnail: memory and disk caching, request coalescing, prefetching, a rate limiter for fast scrolling and resumable downloads.
+
+Everything else is system frameworks. Device thumbnails go through PhotoKit's own `PHCachingImageManager`, checksums through CryptoKit, and the REST layer is `URLSession` with `Codable`.
+
 ## Development
 
-Open `imora.xcodeproj` and run. The UI test suite (`imoraUITests`) drives a full walkthrough against the public Immich demo server and captures screenshots as attachments:
+Open `imora.xcodeproj` and run:
 
 ```sh
-xcodebuild test -project imora.xcodeproj -scheme imora \
+xcodebuild build -project imora.xcodeproj -scheme imora \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.5'
 ```
 
@@ -41,7 +49,7 @@ imora/
   Core/
     API/          ImmichClient (async REST), SessionStore
     Models/       codable dtos, columnar time-bucket decoding
-    Images/       ImageLoader (memory + disk cache), thumbhash decoder
+    Images/       ImageLoader (Nuke pipeline), PhotoKit loader, prefetcher, thumbhash decoder
     Storage/      keychain wrapper
   DesignSystem/   RemoteImage, asset tiles
   Features/       Auth, Timeline, Viewer, Albums, Search, Library, Map, Settings

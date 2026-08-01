@@ -1,55 +1,36 @@
+import Nuke
+import Synchronization
 import UIKit
 
-/// downloads and caches asset thumbnails. memory cache holds decoded images,
-/// urlcache persists encoded bytes on disk across launches.
-/// unchecked because nscache is documented thread-safe.
-nonisolated final class ImageLoader: @unchecked Sendable {
+/// downloads and caches asset thumbnails on top of a nuke pipeline. beyond the
+/// memory and disk caches, the library brings request coalescing, a rate
+/// limiter tuned for fast scrolling, resumable downloads and the prefetcher
+/// the grids use to load tiles before they come on screen.
+nonisolated final class ImageLoader: Sendable {
     static let shared = ImageLoader()
 
-    private let memory: NSCache<NSString, UIImage>
-    private let store: SessionBox
-
-    private final class SessionBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var _session: URLSession
-
-        init(session: URLSession) { _session = session }
-
-        var session: URLSession {
-            lock.lock()
-            defer { lock.unlock() }
-            return _session
-        }
-
-        func replace(_ session: URLSession) {
-            lock.lock()
-            defer { lock.unlock() }
-            _session = session
-        }
-    }
+    private let pipeline: ImagePipeline
+    private let authorization = AuthorizingDelegate()
+    private let prefetcher: ImagePrefetcher
 
     private init() {
-        memory = NSCache()
-        memory.totalCostLimit = 256 * 1024 * 1024
-        store = SessionBox(session: Self.makeSession(headers: [:]))
-    }
-
-    private static func makeSession(headers: [String: String]) -> URLSession {
-        let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = headers
-        config.urlCache = URLCache(
-            memoryCapacity: 64 * 1024 * 1024,
-            diskCapacity: 1024 * 1024 * 1024,
-            diskPath: "imora-images"
+        // an aggressive data cache instead of urlcache: immich thumbnails are
+        // immutable per cache key, so revalidating them is wasted latency.
+        var configuration = ImagePipeline.Configuration.withDataCache(
+            name: "imora-images",
+            sizeLimit: 1 << 30
         )
-        config.requestCachePolicy = .returnCacheDataElseLoad
-        config.httpMaximumConnectionsPerHost = 8
-        return URLSession(configuration: config)
+        configuration.imageCache = ImageCache(costLimit: 256 << 20)
+        // the sanitized key drops the thumbnail size, so one download serves
+        // every pixel size the grid and the viewer ask for.
+        configuration.dataCachePolicy = .storeOriginalData
+        pipeline = ImagePipeline(configuration: configuration, delegate: authorization)
+        prefetcher = ImagePrefetcher(pipeline: pipeline, maxConcurrentRequestCount: 4)
     }
 
     /// call after login so image requests carry the token.
     func configure(headers: [String: String]) {
-        store.replace(Self.makeSession(headers: headers))
+        authorization.headers.withLock { $0 = headers }
     }
 
     func requestKey(for url: URL, targetPixelSize: CGFloat) -> String {
@@ -57,44 +38,63 @@ nonisolated final class ImageLoader: @unchecked Sendable {
     }
 
     func cachedImage(for url: URL, targetPixelSize: CGFloat) -> UIImage? {
-        memory.object(forKey: requestKey(for: url, targetPixelSize: targetPixelSize) as NSString)
+        pipeline.cache[request(for: url, targetPixelSize: targetPixelSize)]?.image
     }
 
     func image(for url: URL, targetPixelSize: CGFloat) async throws -> UIImage {
-        let key = requestKey(for: url, targetPixelSize: targetPixelSize) as NSString
-        if let cached = memory.object(forKey: key) { return cached }
+        try await pipeline.image(for: request(for: url, targetPixelSize: targetPixelSize))
+    }
 
-        let (data, response) = try await store.session.data(from: url)
-        try Task.checkCancellation()
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw ImmichError.http(http.statusCode, "")
-        }
-        guard let image = Self.downsample(data: data, targetPixelSize: targetPixelSize) else {
-            throw ImmichError.decoding("not an image")
-        }
-        try Task.checkCancellation()
-        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
-        memory.setObject(image, forKey: key, cost: cost)
-        return image
+    // MARK: - prefetching
+
+    /// warms the caches for tiles about to scroll into view. prefetches run at
+    /// a lower priority than visible requests and coalesce with them, so a tile
+    /// that appears mid-flight reuses the download already in progress.
+    func startPrefetching(urls: [URL], targetPixelSize: CGFloat) {
+        prefetcher.startPrefetching(with: requests(for: urls, targetPixelSize: targetPixelSize))
+    }
+
+    func stopPrefetching(urls: [URL], targetPixelSize: CGFloat) {
+        prefetcher.stopPrefetching(with: requests(for: urls, targetPixelSize: targetPixelSize))
+    }
+
+    // MARK: - requests
+
+    /// decoding straight to a thumbnail keeps memory flat while scrolling -
+    /// the full-size bitmap never exists.
+    private func request(for url: URL, targetPixelSize: CGFloat) -> ImageRequest {
+        var request = ImageRequest(url: url)
+        request.thumbnail = ImageRequest.ThumbnailOptions(
+            maxPixelSize: Float(Self.normalizedPixelSize(targetPixelSize))
+        )
+        return request
+    }
+
+    private func requests(for urls: [URL], targetPixelSize: CGFloat) -> [ImageRequest] {
+        urls.map { request(for: $0, targetPixelSize: targetPixelSize) }
     }
 
     private static func normalizedPixelSize(_ value: CGFloat) -> Int {
         max(1, Int(value.rounded(.up)))
     }
+}
 
-    /// decodes at reduced resolution to keep memory flat while scrolling.
-    private static func downsample(data: Data, targetPixelSize: CGFloat) -> UIImage? {
-        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else { return nil }
-        let options = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: targetPixelSize,
-        ] as CFDictionary
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
-            return UIImage(data: data)
+/// injects the session token as the request leaves the pipeline. keeping it out
+/// of the request itself means the cache keys never mention the token, so
+/// signing back in still hits a warm cache.
+private final class AuthorizingDelegate: ImagePipeline.Delegate {
+    let headers = Mutex<[String: String]>([:])
+
+    @ImagePipelineActor
+    func willLoadData(
+        for request: ImageRequest,
+        urlRequest: URLRequest,
+        pipeline: ImagePipeline
+    ) async throws -> URLRequest {
+        var urlRequest = urlRequest
+        for (field, value) in headers.withLock({ $0 }) {
+            urlRequest.setValue(value, forHTTPHeaderField: field)
         }
-        return UIImage(cgImage: cgImage)
+        return urlRequest
     }
 }
