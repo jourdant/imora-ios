@@ -70,7 +70,14 @@ struct SettingsView: View {
                     preferenceToggle("People", icon: "person.2", section: "people", isOn: session.preferences?.peopleEnabled ?? true)
                 }
 
-                Section("Backup") {
+                Section {
+                    NavigationLink {
+                        NotificationSettingsScreen()
+                    } label: {
+                        Label("Notifications", systemImage: "bell")
+                    }
+                    .accessibilityIdentifier("settings-notifications")
+
                     NavigationLink {
                         BackupScreen()
                     } label: {

@@ -242,6 +242,10 @@ nonisolated final class ImmichClient: Sendable {
     func updatePreference(section: String, enabled: Bool) async throws -> UserPreferences {
         try await request("users/me/preferences", method: "PUT", body: [section: ["enabled": enabled]])
     }
+
+    func updateEmailNotifications(_ preferences: EmailNotificationPreferences) async throws -> UserPreferences {
+        try await request("users/me/preferences", method: "PUT", body: ["emailNotifications": preferences])
+    }
     func serverAbout() async throws -> ServerAbout { try await get("server/about") }
     func serverFeatures() async throws -> ServerFeatures { try await get("server/features") }
     func serverStorage() async throws -> ServerStorage { try await get("server/storage") }
@@ -587,6 +591,34 @@ nonisolated final class ImmichClient: Sendable {
         try await get("map/markers", query: options.queryItems)
     }
 
+    // MARK: - notifications
+
+    /// the whole inbox, newest first. immich has no push transport, so this and
+    /// the on_notification socket event are the only ways an entry surfaces.
+    func notifications(unreadOnly: Bool = false) async throws -> [ServerNotification] {
+        var query: [URLQueryItem] = []
+        if unreadOnly { query.append(URLQueryItem(name: "unread", value: "true")) }
+        let items: [ServerNotification] = try await get("notifications", query: query)
+        return items.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    func markNotificationRead(id: String, at date: Date = Date()) async throws {
+        try await mutate("notifications/\(id)", method: "PUT", body: ["readAt": APIDate.string(from: date)])
+    }
+
+    func markNotificationsRead(ids: [String], at date: Date = Date()) async throws {
+        guard !ids.isEmpty else { return }
+        try await mutate("notifications", method: "PUT", body: [
+            "ids": AnyEncodable(ids),
+            "readAt": AnyEncodable(APIDate.string(from: date)),
+        ])
+    }
+
+    func deleteNotifications(ids: [String]) async throws {
+        guard !ids.isEmpty else { return }
+        try await mutate("notifications", method: "DELETE", body: ["ids": ids])
+    }
+
     // MARK: - memories
 
     func memories(for date: Date) async throws -> [Memory] {
@@ -630,11 +662,14 @@ nonisolated final class ImmichClient: Sendable {
         }
     }
 
-    /// multipart upload of one asset file. takes ownership of the source file:
-    /// it is deleted as soon as the request body is built, so peak temp usage
-    /// stays near one file size. onProgress receives the sent fraction.
+    /// multipart upload of one asset file, handed to the background session so
+    /// the transfer survives the app being suspended. takes ownership of the
+    /// source file: it is deleted as soon as the request body is built, so peak
+    /// disk usage stays near one file size. onProgress receives the sent
+    /// fraction, and `account` routes a completion that outlives this process.
     func uploadAsset(
         _ upload: AssetUploadRequest,
+        account: String,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> AssetUploadResult {
         let iso = ISO8601DateFormatter()
@@ -655,52 +690,43 @@ nonisolated final class ImmichClient: Sendable {
         }
 
         let boundary = "imora-\(UUID().uuidString)"
+        // the body outlives this process when the app is suspended mid-transfer,
+        // so it cannot live in a directory the system may reclaim.
         let bodyURL = try MultipartBody.makeBodyFile(
             fields: fields,
             fileField: "assetData",
             filename: upload.filename,
             contentsOf: upload.fileURL,
             boundary: boundary,
-            in: FileManager.default.temporaryDirectory.appending(path: "backup")
+            in: BackgroundUploader.bodyDirectory
         )
         try? FileManager.default.removeItem(at: upload.fileURL)
-        defer { try? FileManager.default.removeItem(at: bodyURL) }
 
         var request = URLRequest(url: apiURL.appending(path: "assets"))
         request.httpMethod = "POST"
         request.setValue(MultipartBody.contentType(boundary: boundary), forHTTPHeaderField: "Content-Type")
         request.setValue(upload.checksum, forHTTPHeaderField: "x-immich-checksum")
-        let delegate = onProgress.map { UploadProgressDelegate(onProgress: $0) }
-        let (data, response) = try await session.upload(for: request, fromFile: bodyURL, delegate: delegate)
-        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
-        guard (200..<300).contains(http.statusCode) else {
-            throw ImmichError.http(http.statusCode, Self.serverMessage(from: data))
-        }
+        // the background session carries none of this client's session headers.
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let ticket = BackgroundUploader.Ticket(
+            account: account,
+            localId: upload.deviceAssetId,
+            isMotion: upload.isMotion,
+            bodyPath: bodyURL.path
+        )
+        let data = try await BackgroundUploader.shared.upload(
+            request,
+            fromFile: bodyURL,
+            ticket: ticket,
+            onProgress: onProgress
+        )
         do {
             return try JSONDecoder().decode(AssetUploadResult.self, from: data)
         } catch {
             throw ImmichError.decoding("\(error)")
         }
-    }
-}
-
-/// forwards urlsession byte progress for one upload task.
-private nonisolated final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    private let onProgress: @Sendable (Double) -> Void
-
-    init(onProgress: @escaping @Sendable (Double) -> Void) {
-        self.onProgress = onProgress
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        didSendBodyData bytesSent: Int64,
-        totalBytesSent: Int64,
-        totalBytesExpectedToSend: Int64
-    ) {
-        guard totalBytesExpectedToSend > 0 else { return }
-        onProgress(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
     }
 }
 
@@ -804,6 +830,9 @@ nonisolated struct AssetUploadRequest: Sendable {
     var livePhotoVideoId: String?
     /// hides the motion part of a live photo from the timeline.
     var hidden = false
+    /// which half of a live photo this is, so a completion that outlives the
+    /// app lands on the right side of the index entry.
+    var isMotion = false
 }
 
 nonisolated struct AssetUploadResult: Decodable, Sendable {

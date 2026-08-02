@@ -15,6 +15,8 @@ final class SessionStore {
     private(set) var features: ServerFeatures?
     private(set) var backup: BackupManager?
     private(set) var realtime: RealtimeHub?
+    private(set) var notifications: NotificationInbox?
+    private(set) var shareUploads: ShareUploadModel?
     var preferences: UserPreferences?
 
     private static let serverKey = "imora.serverURL"
@@ -71,6 +73,13 @@ final class SessionStore {
         realtime = nil
         backup?.shutdown()
         backup = nil
+        notifications?.clear()
+        notifications = nil
+        shareUploads?.cancel()
+        shareUploads = nil
+        NotificationRouter.shared.inbox = nil
+        ContinuedProcessing.backup.workload = nil
+        ContinuedProcessing.share.workload = nil
         client = nil
         user = nil
         features = nil
@@ -117,10 +126,24 @@ final class SessionStore {
         self.backup = backup
         let hub = RealtimeHub(client: client)
         backup.onLocalChange = { [weak hub] in hub?.notifyLocalChange() }
+        backup.onRunFinished = { phase in
+            switch phase {
+            case .done(let summary): LocalNotifications.shared.deliverBackupReport(summary)
+            case .error(let message): LocalNotifications.shared.deliverBackupFailure(message)
+            default: break
+            }
+        }
+        ContinuedProcessing.backup.workload = backup
         hub.onRemoteEdit = { [weak backup] ids in backup?.noteRemoteEdits(ids) }
         realtime = hub
+        let inbox = NotificationInbox(client: client)
+        hub.addListener(inbox)
+        NotificationRouter.shared.inbox = inbox
+        notifications = inbox
+        shareUploads = ShareUploadModel(client: client)
         state = .loggedIn
         Task { await refreshUser() }
+        Task { await inbox.load() }
         backup.startIfIdle()
         hub.setActive(true)
     }

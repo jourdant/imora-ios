@@ -37,7 +37,7 @@ struct BackupScreen: View {
             }
             .accessibilityIdentifier("backup-auto-toggle")
         } footer: {
-            Text("Photos and videos upload to your server while the app is open. New uploads appear in the timeline automatically.")
+            Text("Photos and videos upload to your server while the app is open, and new uploads appear in the timeline automatically. A backup you start yourself keeps running for a while after you leave, with progress on the Lock Screen.")
         }
     }
 
@@ -77,13 +77,25 @@ struct BackupScreen: View {
                 .accessibilityIdentifier("backup-cancel")
             } else {
                 Button {
-                    backup.start()
+                    startBackup(backup)
                 } label: {
                     Label("Back Up Now", systemImage: "icloud.and.arrow.up")
                 }
                 .disabled(cleanup == .verifying || cleanup == .deleting)
                 .accessibilityIdentifier("backup-start")
             }
+        }
+    }
+
+    /// hands the run to the scheduler when it will take it, so the progress
+    /// indicator survives leaving the app; otherwise backs up in app as before.
+    private func startBackup(_ backup: BackupManager) {
+        Task {
+            let accepted = await ContinuedProcessing.backup.submit(
+                title: "Backing up",
+                subtitle: "Preparing..."
+            )
+            if !accepted { backup.start() }
         }
     }
 

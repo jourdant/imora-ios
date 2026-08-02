@@ -13,6 +13,7 @@ protocol RealtimeListener: AnyObject {
     func realtimeResync()
     func realtimeAlbumsChanged()
     func realtimeLocalChanged()
+    func realtimeNotification(_ notification: ServerNotification)
 }
 
 extension RealtimeListener {
@@ -21,6 +22,7 @@ extension RealtimeListener {
     func realtimeResync() {}
     func realtimeAlbumsChanged() {}
     func realtimeLocalChanged() {}
+    func realtimeNotification(_ notification: ServerNotification) {}
 }
 
 /// keeps the app in sync with the server over the immich socket.io channel,
@@ -272,6 +274,14 @@ final class RealtimeHub {
         case "on_album_update":
             albumsGeneration += 1
             broadcast { $0.realtimeAlbumsChanged() }
+
+        case "on_notification":
+            // the payload is the whole entry, so the inbox never has to refetch.
+            if let payload,
+               let data = try? JSONSerialization.data(withJSONObject: payload),
+               let notification = try? JSONDecoder().decode(ServerNotification.self, from: data) {
+                broadcast { $0.realtimeNotification(notification) }
+            }
 
         default:
             break

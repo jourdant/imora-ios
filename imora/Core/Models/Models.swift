@@ -27,6 +27,11 @@ nonisolated enum APIDate {
         // no timezone designator: treat as utc wall clock, drop the fraction.
         return naive.date(from: String(raw.prefix(19)))
     }
+
+    /// what the api expects back, matching javascript's toISOString.
+    static func string(from date: Date) -> String {
+        isoFractional.string(from: date)
+    }
 }
 
 extension Date.FormatStyle {
@@ -122,6 +127,16 @@ nonisolated struct FeatureToggle: Codable, Hashable {
     let enabled: Bool
 }
 
+/// server-side email delivery switches. the album flags only matter while
+/// `enabled` is on, which is how the web client gates them too.
+nonisolated struct EmailNotificationPreferences: Codable, Hashable {
+    var enabled: Bool
+    var albumInvite: Bool
+    var albumUpdate: Bool
+
+    static let `default` = EmailNotificationPreferences(enabled: true, albumInvite: true, albumUpdate: true)
+}
+
 nonisolated struct UserPreferences: Codable, Hashable {
     let memories: FeatureToggle?
     let people: FeatureToggle?
@@ -129,11 +144,13 @@ nonisolated struct UserPreferences: Codable, Hashable {
     let ratings: FeatureToggle?
     let tags: FeatureToggle?
     let sharedLinks: FeatureToggle?
+    let emailNotifications: EmailNotificationPreferences?
 
     var memoriesEnabled: Bool { memories?.enabled ?? true }
     var peopleEnabled: Bool { people?.enabled ?? true }
     var tagsEnabled: Bool { tags?.enabled ?? true }
     var ratingsEnabled: Bool { ratings?.enabled ?? false }
+    var email: EmailNotificationPreferences { emailNotifications ?? .default }
 }
 
 nonisolated struct ServerStorage: Codable {
@@ -549,4 +566,78 @@ nonisolated struct Memory: Codable, Identifiable {
     let memoryAt: String
     let data: MemoryData
     let assets: [AssetDetail]
+}
+
+// MARK: - notifications
+
+nonisolated enum NotificationLevel: String, Decodable, Hashable, Sendable {
+    case success
+    case error
+    case warning
+    case info
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .info
+    }
+}
+
+nonisolated enum NotificationKind: String, Decodable, Hashable, Sendable {
+    case jobFailed = "JobFailed"
+    case backupFailed = "BackupFailed"
+    case systemMessage = "SystemMessage"
+    case albumInvite = "AlbumInvite"
+    case albumUpdate = "AlbumUpdate"
+    case custom = "Custom"
+
+    /// a server newer than this build can name kinds we do not know; they still
+    /// belong in the inbox, just without a dedicated icon.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .custom
+    }
+}
+
+/// one entry of the server-side inbox, GET /notifications.
+nonisolated struct ServerNotification: Decodable, Identifiable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let body: String?
+    let level: NotificationLevel
+    let kind: NotificationKind
+    let createdAt: Date
+    var readAt: Date?
+    /// album the entry points at, lifted out of the free-form data payload.
+    let albumID: String?
+
+    var isUnread: Bool { readAt == nil }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, description, level, type, createdAt, readAt, data
+    }
+
+    private struct AlbumPayload: Decodable { let albumId: String? }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        body = try container.decodeIfPresent(String.self, forKey: .description)
+        level = try container.decodeIfPresent(NotificationLevel.self, forKey: .level) ?? .info
+        kind = try container.decodeIfPresent(NotificationKind.self, forKey: .type) ?? .custom
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+            .flatMap(APIDate.parse) ?? Date()
+        readAt = try container.decodeIfPresent(String.self, forKey: .readAt).flatMap(APIDate.parse)
+        albumID = Self.albumID(in: container)
+    }
+
+    /// the server stringifies the payload before storing it, so the field comes
+    /// back as json text; an object is accepted too in case that ever changes.
+    private static func albumID(in container: KeyedDecodingContainer<CodingKeys>) -> String? {
+        if let raw = try? container.decode(String.self, forKey: .data),
+           let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] {
+            return object["albumId"] as? String
+        }
+        return (try? container.decode(AlbumPayload.self, forKey: .data))?.albumId
+    }
 }

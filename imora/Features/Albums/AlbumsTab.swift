@@ -15,6 +15,8 @@ struct AlbumsTab: View {
     @State private var isLoading = false
     @State private var showCreate = false
     @State private var newAlbumName = ""
+    @State private var path = NavigationPath()
+    private var router: NotificationRouter { .shared }
 
     private var visibleAlbums: [Album] {
         var result = albums
@@ -30,7 +32,7 @@ struct AlbumsTab: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     filterChips
@@ -69,6 +71,9 @@ struct AlbumsTab: View {
                 }
             }
             .task { await load() }
+            // a notification tap arrives as an id; .task(id:) also covers the
+            // case where this tab is only created by the switch itself.
+            .task(id: router.pendingAlbumID) { await openPendingAlbum() }
             // reloads after returning from a detail where the album may have
             // been renamed or deleted. the initial load stays with .task.
             .onAppear {
@@ -129,6 +134,14 @@ struct AlbumsTab: View {
         _ = try? await client.createAlbum(name: newAlbumName)
         newAlbumName = ""
         await load()
+    }
+
+    private func openPendingAlbum() async {
+        guard let id = router.pendingAlbumID else { return }
+        defer { router.pendingAlbumID = nil }
+        guard let album = try? await session.client?.album(id: id) else { return }
+        path = NavigationPath()
+        path.append(album)
     }
 }
 

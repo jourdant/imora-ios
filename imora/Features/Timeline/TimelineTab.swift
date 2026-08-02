@@ -16,6 +16,16 @@ struct TimelineTab: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        NotificationRouter.shared.openInbox()
+                    } label: {
+                        Image(systemName: "bell")
+                    }
+                    // ios 26 renders toolbar badges; zero draws nothing.
+                    .badge(session.notifications?.unreadCount ?? 0)
+                    .accessibilityIdentifier("notifications-open")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
                         showSettings = true
                     } label: {
                         ProfileAvatar(size: 30)

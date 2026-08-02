@@ -63,7 +63,9 @@ final class BackupManager {
     private static let uploadWorkers = 3
     private static let checkBatchSize = 100
 
-    private(set) var phase: BackupPhase = .idle
+    private(set) var phase: BackupPhase = .idle {
+        didSet { onContinuedProgress?() }
+    }
     private(set) var summary = BackupSummary()
     /// first per-asset failure of the current run, for display next to counts.
     private(set) var lastFailure: String?
@@ -80,6 +82,12 @@ final class BackupManager {
     private(set) var localIdentifierByRemoteId: [String: String] = [:]
     /// wired by sessionstore to the realtime hub, which debounces.
     var onLocalChange: (() -> Void)?
+    /// wired by sessionstore to raise the end-of-run notification. carries the
+    /// terminal phase so a cancelled run stays silent.
+    var onRunFinished: ((BackupPhase) -> Void)?
+    /// wired by the continued-processing task, which has to keep feeding the
+    /// system progress ui or the scheduler expires it.
+    var onContinuedProgress: (() -> Void)?
 
     var autoBackup: Bool {
         didSet {
@@ -104,6 +112,15 @@ final class BackupManager {
     private var runTask: Task<Void, Never>?
     private var rerunRequested = false
     private var changeObserver: LibraryChangeObserver?
+    /// uploads that landed in the index without a run to count them, i.e. while
+    /// the app was suspended or gone.
+    private var adoptedUploads = 0
+
+    /// host|userId, stamped onto every background upload so a completion can
+    /// never be applied to a different account's index.
+    private var accountKey: String {
+        SessionCache.accountKey(host: client.apiURL.host() ?? "")
+    }
 
     nonisolated static var scratchDirectory: URL {
         FileManager.default.temporaryDirectory.appending(path: "backup")
@@ -123,6 +140,11 @@ final class BackupManager {
     func shutdown() {
         runTask?.cancel()
         runTask = nil
+        BackgroundUploader.shared.setOrphanHandler(nil)
+        BackgroundUploader.shared.setEventsFinishedHandler(nil)
+        // transfers outlive the process, so signing out has to stop them
+        // explicitly or they would keep filling a stranger's library.
+        BackgroundUploader.shared.cancelAll()
         if let changeObserver {
             PHPhotoLibrary.shared().unregisterChangeObserver(changeObserver)
             self.changeObserver = nil
@@ -134,6 +156,13 @@ final class BackupManager {
     func start() {
         guard !isRunning else { return }
         runTask = Task { await run() }
+    }
+
+    /// starts a run if idle and suspends until it ends. the continued-processing
+    /// task has to outlive the whole run, so it needs something to await.
+    func runToCompletion() async {
+        if !isRunning { start() }
+        await runTask?.value
     }
 
     func cancel() {
@@ -216,7 +245,46 @@ final class BackupManager {
         backedUpRemoteIds = await index.backedUpRemoteIds()
         localIdentifierByRemoteId = await index.renderableRemoteToLocalMap()
         updateChangeObserver()
+        adoptBackgroundUploads()
         onLocalChange?()
+    }
+
+    // MARK: - background uploads
+
+    /// transfers handed to the system finish whether or not this process is
+    /// still around. anything that landed while it was not has to reach the
+    /// index here, or the next run would send the same bytes again.
+    private func adoptBackgroundUploads() {
+        BackgroundUploader.shared.setOrphanHandler { [weak self] completion in
+            guard let manager = self else { return }
+            Task { @MainActor in await manager.applyBackgroundUpload(completion) }
+        }
+        BackgroundUploader.shared.setEventsFinishedHandler { [weak self] in
+            guard let manager = self else { return }
+            Task { @MainActor in manager.reportAdoptedUploads() }
+        }
+        BackgroundUploader.shared.sweepAbandonedBodies()
+    }
+
+    private func applyBackgroundUpload(_ completion: BackgroundUploader.Completion) async {
+        guard let userId, completion.ticket.account == accountKey else { return }
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
+        if completion.ticket.isMotion {
+            await index.setMotionRemoteId(localId: completion.ticket.localId, completion.remoteId)
+        } else {
+            await index.setPrimaryRemoteId(localId: completion.ticket.localId, completion.remoteId)
+        }
+        await index.save()
+        adoptedUploads += 1
+        localChanged()
+    }
+
+    /// the run that started these uploads is long gone, so the end-of-run
+    /// notification never fired for them.
+    private func reportAdoptedUploads() {
+        guard adoptedUploads > 0 else { return }
+        LocalNotifications.shared.deliverBackupReport(BackupSummary(uploaded: adoptedUploads))
+        adoptedUploads = 0
     }
 
     /// every device asset paired with its backup status, newest first.
@@ -240,6 +308,34 @@ final class BackupManager {
         // quantized so progress redraws stay coarse.
         guard fraction >= 1 || fraction - current >= 0.02 else { return }
         uploadStates[localId] = .uploading(min(fraction, 1))
+        // a single large video can hold the phase still for minutes, and a
+        // continued-processing task that stops reporting gets expired.
+        onContinuedProgress?()
+    }
+
+    /// how far the current run has come, 0...1, counting the bytes already sent
+    /// for uploads still in flight. hashing takes the first fifth because it
+    /// runs before a single byte leaves the device.
+    var progressFraction: Double {
+        switch phase {
+        case .idle, .scanning:
+            0
+        case .hashing(let done, let total):
+            total > 0 ? 0.2 * Double(done) / Double(total) : 0
+        case .checking:
+            0.2
+        case .uploading(let done, let total):
+            total > 0 ? 0.2 + 0.8 * min(Double(done) + inFlightFraction, Double(total)) / Double(total) : 0.2
+        case .done, .error:
+            1
+        }
+    }
+
+    private var inFlightFraction: Double {
+        uploadStates.values.reduce(0) { total, state in
+            if case .uploading(let fraction) = state { return total + fraction }
+            return total
+        }
     }
 
     // MARK: - pipeline
@@ -276,6 +372,7 @@ final class BackupManager {
             await index.save()
             phase = .error(error.localizedDescription)
         }
+        onRunFinished?(phase)
         uploadStates.removeAll()
         localChanged()
         runTask = nil
@@ -385,6 +482,7 @@ final class BackupManager {
         let index = index
         let deviceId = DeviceID.current
         let scratch = Self.scratchDirectory
+        let account = accountKey
         var quotaMessage: String?
         let progress: @Sendable (String, Double) -> Void = { [weak self] localId, fraction in
             // bound once here: the nested task cannot capture the weak slot,
@@ -404,7 +502,8 @@ final class BackupManager {
                 group.addTask {
                     let outcome = await Self.uploadOne(
                         asset: asset, client: client, index: index,
-                        deviceId: deviceId, scratch: scratch, onProgress: progress
+                        deviceId: deviceId, scratch: scratch, account: account,
+                        onProgress: progress
                     )
                     return (asset.localIdentifier, outcome)
                 }
@@ -473,6 +572,7 @@ final class BackupManager {
         index: BackupIndex,
         deviceId: String,
         scratch: URL,
+        account: String,
         onProgress: @escaping @Sendable (String, Double) -> Void
     ) async -> UploadOutcome {
         // the asset may have changed or vanished since the scan.
@@ -524,8 +624,9 @@ final class BackupManager {
                     fileModifiedAt: modifiedAt,
                     isFavorite: false,
                     durationMs: 0,
-                    hidden: true
-                )) { fraction in
+                    hidden: true,
+                    isMotion: true
+                ), account: account) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 // persisted immediately so a failed still upload resumes here.
@@ -550,7 +651,7 @@ final class BackupManager {
                     isFavorite: current.isFavorite,
                     durationMs: current.isVideo ? current.durationMs : 0,
                     livePhotoVideoId: motionRemoteId
-                )) { fraction in
+                ), account: account) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 await index.setPrimaryRemoteId(localId: current.localIdentifier, result.id)
@@ -730,6 +831,43 @@ final class BackupManager {
         await index.save()
         localChanged()
         return ids.count
+    }
+}
+
+// MARK: - continued processing
+
+extension BackupManager: ContinuedWorkload {
+    var continuedTitle: String {
+        switch phase {
+        // a run with nothing to send is not an achievement to announce.
+        case .done(let summary) where summary.uploaded == 0 && summary.failed == 0:
+            "Already backed up"
+        case .done: "Backup complete"
+        case .error: "Backup stopped"
+        default: "Backing up"
+        }
+    }
+
+    var continuedSubtitle: String {
+        switch phase {
+        case .idle, .scanning: "Scanning library..."
+        case .hashing(let done, let total): "Preparing \(done) of \(total)"
+        case .checking: "Checking with your server..."
+        case .uploading(let done, let total): "\(done) of \(total) uploaded"
+        case .done(let summary) where summary.uploaded == 0 && summary.failed == 0:
+            "Nothing new to send"
+        case .done(let summary) where summary.failed > 0:
+            "\(summary.uploaded) uploaded, \(summary.failed) failed"
+        case .done(let summary): "\(summary.uploaded) uploaded"
+        case .error(let message): message
+        }
+    }
+
+    var continuedFraction: Double { progressFraction }
+
+    var continuedSucceeded: Bool {
+        if case .done = phase { return true }
+        return false
     }
 }
 
