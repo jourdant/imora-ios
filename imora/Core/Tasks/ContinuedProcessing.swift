@@ -27,11 +27,11 @@ protocol ContinuedWorkload: AnyObject {
 ///
 /// the api is only for work the user explicitly asked for, which is why the
 /// backup instance covers the back up now button and not the library-change
-/// reruns, and the share instance covers a drop from the share sheet.
+/// reruns. share uploads ride their own background url sessions and need
+/// none of this.
 @Observable
 final class ContinuedProcessing {
     static let backup = ContinuedProcessing(suffix: "backup")
-    static let share = ContinuedProcessing(suffix: "share")
 
     /// set by whoever owns the job; the launch handler needs it to exist by the
     /// time the system calls back.
@@ -52,20 +52,14 @@ final class ContinuedProcessing {
         self.suffix = suffix
     }
 
-    private static func owner(ofSuffix suffix: String) -> ContinuedProcessing {
-        suffix == "share" ? share : backup
-    }
-
     /// called from the app initializer. continued-processing registrations are
     /// exempt from the finish-launching deadline, but there is no reason to wait.
     static func registerAll() {
         backup.register()
-        share.register()
     }
 
     private func register() {
         guard !isRegistered else { return }
-        let suffix = suffix
         isRegistered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: identifier,
             using: .main
@@ -74,7 +68,7 @@ final class ContinuedProcessing {
             // actor is sound and the non-sendable task never crosses isolation.
             MainActor.assumeIsolated {
                 guard let task = task as? BGContinuedProcessingTask else { return }
-                ContinuedProcessing.owner(ofSuffix: suffix).begin(task)
+                ContinuedProcessing.backup.begin(task)
             }
         }
         if !isRegistered {
@@ -101,10 +95,9 @@ final class ContinuedProcessing {
         task.progress.totalUnitCount = 100
         // the cancel button in the system ui lands here, as does the scheduler
         // reclaiming resources under load.
-        let suffix = suffix
         task.expirationHandler = {
             Task { @MainActor in
-                ContinuedProcessing.owner(ofSuffix: suffix).workload?.cancel()
+                ContinuedProcessing.backup.workload?.cancel()
             }
         }
         workload.onContinuedProgress = { [weak self, weak task] in

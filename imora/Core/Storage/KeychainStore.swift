@@ -1,22 +1,34 @@
 import Foundation
 import Security
 
-/// minimal keychain wrapper for the session token.
+/// minimal keychain wrapper for the session token. items are written into the
+/// app group's access group so the share extension can authenticate with the
+/// same session; reads stay group-less, which searches every group this
+/// process can see and also finds tokens written before the group existed.
 enum KeychainStore {
     private static let service = "app.imora.credentials"
 
+    private static var accessGroup: String? {
+        Bundle.main.object(forInfoDictionaryKey: "IMORAAppGroup") as? String
+    }
+
     static func set(_ value: String, for key: String) {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
+        // delete first: an update could match a copy in another group and
+        // leave a stale twin behind for reads to trip on.
+        delete(key)
+        var insert: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            kSecValueData as String: Data(value.utf8),
         ]
-        let attributes: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var insert = query
-            insert[kSecValueData as String] = data
+        if let accessGroup {
+            insert[kSecAttrAccessGroup as String] = accessGroup
+        }
+        let status = SecItemAdd(insert as CFDictionary, nil)
+        // sharing is best effort: on a build whose provisioning rejects the
+        // group, a private token still beats losing the session.
+        if status == errSecMissingEntitlement, insert.removeValue(forKey: kSecAttrAccessGroup as String) != nil {
             SecItemAdd(insert as CFDictionary, nil)
         }
     }

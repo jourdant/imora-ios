@@ -11,9 +11,11 @@ struct ImoraApp: App {
         // is still presented.
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         ContinuedProcessing.registerAll()
-        // builds the background session and attaches its delegate, so uploads
-        // that finished while the app was gone are delivered on this launch.
+        // builds the background sessions and attaches their delegates, so
+        // uploads that finished while the app was gone - backup runs and
+        // share-sheet drops alike - are delivered on this launch.
         BackgroundUploader.shared.attach()
+        ShareUploadCoordinator.shared.attach()
     }
 
     var body: some Scene {
@@ -26,16 +28,24 @@ struct ImoraApp: App {
 
 /// exists for one callback: the system relaunches the app when background
 /// uploads finish and hands over a completion handler that has to be called
-/// once their events are delivered.
+/// once their events are delivered. the identifier routes between the backup
+/// session and the sessions the share extension started.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
         handleEventsForBackgroundURLSession identifier: String,
         completionHandler: @escaping () -> Void
     ) {
-        BackgroundUploader.shared.setBackgroundCompletionHandler(
-            BackgroundUploader.LaunchCompletion(run: completionHandler)
-        )
+        if identifier.hasPrefix(ShareTransfer.sessionPrefix) {
+            ShareUploadCoordinator.shared.handleEvents(
+                identifier: identifier,
+                completion: ShareUploadCoordinator.LaunchCompletion(run: completionHandler)
+            )
+        } else {
+            BackgroundUploader.shared.setBackgroundCompletionHandler(
+                BackgroundUploader.LaunchCompletion(run: completionHandler)
+            )
+        }
     }
 }
 
@@ -64,21 +74,14 @@ struct RootView: View {
                 // what surfaces anything raised in the meantime.
                 Task { await session.notifications?.load() }
                 Task { await LocalNotifications.shared.refreshAuthorization() }
-                // whatever the share extension staged while we were away.
-                adoptSharedItems()
+                // uploads the share extension queued while we were away: drain
+                // what finished, hurry along what the system kept waiting.
+                ShareUploadCoordinator.shared.adoptPending()
             case .background:
                 session.realtime?.setActive(false)
             default:
                 break
             }
         }
-    }
-
-    /// the extension cannot open us - ios forbids it - so the app checks the
-    /// shared inbox itself every time it comes forward.
-    private func adoptSharedItems() {
-        guard let uploads = session.shareUploads else { return }
-        uploads.reload()
-        if uploads.hasWork { NotificationRouter.shared.showsShareUpload = true }
     }
 }

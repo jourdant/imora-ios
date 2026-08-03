@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct MainTabView: View {
-    /// tap targets from notifications land here, so the shell owns both the
-    /// inbox sheet and the tab switch an album deep link needs.
+    /// in-app navigation targets land here, so the shell owns both the inbox
+    /// sheet and the tab switch an album deep link needs.
     @Bindable private var router = NotificationRouter.shared
     @State private var selection: TabKey = .photos
 
@@ -29,18 +29,10 @@ struct MainTabView: View {
         .sheet(isPresented: $router.showsInbox) {
             NotificationsScreen()
         }
-        .sheet(isPresented: $router.showsShareUpload) {
-            ShareUploadScreen()
-        }
         .onChange(of: router.pendingAlbumID) { _, id in
             // the albums tab picks the id up itself; switching to it is what
             // makes the tab exist in the first place.
             if id != nil { selection = .albums }
-        }
-        .onChange(of: router.showsPhotos) { _, wants in
-            guard wants else { return }
-            selection = .photos
-            router.showsPhotos = false
         }
     }
 }

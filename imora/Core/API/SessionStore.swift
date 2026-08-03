@@ -16,7 +16,6 @@ final class SessionStore {
     private(set) var backup: BackupManager?
     private(set) var realtime: RealtimeHub?
     private(set) var notifications: NotificationInbox?
-    private(set) var shareUploads: ShareUploadModel?
     var preferences: UserPreferences?
 
     private static let serverKey = "imora.serverURL"
@@ -48,6 +47,10 @@ final class SessionStore {
             state = .loggedOut
             return
         }
+        // re-setting moves tokens from before keychain sharing into the app
+        // group access group, and the mirror keeps the extension current.
+        KeychainStore.set(token, for: Self.tokenKey)
+        mirrorForShareExtension(apiURL: apiURL)
         let cached = apiURL.host().flatMap { SessionCache.load(host: $0) }
         features = cached?.features
         preferences = cached?.preferences
@@ -57,6 +60,7 @@ final class SessionStore {
     func logIn(apiURL: URL, response: LoginResponse) async {
         UserDefaults.standard.set(apiURL, forKey: Self.serverKey)
         KeychainStore.set(response.accessToken, for: Self.tokenKey)
+        mirrorForShareExtension(apiURL: apiURL)
         SessionCache.noteUserId(response.userId)
         let client = ImmichClient(apiURL: apiURL, accessToken: response.accessToken)
         let user = try? await client.currentUser()
@@ -75,10 +79,9 @@ final class SessionStore {
         backup = nil
         notifications?.clear()
         notifications = nil
-        shareUploads?.cancel()
-        shareUploads = nil
+        ShareTransfer.defaults?.removeObject(forKey: ShareTransfer.serverURLKey)
+        ShareTransfer.defaults?.removeObject(forKey: ShareTransfer.deviceIdKey)
         ContinuedProcessing.backup.workload = nil
-        ContinuedProcessing.share.workload = nil
         client = nil
         user = nil
         features = nil
@@ -107,6 +110,14 @@ final class SessionStore {
         if let features = await featuresTask { self.features = features }
         if let preferences = await preferencesTask { self.preferences = preferences }
         cacheSnapshot()
+    }
+
+    /// the share extension uploads with this session, and the app group is
+    /// all it can read.
+    private func mirrorForShareExtension(apiURL: URL) {
+        let defaults = ShareTransfer.defaults
+        defaults?.set(apiURL.absoluteString, forKey: ShareTransfer.serverURLKey)
+        defaults?.set(DeviceID.current, forKey: ShareTransfer.deviceIdKey)
     }
 
     private func cacheSnapshot() {
@@ -138,7 +149,6 @@ final class SessionStore {
         let inbox = NotificationInbox(client: client)
         hub.addListener(inbox)
         notifications = inbox
-        shareUploads = ShareUploadModel(client: client)
         state = .loggedIn
         Task { await refreshUser() }
         Task { await inbox.load() }

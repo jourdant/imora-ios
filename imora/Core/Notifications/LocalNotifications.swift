@@ -3,9 +3,10 @@ import UIKit
 import UserNotifications
 
 /// the system side of notifications. immich ships no apns transport, so the
-/// only native banners are the ones this device raises about its own backup
-/// runs - server inbox entries stay in the in-app inbox, where a banner would
-/// only duplicate the list under the open app.
+/// only native banners are the ones this device raises about its own work -
+/// backup runs and share-sheet uploads. server inbox entries stay in the
+/// in-app inbox, where a banner would only duplicate the list under the open
+/// app.
 @Observable
 final class LocalNotifications {
     static let shared = LocalNotifications()
@@ -89,6 +90,25 @@ final class LocalNotifications {
     func deliverBackupFailure(_ message: String) {
         guard backupReports else { return }
         deliverBackup(title: "Backup stopped", body: message)
+    }
+
+    /// one summary per share-sheet batch once its background uploads land.
+    /// not gated by a switch: the user just asked for this exact upload.
+    func deliverShareResult(uploaded: Int, failed: Int) {
+        guard uploaded > 0 || failed > 0 else { return }
+        var parts: [String] = []
+        if uploaded > 0 { parts.append("\(uploaded) uploaded") }
+        if failed > 0 { parts.append("\(failed) failed") }
+        let content = UNMutableNotificationContent()
+        content.title = failed > 0 ? "Sharing finished with errors" : "Shared to Imora"
+        content.body = parts.joined(separator: ", ")
+        content.sound = .default
+        content.threadIdentifier = "imora.share"
+        add(UNNotificationRequest(
+            identifier: "imora.share.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        ))
     }
 
     private func deliverBackup(title: String, body: String) {

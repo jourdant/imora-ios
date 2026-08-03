@@ -26,7 +26,6 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).backup</string>
-		<string>$(PRODUCT_BUNDLE_IDENTIFIER).share</string>
 	</array>
 </dict>
 </plist>

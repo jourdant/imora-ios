@@ -1,11 +1,10 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
-import UserNotifications
 
-/// the share sheet entry point. it stages the incoming media in the app group
-/// and stops there: extensions are not allowed to open their containing app, so
-/// a notification is what invites the user over to actually upload.
+/// the share sheet entry point. the media becomes upload tasks on a background
+/// url session right here - the system runs them with everything closed, so
+/// there is no trip through the app and nothing for the user to wait on.
 final class ShareViewController: UIViewController {
     private var providers: [NSItemProvider] = []
 
@@ -21,8 +20,9 @@ final class ShareViewController: UIViewController {
         let host = UIHostingController(
             rootView: ShareSheetView(
                 count: providers.count,
-                send: { [weak self] in self?.stage() },
-                cancel: { [weak self] in self?.finish() }
+                signedIn: ShareUploader.credentials() != nil,
+                send: { [weak self] in await self?.send() ?? false },
+                complete: { [weak self] in self?.finish() }
             )
         )
         addChild(host)
@@ -37,122 +37,130 @@ final class ShareViewController: UIViewController {
         host.didMove(toParent: self)
     }
 
-    private func stage() {
-        Task {
-            guard let directory = ShareInbox.directory else { return finish() }
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            var items: [ShareBatch.Item] = []
-            for provider in providers {
-                if let item = await Self.copy(provider, into: directory) { items.append(item) }
+    /// stages every provider into a request body and hands the batch to the
+    /// system. returns whether anything was enqueued.
+    private func send() async -> Bool {
+        guard let credentials = ShareUploader.credentials() else { return false }
+        var prepared: [ShareUploader.Prepared] = []
+        for provider in providers {
+            if let item = await ShareUploader.prepare(provider, deviceId: credentials.deviceId) {
+                prepared.append(item)
             }
-            guard !items.isEmpty else { return finish() }
-            ShareInbox.write(ShareBatch(id: UUID().uuidString, addedAt: Date(), items: items))
-            await Self.notify(count: items.count)
-            finish()
         }
+        guard !prepared.isEmpty else { return false }
+        ShareUploader.enqueue(prepared, credentials: credentials)
+        return true
     }
 
     private func finish() {
         extensionContext?.completeRequest(returningItems: nil)
     }
-
-    /// the url handed to the completion block is only valid inside it, so the
-    /// copy happens there rather than after the await.
-    private static func copy(_ provider: NSItemProvider, into directory: URL) async -> ShareBatch.Item? {
-        let isVideo = provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
-        let type: UTType = isVideo ? .movie : .image
-        return await withCheckedContinuation { continuation in
-            _ = provider.loadFileRepresentation(for: type, openInPlace: false) { url, _, _ in
-                guard let url else { return continuation.resume(returning: nil) }
-                let fileExtension = url.pathExtension.isEmpty ? (isVideo ? "mov" : "jpg") : url.pathExtension
-                let storedName = "\(UUID().uuidString).\(fileExtension)"
-                do {
-                    try FileManager.default.copyItem(at: url, to: directory.appending(path: storedName))
-                } catch {
-                    return continuation.resume(returning: nil)
-                }
-                continuation.resume(returning: ShareBatch.Item(
-                    id: UUID().uuidString,
-                    storedName: storedName,
-                    filename: url.lastPathComponent,
-                    isVideo: isVideo
-                ))
-            }
-        }
-    }
-
-    private static func notify(count: Int) async {
-        let content = UNMutableNotificationContent()
-        content.title = count == 1 ? "1 item ready for Imora" : "\(count) items ready for Imora"
-        content.body = "Open Imora to upload to your server."
-        content.sound = .default
-        content.threadIdentifier = "imora.share"
-        content.userInfo = ["shareImport": true]
-        try? await UNUserNotificationCenter.current().add(
-            UNNotificationRequest(
-                identifier: "imora.share.\(UUID().uuidString)",
-                content: content,
-                trigger: nil
-            )
-        )
-    }
 }
+
+private let brandTint = Color(red: 171 / 255, green: 115 / 255, blue: 242 / 255)
 
 private struct ShareSheetView: View {
     let count: Int
-    let send: () -> Void
-    let cancel: () -> Void
+    let signedIn: Bool
+    let send: () async -> Bool
+    let complete: () -> Void
 
-    @State private var isSending = false
+    private enum Phase: Equatable {
+        case idle, sending, done, failed
+    }
+
+    @State private var phase = Phase.idle
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 18) {
                 Spacer()
-                Image(systemName: count == 0 ? "photo.badge.exclamationmark" : "icloud.and.arrow.up")
+                Image(systemName: icon)
                     .font(.system(size: 52))
-                    .foregroundStyle(.indigo.gradient)
+                    .foregroundStyle(brandTint.gradient)
                 Text(title)
                     .font(.title3.weight(.semibold))
                     .multilineTextAlignment(.center)
-                Text(count == 0
-                     ? "Nothing here that Imora can upload."
-                     : "They are handed to Imora, which uploads them to your server.")
+                Text(subtitle)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Spacer()
-                if isSending {
-                    ProgressView()
-                        .padding(.bottom, 12)
-                } else if count > 0 {
-                    Button {
-                        isSending = true
-                        send()
-                    } label: {
-                        Text("Add to Imora")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                }
+                footer
             }
             .padding(24)
+            .animation(.smooth(duration: 0.25), value: phase)
             .navigationTitle("Imora")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel", action: cancel)
+                    Button("Cancel", action: complete)
+                        .disabled(phase == .sending)
                 }
             }
         }
     }
 
-    private var title: String {
-        switch count {
-        case 0: "Nothing to add"
-        case 1: "Add 1 item"
-        default: "Add \(count) items"
+    @ViewBuilder private var footer: some View {
+        switch phase {
+        case .idle where count > 0 && signedIn:
+            Button {
+                phase = .sending
+                Task {
+                    phase = await send() ? .done : .failed
+                    if phase == .done {
+                        // a beat to read the confirmation, then out of the way.
+                        try? await Task.sleep(for: .milliseconds(900))
+                        complete()
+                    }
+                }
+            } label: {
+                Text("Add to Imora")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(brandTint)
+            .controlSize(.large)
+        case .sending:
+            ProgressView()
+                .padding(.bottom, 12)
+        default:
+            EmptyView()
         }
+    }
+
+    private var icon: String {
+        switch phase {
+        case .done: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.triangle"
+        default: break
+        }
+        if count == 0 { return "photo.badge.exclamationmark" }
+        if !signedIn { return "person.crop.circle.badge.questionmark" }
+        return "icloud.and.arrow.up"
+    }
+
+    private var title: String {
+        switch phase {
+        case .done: return "On their way"
+        case .failed: return "Could not read the files"
+        case .sending: return "Handing over"
+        case .idle: break
+        }
+        if count == 0 { return "Nothing to add" }
+        if !signedIn { return "Sign in first" }
+        return count == 1 ? "Add 1 item" : "Add \(count) items"
+    }
+
+    private var subtitle: String {
+        switch phase {
+        case .done: return "They upload in the background. Imora notifies you once they are on your server."
+        case .failed: return "Nothing was uploaded. Try sharing them again."
+        case .sending: return "Preparing the uploads."
+        case .idle: break
+        }
+        if count == 0 { return "Nothing here that Imora can upload." }
+        if !signedIn { return "Open Imora and connect to your server, then share again." }
+        return "They upload straight to your server - no need to open Imora."
     }
 }

@@ -9,10 +9,6 @@ final class NotificationRouter {
 
     var pendingAlbumID: String?
     var showsInbox = false
-    /// raised when the share extension left something in the app group.
-    var showsShareUpload = false
-    /// set by the share screen's view photos button.
-    var showsPhotos = false
 
     private init() {}
 
