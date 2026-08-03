@@ -1,5 +1,8 @@
 import SwiftUI
 
+/// interactive tint for the auth screen, the deepest hue of the app mark.
+private let brandTint = Color(.brandTint)
+
 struct LoginFlowView: View {
     @Environment(SessionStore.self) private var session
 
@@ -17,36 +20,18 @@ struct LoginFlowView: View {
     @State private var features: ServerFeatures?
     @State private var config: ServerConfig?
     @State private var oauthAutoLaunched = false
-    @Namespace private var glass
+    @FocusState private var focus: AuthFocus?
 
     var body: some View {
-        ZStack {
-            AuroraBackground()
+        // the reader is only there to keep the card centred while it still
+        // fits, and let it scroll once the keyboard eats the height.
+        GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 0) {
+                    header
+                        .padding(.bottom, 40)
 
-            VStack(spacing: 0) {
-                Spacer()
-
-                VStack(spacing: 12) {
-                    Image(systemName: "photo.stack.fill")
-                        .font(.system(size: 44, weight: .medium))
-                        .foregroundStyle(.white)
-                        .frame(width: 92, height: 92)
-                        .glassEffect(.regular.tint(.indigo.opacity(0.4)), in: .rect(cornerRadius: 24))
-
-                    Text("Imora")
-                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
-                        .foregroundStyle(.white)
-
-                    Text(subtitle)
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.75))
-                        .multilineTextAlignment(.center)
-                        .contentTransition(.opacity)
-                }
-                .padding(.bottom, 36)
-
-                GlassEffectContainer(spacing: 20) {
-                    VStack(spacing: 16) {
+                    VStack(spacing: 14) {
                         switch step {
                         case .server:
                             serverForm
@@ -54,27 +39,43 @@ struct LoginFlowView: View {
                             credentialsForm
                         }
                     }
+                    .animation(.smooth(duration: 0.3), value: step)
+
+                    if let errorMessage {
+                        errorBanner(errorMessage)
+                            .padding(.top, 20)
+                            .transition(.opacity)
+                    }
                 }
+                .animation(.smooth, value: errorMessage)
                 .padding(.horizontal, 28)
-                .animation(.smooth(duration: 0.35), value: step)
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .glassEffect(.regular.tint(.red.opacity(0.55)), in: .capsule)
-                        .padding(.top, 20)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-
-                Spacer()
-                Spacer()
+                .padding(.vertical, 40)
+                .frame(maxWidth: 460)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
             }
-            .animation(.smooth, value: errorMessage)
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollDismissesKeyboard(.interactively)
         }
+        .background(Color(.systemBackground))
         .task { await debugAutoLogin() }
+    }
+
+    private var header: some View {
+        VStack(spacing: 14) {
+            Image(.appMark)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 84, height: 84)
+
+            Text("Imora")
+                .font(.system(.largeTitle, design: .rounded).weight(.bold))
+
+            Text(subtitle)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .contentTransition(.opacity)
+        }
     }
 
     /// lets ui tests and simulator runs log in from environment variables.
@@ -103,21 +104,27 @@ struct LoginFlowView: View {
     // MARK: - step 1, server url
 
     @ViewBuilder private var serverForm: some View {
-        GlassField(systemImage: "server.rack", isSecure: false, placeholder: "server.example.com", text: $serverInput)
-            .keyboardType(.URL)
-            .textContentType(.URL)
-            .glassEffectID("field-1", in: glass)
-            .onSubmit { Task { await resolveServer() } }
+        AuthField(
+            systemImage: "server.rack",
+            placeholder: "server.example.com",
+            text: $serverInput,
+            focus: $focus,
+            field: .server
+        )
+        .keyboardType(.URL)
+        .textContentType(.URL)
+        .textInputAutocapitalization(.never)
+        .submitLabel(.continue)
+        .onSubmit { Task { await resolveServer() } }
 
         Button {
             Task { await resolveServer() }
         } label: {
             busyLabel("Continue")
         }
-        .buttonStyle(.glassProminent)
-        .tint(.indigo)
+        .buttonStyle(.borderedProminent)
+        .tint(brandTint)
         .disabled(serverInput.trimmingCharacters(in: .whitespaces).isEmpty || isBusy)
-        .glassEffectID("cta", in: glass)
     }
 
     // MARK: - step 2, credentials
@@ -127,46 +134,55 @@ struct LoginFlowView: View {
 
     @ViewBuilder private var credentialsForm: some View {
         if passwordLoginAvailable {
-            GlassField(systemImage: "envelope", isSecure: false, placeholder: "Email", text: $email)
-                .keyboardType(.emailAddress)
-                .textContentType(.username)
-                .textInputAutocapitalization(.never)
-                .glassEffectID("field-1", in: glass)
+            AuthField(
+                systemImage: "envelope",
+                placeholder: "Email",
+                text: $email,
+                focus: $focus,
+                field: .email
+            )
+            .keyboardType(.emailAddress)
+            .textContentType(.username)
+            .textInputAutocapitalization(.never)
+            .submitLabel(.next)
+            .onSubmit { focus = .password }
 
-            GlassField(systemImage: "lock", isSecure: true, placeholder: "Password", text: $password)
-                .textContentType(.password)
-                .onSubmit { Task { await logIn() } }
-                .glassEffectID("field-2", in: glass)
+            AuthField(
+                systemImage: "lock",
+                isSecure: true,
+                placeholder: "Password",
+                text: $password,
+                focus: $focus,
+                field: .password
+            )
+            .textContentType(.password)
+            .submitLabel(.go)
+            .onSubmit { Task { await logIn() } }
 
             Button {
                 Task { await logIn() }
             } label: {
                 busyLabel("Sign In")
             }
-            .buttonStyle(.glassProminent)
-            .tint(.indigo)
+            .buttonStyle(.borderedProminent)
+            .tint(brandTint)
             .disabled(email.isEmpty || password.isEmpty || isBusy)
-            .glassEffectID("cta", in: glass)
         }
 
         if oauthAvailable {
             if passwordLoginAvailable {
-                Text("or")
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.6))
-            }
+                separator
+                    .padding(.vertical, 2)
 
-            if passwordLoginAvailable {
-                oauthButtonLabel
-                    .buttonStyle(.glass)
+                oauthButton(prominent: false)
+                    .buttonStyle(.bordered)
+                    .tint(brandTint)
                     .disabled(isBusy)
-                    .glassEffectID("oauth", in: glass)
             } else {
-                oauthButtonLabel
-                    .buttonStyle(.glassProminent)
-                    .tint(.indigo)
+                oauthButton(prominent: true)
+                    .buttonStyle(.borderedProminent)
+                    .tint(brandTint)
                     .disabled(isBusy)
-                    .glassEffectID("cta", in: glass)
             }
         }
 
@@ -179,40 +195,58 @@ struct LoginFlowView: View {
         } label: {
             Label("Different server", systemImage: "chevron.backward")
                 .font(.subheadline.weight(.medium))
-                .foregroundStyle(.white.opacity(0.85))
-                .padding(.vertical, 6)
         }
         .buttonStyle(.plain)
+        .foregroundStyle(brandTint)
+        .padding(.top, 6)
     }
 
-    private var oauthButtonLabel: some View {
+    private var separator: some View {
+        HStack(spacing: 12) {
+            Rectangle()
+                .fill(.separator)
+                .frame(height: 1)
+            Text("or")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Rectangle()
+                .fill(.separator)
+                .frame(height: 1)
+        }
+    }
+
+    private func oauthButton(prominent: Bool) -> some View {
         Button {
             Task { await startOAuth() }
         } label: {
-            HStack(spacing: 8) {
-                if isBusy && !passwordLoginAvailable {
-                    ProgressView().tint(.white)
-                } else {
-                    Image(systemName: "person.badge.key.fill")
-                }
-                Text(config?.oauthButtonText?.isEmpty == false ? config!.oauthButtonText! : "Continue with OAuth")
-                    .font(.headline)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
+            busyLabel(
+                config?.oauthButtonText?.isEmpty == false ? config!.oauthButtonText! : "Continue with OAuth",
+                systemImage: "person.badge.key.fill",
+                showsProgress: isBusy && !passwordLoginAvailable,
+                prominent: prominent
+            )
         }
     }
 
-    private func busyLabel(_ title: String) -> some View {
+    private func busyLabel(
+        _ title: String,
+        systemImage: String? = nil,
+        showsProgress: Bool? = nil,
+        prominent: Bool = true
+    ) -> some View {
         HStack(spacing: 8) {
-            if isBusy {
-                ProgressView().tint(.white)
+            if showsProgress ?? isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(prominent ? .white : brandTint)
+            } else if let systemImage {
+                Image(systemName: systemImage)
             }
             Text(title)
                 .font(.headline)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
     }
 
     // MARK: - actions
@@ -274,20 +308,42 @@ struct LoginFlowView: View {
             errorMessage = error.localizedDescription
         }
     }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+            Text(message)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.footnote.weight(.medium))
+        .foregroundStyle(.red)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.red.opacity(0.12), in: .rect(cornerRadius: 14, style: .continuous))
+    }
 }
 
 // MARK: - building blocks
 
-private struct GlassField: View {
+private enum AuthFocus {
+    case server, email, password
+}
+
+private struct AuthField: View {
     let systemImage: String
-    let isSecure: Bool
+    var isSecure = false
     let placeholder: String
     @Binding var text: String
+    @FocusState.Binding var focus: AuthFocus?
+    let field: AuthFocus
+
+    private var shape: RoundedRectangle { .rect(cornerRadius: 14, style: .continuous) }
+    private var isFocused: Bool { focus == field }
 
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: systemImage)
-                .foregroundStyle(.white.opacity(0.7))
+                .foregroundStyle(isFocused ? brandTint : Color.secondary)
                 .frame(width: 22)
             Group {
                 if isSecure {
@@ -297,39 +353,13 @@ private struct GlassField: View {
                         .autocorrectionDisabled()
                 }
             }
-            .foregroundStyle(.white)
-            .tint(.white)
+            .focused($focus, equals: field)
         }
-        .padding(.horizontal, 18)
-        .frame(height: 54)
-        .glassEffect(.regular.tint(.white.opacity(0.08)), in: .capsule)
-    }
-}
-
-/// slowly drifting mesh gradient behind the login card.
-struct AuroraBackground: View {
-    @State private var animate = false
-
-    var body: some View {
-        MeshGradient(
-            width: 3,
-            height: 3,
-            points: [
-                [0, 0], [0.5, 0], [1, 0],
-                [0, 0.5], animate ? [0.65, 0.45] : [0.35, 0.55], [1, 0.5],
-                [0, 1], [0.5, 1], [1, 1],
-            ],
-            colors: [
-                .black, .indigo.opacity(0.85), .black,
-                .purple.opacity(0.7), .indigo, .blue.opacity(0.75),
-                .black, .purple.opacity(0.8), .black,
-            ]
-        )
-        .ignoresSafeArea()
-        .onAppear {
-            withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) {
-                animate = true
-            }
-        }
+        .tint(brandTint)
+        .padding(.horizontal, 16)
+        .frame(height: 52)
+        .background(Color(.secondarySystemBackground), in: shape)
+        .overlay(shape.strokeBorder(brandTint.opacity(isFocused ? 1 : 0), lineWidth: 1.5))
+        .animation(.smooth(duration: 0.2), value: isFocused)
     }
 }

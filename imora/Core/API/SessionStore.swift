@@ -77,7 +77,6 @@ final class SessionStore {
         notifications = nil
         shareUploads?.cancel()
         shareUploads = nil
-        NotificationRouter.shared.inbox = nil
         ContinuedProcessing.backup.workload = nil
         ContinuedProcessing.share.workload = nil
         client = nil
@@ -138,7 +137,6 @@ final class SessionStore {
         realtime = hub
         let inbox = NotificationInbox(client: client)
         hub.addListener(inbox)
-        NotificationRouter.shared.inbox = inbox
         notifications = inbox
         shareUploads = ShareUploadModel(client: client)
         state = .loggedIn

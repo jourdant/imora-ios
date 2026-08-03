@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// two independent delivery paths: banners on this device, and the account-wide
-/// email switches the server owns.
+/// two independent delivery paths: the device-side backup banners and badge,
+/// and the account-wide email switches the server owns. server inbox entries
+/// never become banners, so they need no switches here.
 struct NotificationSettingsScreen: View {
     @Environment(SessionStore.self) private var session
     @Bindable private var local = LocalNotifications.shared
@@ -40,7 +41,7 @@ struct NotificationSettingsScreen: View {
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Notifications Are Off", systemImage: "bell.slash")
-                    Text("Imora cannot alert you about album invites, album activity or backup results until you allow notifications.")
+                    Text("Imora cannot report backup results or badge the app icon with unread notifications until you allow notifications.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     // a denied permission can only be undone in the system
@@ -66,22 +67,13 @@ struct NotificationSettingsScreen: View {
 
     private var alertsSection: some View {
         Section {
-            Toggle(isOn: $local.albumInvites) {
-                Label("Album Invites", systemImage: "rectangle.stack.badge.person.crop")
-            }
-            Toggle(isOn: $local.albumUpdates) {
-                Label("Album Activity", systemImage: "photo.badge.plus")
-            }
-            Toggle(isOn: $local.serverAlerts) {
-                Label("Server Alerts", systemImage: "exclamationmark.triangle")
-            }
             Toggle(isOn: $local.backupReports) {
                 Label("Backup Results", systemImage: "arrow.triangle.2.circlepath.icloud")
             }
         } header: {
             Text("Alerts")
         } footer: {
-            Text("Immich has no push channel, so alerts arrive while Imora is running and anything missed is caught up the next time you open the app.")
+            Text("Backup results are the only banners Imora raises. Album invites and server messages stay in the in-app notification inbox.")
         }
         .disabled(!local.isAuthorized)
     }

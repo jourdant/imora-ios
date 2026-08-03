@@ -7,10 +7,9 @@ struct ImoraApp: App {
     @State private var session = SessionStore()
 
     init() {
-        // set before any scene exists so a launch from a notification tap is
-        // still routed instead of dropped.
+        // set before any scene exists so a backup report landing mid-launch
+        // is still presented.
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
-        LocalNotifications.shared.registerCategories()
         ContinuedProcessing.registerAll()
         // builds the background session and attaches its delegate, so uploads
         // that finished while the app was gone are delivered on this launch.
