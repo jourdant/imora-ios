@@ -1,53 +1,18 @@
+import BackgroundTasks
 import CryptoKit
 import Foundation
-import Security
 import UniformTypeIdentifiers
 
-/// turns the shared media into upload tasks on a background url session and
-/// returns. the system owns the transfers from there: they run with the sheet
-/// dismissed and the app closed, and the app adopts the session on its next
-/// launch to clean up and report.
+/// Turns shared media into uploads. When the system grants continued
+/// processing, the extension that submitted the request also owns the session
+/// and reports its bytes. If the request is declined, the original daemon-owned
+/// background-session path remains the fallback.
 nonisolated enum ShareUploader {
-    struct Credentials: Sendable {
-        let apiURL: URL
-        let token: String
-        let deviceId: String
-    }
-
     struct Prepared: Sendable {
         let bodyURL: URL
         let filename: String
         let checksum: String
         let boundary: String
-    }
-
-    /// nil until the app has signed in and mirrored the session into the app
-    /// group; the sheet turns that into a sign-in prompt.
-    static func credentials() -> Credentials? {
-        guard let defaults = ShareTransfer.defaults,
-              let urlString = defaults.string(forKey: ShareTransfer.serverURLKey),
-              let apiURL = URL(string: urlString),
-              let token = readToken()
-        else { return nil }
-        let deviceId = defaults.string(forKey: ShareTransfer.deviceIdKey) ?? "imora-share"
-        return Credentials(apiURL: apiURL, token: token, deviceId: deviceId)
-    }
-
-    /// the app writes the token into the app group access group; a group-less
-    /// query searches every group this process can see and finds it there.
-    private static func readToken() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: ShareTransfer.tokenService,
-            kSecAttrAccount as String: ShareTransfer.tokenAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
-        else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 
     // MARK: - staging
@@ -107,37 +72,58 @@ nonisolated enum ShareUploader {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = Insecure.SHA1()
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        // each bridged chunk comes back autoreleased - drained per iteration,
+        // or hashing accumulates the whole file and a large video kills the
+        // extension at its memory cap before anything is enqueued.
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
             hasher.update(data: chunk)
-        }
+            return true
+        }) {}
         return Data(hasher.finalize()).base64EncodedString()
     }
 
-    // MARK: - enqueue
+    // MARK: - handoff
 
-    /// one background session per drop, so its identifier can be handed to the
-    /// app through a marker file and adopted independently of other batches.
-    static func enqueue(_ items: [Prepared], credentials: Credentials) {
-        guard !items.isEmpty else { return }
-        let identifier = ShareTransfer.sessionPrefix + UUID().uuidString
-        let config = URLSessionConfiguration.background(withIdentifier: identifier)
-        config.sharedContainerIdentifier = ShareTransfer.appGroup
-        config.sessionSendsLaunchEvents = true
-        let session = URLSession(configuration: config)
-
-        ShareTransfer.markSession(identifier)
-        for item in items {
-            var request = URLRequest(url: credentials.apiURL.appending(path: "assets"))
-            request.httpMethod = "POST"
-            request.setValue(MultipartBody.contentType(boundary: item.boundary), forHTTPHeaderField: "Content-Type")
-            request.setValue(item.checksum, forHTTPHeaderField: "x-immich-checksum")
-            request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-            let task = session.uploadTask(with: request, fromFile: item.bodyURL)
-            task.taskDescription = ShareTransfer.encode(
-                ShareTicket(bodyPath: item.bodyURL.path, filename: item.filename)
+    /// Stages the workload before submission so the extension launch handler
+    /// can see it immediately. The handler may run before the async submission
+    /// call returns.
+    @concurrent
+    static func handOff(_ items: [Prepared], credentials: ShareTransfer.Credentials) async -> Bool {
+        guard !items.isEmpty else { return false }
+        let batch = ShareUploadActivity.Batch(items: items, credentials: credentials)
+        switch ShareUploadActivity.shared.stage(batch) {
+        case .joinedExistingRequest:
+            return true
+        case .progressUnavailable:
+            return false
+        case .submitRequest(let identifier):
+            let accepted = await requestProgress(identifier: identifier, count: items.count)
+            return await ShareUploadActivity.shared.waitForActivity(
+                identifier: identifier,
+                accepted: accepted
             )
-            task.resume()
+        }
+    }
+
+    /// Asks for the Live Activity that represents the extension-owned upload.
+    /// Failing fast preserves the reliable URLSession-only fallback.
+    private static func requestProgress(identifier: String, count: Int) async -> Bool {
+        let request = BGContinuedProcessingTaskRequest(
+            identifier: identifier,
+            title: "Uploading to Imora",
+            subtitle: count == 1 ? "1 item" : "\(count) items"
+        )
+        request.strategy = .fail
+        do {
+            if #available(iOS 27.0, *) {
+                try await BGTaskScheduler.shared.submitTaskRequest(request)
+            } else {
+                try BGTaskScheduler.shared.submit(request)
+            }
+            return true
+        } catch {
+            return false
         }
     }
 }

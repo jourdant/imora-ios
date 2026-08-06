@@ -42,9 +42,14 @@ nonisolated enum MultipartBody {
 
         let reader = try FileHandle(forReadingFrom: source)
         defer { try? reader.close() }
-        while let chunk = try reader.read(upToCount: chunkSize), !chunk.isEmpty {
+        // chunks come back autoreleased - drain per iteration so peak memory
+        // stays one chunk instead of the whole file. share extensions die
+        // around 120mb otherwise.
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try reader.read(upToCount: chunkSize), !chunk.isEmpty else { return false }
             try handle.write(contentsOf: chunk)
-        }
+            return true
+        }) {}
 
         try handle.write(contentsOf: Data("\r\n--\(boundary)--\r\n".utf8))
         return bodyURL

@@ -193,10 +193,14 @@ nonisolated enum PhotoLibraryService {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = Insecure.SHA1()
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        // drained per chunk - the autoreleased nsdata otherwise pile up to
+        // the size of the file being hashed.
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
             hasher.update(data: chunk)
             try Task.checkCancellation()
-        }
+            return true
+        }) {}
         return Data(hasher.finalize()).base64EncodedString()
     }
 
