@@ -74,9 +74,6 @@ struct RootView: View {
                 // what surfaces anything raised in the meantime.
                 Task { await session.notifications?.load() }
                 Task { await LocalNotifications.shared.refreshAuthorization() }
-                // uploads the share extension queued while we were away: drain
-                // what finished, hurry along what the system kept waiting.
-                ShareUploadCoordinator.shared.adoptPending()
             case .background:
                 session.realtime?.setActive(false)
             default:

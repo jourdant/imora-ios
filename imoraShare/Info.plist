@@ -6,6 +6,12 @@
 	<string>Imora</string>
 	<key>IMORAAppGroup</key>
 	<string>$(IMORA_APP_GROUP)</string>
+	<key>IMORAShareTaskID</key>
+	<string>$(IMORA_SHARE_TASK_ID)</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>$(IMORA_SHARE_TASK_ID)</string>
+	</array>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>

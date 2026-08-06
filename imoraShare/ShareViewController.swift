@@ -2,6 +2,14 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+/// what came out of handing a drop over to the system.
+private enum SendOutcome {
+    case failed
+    /// uploads are enqueued; `progressVisible` says whether the system took
+    /// the continued-processing task that shows their progress.
+    case queued(progressVisible: Bool)
+}
+
 /// the share sheet entry point. the media becomes upload tasks on a background
 /// url session right here - the system runs them with everything closed, so
 /// there is no trip through the app and nothing for the user to wait on.
@@ -20,8 +28,8 @@ final class ShareViewController: UIViewController {
         let host = UIHostingController(
             rootView: ShareSheetView(
                 count: providers.count,
-                signedIn: ShareUploader.credentials() != nil,
-                send: { [weak self] in await self?.send() ?? false },
+                signedIn: ShareTransfer.credentials() != nil,
+                send: { [weak self] in await self?.send() ?? .failed },
                 complete: { [weak self] in self?.finish() }
             )
         )
@@ -37,19 +45,19 @@ final class ShareViewController: UIViewController {
         host.didMove(toParent: self)
     }
 
-    /// stages every provider into a request body and hands the batch to the
-    /// system. returns whether anything was enqueued.
-    private func send() async -> Bool {
-        guard let credentials = ShareUploader.credentials() else { return false }
+    /// Stages every provider into a request body and hands the batch to the
+    /// extension-owned progress task, with a daemon session as fallback.
+    private func send() async -> SendOutcome {
+        guard let credentials = ShareTransfer.credentials() else { return .failed }
         var prepared: [ShareUploader.Prepared] = []
         for provider in providers {
             if let item = await ShareUploader.prepare(provider, deviceId: credentials.deviceId) {
                 prepared.append(item)
             }
         }
-        guard !prepared.isEmpty else { return false }
-        ShareUploader.enqueue(prepared, credentials: credentials)
-        return true
+        guard !prepared.isEmpty else { return .failed }
+        let progressVisible = await ShareUploader.handOff(prepared, credentials: credentials)
+        return .queued(progressVisible: progressVisible)
     }
 
     private func finish() {
@@ -62,11 +70,11 @@ private let brandTint = Color(red: 171 / 255, green: 115 / 255, blue: 242 / 255)
 private struct ShareSheetView: View {
     let count: Int
     let signedIn: Bool
-    let send: () async -> Bool
+    let send: () async -> SendOutcome
     let complete: () -> Void
 
     private enum Phase: Equatable {
-        case idle, sending, done, failed
+        case idle, sending, done(progressVisible: Bool), failed
     }
 
     @State private var phase = Phase.idle
@@ -101,31 +109,46 @@ private struct ShareSheetView: View {
         }
     }
 
+    /// a fixed-height slot so no phase change reflows the texts above. while
+    /// staging, the button stays in place and only its label becomes a
+    /// spinner - swapping whole views here is what used to make the sheet
+    /// flicker mid-dismissal.
     @ViewBuilder private var footer: some View {
-        switch phase {
-        case .idle where count > 0 && signedIn:
-            Button {
-                phase = .sending
-                Task {
-                    phase = await send() ? .done : .failed
-                    if phase == .done {
-                        // a beat to read the confirmation, then out of the way.
-                        try? await Task.sleep(for: .milliseconds(900))
-                        complete()
+        ZStack {
+            switch phase {
+            case .idle where count > 0 && signedIn, .sending:
+                Button(action: start) {
+                    ZStack {
+                        // invisible text keeps the button footprint stable.
+                        Text("Add to Imora").opacity(phase == .sending ? 0 : 1)
+                        if phase == .sending { ProgressView() }
                     }
-                }
-            } label: {
-                Text("Add to Imora")
                     .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(brandTint)
+                .controlSize(.large)
+                .disabled(phase == .sending)
+            default:
+                Color.clear
             }
-            .buttonStyle(.borderedProminent)
-            .tint(brandTint)
-            .controlSize(.large)
-        case .sending:
-            ProgressView()
-                .padding(.bottom, 12)
-        default:
-            EmptyView()
+        }
+        .frame(height: 52)
+    }
+
+    private func start() {
+        guard phase == .idle else { return }
+        phase = .sending
+        Task {
+            switch await send() {
+            case .failed:
+                phase = .failed
+            case .queued(let progressVisible):
+                phase = .done(progressVisible: progressVisible)
+                // a beat to read the confirmation, then out of the way.
+                try? await Task.sleep(for: .milliseconds(900))
+                complete()
+            }
         }
     }
 
@@ -133,7 +156,8 @@ private struct ShareSheetView: View {
         switch phase {
         case .done: return "checkmark.circle.fill"
         case .failed: return "exclamationmark.triangle"
-        default: break
+        // staging keeps the idle look; the button spinner tells the story.
+        case .idle, .sending: break
         }
         if count == 0 { return "photo.badge.exclamationmark" }
         if !signedIn { return "person.crop.circle.badge.questionmark" }
@@ -144,8 +168,7 @@ private struct ShareSheetView: View {
         switch phase {
         case .done: return "On their way"
         case .failed: return "Could not read the files"
-        case .sending: return "Handing over"
-        case .idle: break
+        case .idle, .sending: break
         }
         if count == 0 { return "Nothing to add" }
         if !signedIn { return "Sign in first" }
@@ -154,10 +177,12 @@ private struct ShareSheetView: View {
 
     private var subtitle: String {
         switch phase {
-        case .done: return "They upload in the background. Imora notifies you once they are on your server."
+        case .done(let progressVisible):
+            return progressVisible
+                ? "They upload in the background - follow the progress from your Lock Screen or Dynamic Island."
+                : "They upload in the background. Imora notifies you once they are on your server."
         case .failed: return "Nothing was uploaded. Try sharing them again."
-        case .sending: return "Preparing the uploads."
-        case .idle: break
+        case .idle, .sending: break
         }
         if count == 0 { return "Nothing here that Imora can upload." }
         if !signedIn { return "Open Imora and connect to your server, then share again." }

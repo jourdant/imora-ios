@@ -10,8 +10,7 @@ protocol ContinuedWorkload: AnyObject {
     var isRunning: Bool { get }
     var continuedTitle: String { get }
     var continuedSubtitle: String { get }
-    /// 0...1 across the whole job.
-    var continuedFraction: Double { get }
+    var continuedProgress: ContinuedProgress { get }
     var continuedSucceeded: Bool { get }
     var onContinuedProgress: (() -> Void)? { get set }
 
@@ -31,25 +30,23 @@ protocol ContinuedWorkload: AnyObject {
 /// none of this.
 @Observable
 final class ContinuedProcessing {
-    static let backup = ContinuedProcessing(suffix: "backup")
+    static let backup = ContinuedProcessing(
+        identifier: "\(Bundle.main.bundleIdentifier ?? "app.imora").backup"
+    )
 
     /// set by whoever owns the job; the launch handler needs it to exist by the
     /// time the system calls back.
     @ObservationIgnored weak var workload: (any ContinuedWorkload)?
 
-    private let suffix: String
-    private var isRegistered = false
-    private var lastSubtitle = ""
-
     /// one fixed identifier per job kind, registered once. apple blocks wildcard
     /// handlers - the registered and submitted strings have to match - and only
     /// one job of each kind runs at a time, so a single id covers it.
-    private var identifier: String {
-        "\(Bundle.main.bundleIdentifier ?? "app.imora").\(suffix)"
-    }
+    private let identifier: String
+    private var isRegistered = false
+    private var lastSubtitle = ""
 
-    private init(suffix: String) {
-        self.suffix = suffix
+    private init(identifier: String) {
+        self.identifier = identifier
     }
 
     /// called from the app initializer. continued-processing registrations are
@@ -63,12 +60,12 @@ final class ContinuedProcessing {
         isRegistered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: identifier,
             using: .main
-        ) { task in
+        ) { [self] task in
             // the queue above pins this to the main thread, so adopting the main
             // actor is sound and the non-sendable task never crosses isolation.
             MainActor.assumeIsolated {
                 guard let task = task as? BGContinuedProcessingTask else { return }
-                ContinuedProcessing.backup.begin(task)
+                self.begin(task)
             }
         }
         if !isRegistered {
@@ -92,12 +89,13 @@ final class ContinuedProcessing {
         }
         backupLog.info("continued processing task started")
         lastSubtitle = ""
-        task.progress.totalUnitCount = 100
+        task.progress.totalUnitCount = 1
+        task.progress.completedUnitCount = 0
         // the cancel button in the system ui lands here, as does the scheduler
         // reclaiming resources under load.
-        task.expirationHandler = {
+        task.expirationHandler = { [weak self] in
             Task { @MainActor in
-                ContinuedProcessing.backup.workload?.cancel()
+                self?.workload?.cancel()
             }
         }
         workload.onContinuedProgress = { [weak self, weak task] in
@@ -115,7 +113,9 @@ final class ContinuedProcessing {
 
     private func report(to task: BGContinuedProcessingTask) {
         guard let workload else { return }
-        task.progress.completedUnitCount = Int64((workload.continuedFraction * 100).rounded())
+        let progress = workload.continuedProgress
+        task.progress.totalUnitCount = progress.totalUnitCount
+        task.progress.completedUnitCount = progress.completedUnitCount
         let subtitle = workload.continuedSubtitle
         // byte progress ticks far more often than the wording changes.
         guard subtitle != lastSubtitle else { return }

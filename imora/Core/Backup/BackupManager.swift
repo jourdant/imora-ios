@@ -863,7 +863,9 @@ extension BackupManager: ContinuedWorkload {
         }
     }
 
-    var continuedFraction: Double { progressFraction }
+    var continuedProgress: ContinuedProgress {
+        ContinuedProgress(fraction: progressFraction)
+    }
 
     var continuedSucceeded: Bool {
         if case .done = phase { return true }

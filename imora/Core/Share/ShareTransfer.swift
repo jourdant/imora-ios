@@ -1,8 +1,7 @@
 import Foundation
 
-// NOTE: this file is duplicated verbatim in imoraShare/ShareTransfer.swift.
-// the share extension and the app are separate modules with no shared target,
-// and this is the contract between them - change both or neither.
+// The ticket, session markers, and credential keys below form the on-disk
+// contract with imoraShare/ShareTransfer.swift.
 
 /// everything the app needs to finish an upload the share extension started.
 /// carried in the task description, so it survives both processes dying.
@@ -59,12 +58,6 @@ nonisolated enum ShareTransfer {
     static func unmarkSession(_ identifier: String) {
         guard let sessionDirectory else { return }
         try? FileManager.default.removeItem(at: sessionDirectory.appending(path: identifier))
-    }
-
-    static func markedSessions() -> [String] {
-        guard let sessionDirectory else { return [] }
-        let contents = (try? FileManager.default.contentsOfDirectory(atPath: sessionDirectory.path)) ?? []
-        return contents.filter { $0.hasPrefix(sessionPrefix) }
     }
 
     static func encode(_ ticket: ShareTicket) -> String? {

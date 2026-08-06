@@ -1,8 +1,8 @@
 import Foundation
+import Security
 
-// NOTE: this file is duplicated verbatim in imora/Core/Share/ShareTransfer.swift.
-// the share extension and the app are separate modules with no shared target,
-// and this is the contract between them - change both or neither.
+// The ticket, session markers, and credential keys below form the on-disk
+// contract with imora/Core/Share/ShareTransfer.swift.
 
 /// everything the app needs to finish an upload the share extension started.
 /// carried in the task description, so it survives both processes dying.
@@ -37,6 +37,55 @@ nonisolated enum ShareTransfer {
 
     static let sessionPrefix = "app.imora.share."
 
+    /// The continued-processing task is registered and submitted by this
+    /// extension because iOS delivers it back to the submitting process.
+    static var uploadTaskIdentifierPattern: String? {
+        Bundle.main.object(forInfoDictionaryKey: "IMORAShareTaskID") as? String
+    }
+
+    static func makeUploadTaskIdentifier() -> String? {
+        guard let pattern = uploadTaskIdentifierPattern else { return nil }
+        let prefix = pattern.hasSuffix(".*") ? String(pattern.dropLast(2)) : pattern
+        return prefix + "." + UUID().uuidString
+    }
+
+    // MARK: - credentials
+
+    struct Credentials: Sendable {
+        let apiURL: URL
+        let token: String
+        let deviceId: String
+    }
+
+    /// Nil until the app has signed in and mirrored the session into the app
+    /// group so the extension can upload directly.
+    static func credentials() -> Credentials? {
+        guard let defaults,
+              let urlString = defaults.string(forKey: serverURLKey),
+              let apiURL = URL(string: urlString),
+              let token = readToken()
+        else { return nil }
+        let deviceId = defaults.string(forKey: deviceIdKey) ?? "imora-share"
+        return Credentials(apiURL: apiURL, token: token, deviceId: deviceId)
+    }
+
+    /// the app writes the token into the app group access group; a group-less
+    /// query searches every group this process can see and finds it there.
+    private static func readToken() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: tokenService,
+            kSecAttrAccount as String: tokenAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// app-to-extension mirror of the signed-in session. the token itself is
     /// in the keychain, written into the app group access group under the
     /// service and account below.
@@ -59,12 +108,6 @@ nonisolated enum ShareTransfer {
     static func unmarkSession(_ identifier: String) {
         guard let sessionDirectory else { return }
         try? FileManager.default.removeItem(at: sessionDirectory.appending(path: identifier))
-    }
-
-    static func markedSessions() -> [String] {
-        guard let sessionDirectory else { return [] }
-        let contents = (try? FileManager.default.contentsOfDirectory(atPath: sessionDirectory.path)) ?? []
-        return contents.filter { $0.hasPrefix(sessionPrefix) }
     }
 
     static func encode(_ ticket: ShareTicket) -> String? {
