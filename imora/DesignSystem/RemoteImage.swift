@@ -164,13 +164,21 @@ struct LocalPhotoImage: View {
         .task(id: requestKey) {
             let key = requestKey
             guard image?.key != key else { return }
+            let start = ContinuousClock.now
             let loaded = await LocalImageLoader.shared.image(
                 localIdentifier: localIdentifier,
                 targetPixelSize: targetPixelSize
             )
             guard !Task.isCancelled else { return }
             guard let loaded else { return onUnavailable?() ?? () }
-            image = KeyedImage(key: key, image: loaded)
+            let keyed = KeyedImage(key: key, image: loaded)
+            // same rule as remoteimage: fast loads swap in place, slow ones
+            // fade so a late arrival never pops over the fallback.
+            if ContinuousClock.now - start < .milliseconds(120) {
+                image = keyed
+            } else {
+                withAnimation(.easeIn(duration: 0.15)) { image = keyed }
+            }
         }
     }
 }
