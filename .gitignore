@@ -63,3 +63,6 @@ fastlane/test_output
 
 # local xcodebuild output
 build/
+
+# macOS
+.DS_Store

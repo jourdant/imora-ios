@@ -1,4 +1,3 @@
-import AVFoundation
 import SwiftUI
 
 private struct TimelineScrollState: Equatable {
@@ -72,14 +71,10 @@ struct TimelineScreen<Header: View>: View {
     @State private var scrollContext = ScrollContext()
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
-    /// tile whose pixels the system context menu is currently lifting. the
-    /// grid copy hides while set so the lift reads as the tile itself
-    /// leaving its spot, not a duplicate growing over it.
-    @State private var liftedAssetID: String?
     @State private var columnCount = 3
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
-    @Namespace private var zoomNamespace
+    @State private var tileRegistry = AssetTileRegistry()
 
     init(
         title: String,
@@ -117,8 +112,6 @@ struct TimelineScreen<Header: View>: View {
     }
 
     var body: some View {
-        @Bindable var viewer = viewer
-
         GeometryReader { geometry in
             let side = tileSide(for: geometry.size.width)
 
@@ -268,21 +261,6 @@ struct TimelineScreen<Header: View>: View {
         // the pipeline outlives the screen, so a window left open would keep
         // downloading tiles for a grid nobody is looking at.
         .onDisappear { prefetcher.cancel() }
-        // full screen cover keeps the grid and its bars on screen behind the
-        // zoom morph, exactly like the system photos app; a navigation push
-        // slides the source bars and stalls taps after the pop settles.
-        .fullScreenCover(item: $viewer.route) { route in
-            AssetViewerScreen(
-                assets: route.assets,
-                initialIndex: route.initialIndex,
-                presentationID: route.id,
-                zoomNamespace: zoomNamespace,
-                album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
-                onDismissed: { finishViewer(route.id) }
-            ) { change in
-                handleViewerChange(change)
-            }
-        }
         .sheet(item: $pendingAlbumAssets) { ids in
             AlbumPickerSheet(assetIDs: ids) {
                 exitSelection()
@@ -388,46 +366,44 @@ struct TimelineScreen<Header: View>: View {
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {
-        let tile = AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
-            .overlay(alignment: .topLeading) {
-                if isSelecting && !asset.isLocal {
-                    Image(systemName: selection.contains(asset.id) ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, selection.contains(asset.id) ? Color.accentColor : .black.opacity(0.25))
-                        .contentTransition(.symbolEffect(.replace))
-                        .animation(.snappy(duration: 0.22), value: selection.contains(asset.id))
-                        .padding(6)
+        // selection mode keeps taps as the only gesture, like the system
+        // photos app.
+        if isSelecting {
+            AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
+                .overlay(alignment: .topLeading) {
+                    if !asset.isLocal {
+                        Image(systemName: selection.contains(asset.id) ? "checkmark.circle.fill" : "circle")
+                            .font(.title3)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, selection.contains(asset.id) ? Color.accentColor : .black.opacity(0.25))
+                            .contentTransition(.symbolEffect(.replace))
+                            .animation(.snappy(duration: 0.22), value: selection.contains(asset.id))
+                            .padding(6)
+                    }
                 }
-            }
-            .overlay {
-                if isSelecting && selection.contains(asset.id) {
-                    Rectangle().stroke(Color.accentColor, lineWidth: 3)
+                .overlay {
+                    if selection.contains(asset.id) {
+                        Rectangle().stroke(Color.accentColor, lineWidth: 3)
+                    }
                 }
-            }
-            .matchedTransitionSource(id: asset.id, in: zoomNamespace)
-
-        // device-only photos have no server actions yet, and selection mode
-        // keeps taps as the only gesture, like the system photos app.
-        if asset.isLocal || isSelecting {
-            tile.onTapGesture {
-                if isSelecting {
+                .onTapGesture {
                     // server actions cannot target device-only photos.
                     if !asset.isLocal { toggle(asset) }
-                } else {
-                    openViewer(at: asset)
                 }
-            }
         } else {
-            tile.opacity(liftedAssetID == asset.id ? 0 : 1)
-                .overlay {
-                    TileInteractionHost(
-                        menu: { UIMenu(children: menuElements(for: asset)) },
-                        preview: { previewController(for: asset, within: $0) },
-                        onLiftChange: { liftedAssetID = $0 ? asset.id : nil },
-                        onOpen: { openViewer(at: asset) }
+            InteractiveAssetTile(
+                asset: asset,
+                showsBackupBadge: mergesLocalPhotos,
+                registry: tileRegistry,
+                menu: { UIMenu(children: menuElements(for: asset)) },
+                makeViewer: { startsAsContextPreview, bounds in
+                    viewerController(
+                        for: asset,
+                        startsAsContextPreview: startsAsContextPreview,
+                        previewBounds: bounds
                     )
                 }
+            )
         }
     }
 
@@ -436,6 +412,7 @@ struct TimelineScreen<Header: View>: View {
     /// single-asset menu behind the long-press preview. mirrors the action
     /// set of the selection bar for the current screen.
     private func menuElements(for asset: Asset) -> [UIMenuElement] {
+        if asset.isLocal { return localMenuElements(for: asset) }
         var main: [UIMenuElement] = []
         if filter.isTrashed == true {
             main.append(UIAction(title: "Restore", image: UIImage(systemName: "arrow.uturn.backward")) { _ in
@@ -481,22 +458,28 @@ struct TimelineScreen<Header: View>: View {
         ]
     }
 
-    /// hosting controller for the floating preview, sized to the asset's
-    /// exact aspect ratio so the photo fills the platter with no borders.
-    private func previewController(for asset: Asset, within bounds: CGSize) -> UIViewController {
-        // the preview hosts its own hierarchy without the screen's
-        // observable environment, so the session is re-injected.
-        let host = UIHostingController(rootView: AssetContextPreview(asset: asset).environment(session))
-        host.view.backgroundColor = .clear
-        let ratio = CGFloat(asset.ratio > 0 ? asset.ratio : 1)
-        let height = min(bounds.height * 0.62, (bounds.width - 24) / ratio)
-        host.preferredContentSize = CGSize(width: ratio * height, height: height)
-        // render once before the platter picks the view up, so the first
-        // frame already shows the cached tile pixels instead of a blank
-        // that fills in a beat later.
-        host.view.frame = CGRect(origin: .zero, size: host.preferredContentSize)
-        host.view.layoutIfNeeded()
-        return host
+    /// device-only photos have no server actions. deletion goes through the
+    /// system photo library dialog, so no extra confirmation is needed, and
+    /// the library observer removes the tile once the change lands.
+    private func localMenuElements(for asset: Asset) -> [UIMenuElement] {
+        guard let localId = asset.localIdentifier else { return [] }
+        let delete = UIAction(
+            title: "Delete from Device",
+            image: UIImage(systemName: "trash"),
+            attributes: .destructive
+        ) { _ in
+            Task {
+                // declining the system dialog throws and must not be
+                // recorded as a deletion.
+                do {
+                    try await PhotoLibraryService.delete(localIdentifiers: [localId])
+                } catch {
+                    return
+                }
+                session.backup?.noteLocalDeletion([localId])
+            }
+        }
+        return [UIMenu(options: .displayInline, children: [delete])]
     }
 
     @ViewBuilder private var overlayState: some View {
@@ -571,15 +554,34 @@ struct TimelineScreen<Header: View>: View {
         isSelecting = false
     }
 
-    private func openViewer(at asset: Asset) {
-        guard let index = model.flatAssetIndex(for: asset.id) else { return }
+    private func viewerController(
+        for asset: Asset,
+        startsAsContextPreview: Bool,
+        previewBounds: CGSize
+    ) -> AssetViewerHostingController? {
+        guard let index = model.flatAssetIndex(for: asset.id) else { return nil }
+        guard let route = viewer.makeRoute(assets: model.flatAssets, initialIndex: index) else { return nil }
 
-        // no transition gate: taps during a still settling dismissal must
-        // start the next presentation, matching the system photos app. the
-        // suspension resolves through the active viewer's completion.
+        return AssetViewerHostingController(
+            route: route,
+            startsAsContextPreview: startsAsContextPreview,
+            previewBounds: previewBounds,
+            session: session,
+            sourceRegistry: tileRegistry,
+            album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
+            willPresent: { route in beginViewerPresentation(route) },
+            didDismiss: { id in finishViewer(id) },
+            onChange: { change in handleViewerChange(change) }
+        )
+    }
+
+    private func beginViewerPresentation(_ route: ViewerRoute) -> Bool {
+        // Only one UIKit viewer can own Timeline suspension. Its completion
+        // clears this gate at the same point the native zoom gives back control.
+        guard viewer.activate(route, presentsCover: false) else { return false }
         model.suspendForViewer()
         hideScrubberForViewer()
-        viewer.present(assets: model.flatAssets, initialIndex: index)
+        return true
     }
 
     private func finishViewer(_ id: UUID) {
@@ -767,51 +769,98 @@ private struct PlaceholderGrid: View {
     }
 }
 
-/// invisible uikit layer owning a tile's tap and long press. swiftui's
-/// contextMenu cannot commit when the floating preview is tapped, so the
-/// interaction is bridged: tap opens the viewer, long press lifts the tile
-/// into the preview, and tapping the preview opens the viewer too.
-private struct TileInteractionHost: UIViewRepresentable {
+/// uikit-hosted tile owning tap and long press. swiftui's contextMenu cannot
+/// commit when the floating preview is tapped, so the interaction is bridged
+/// on the same view that draws the tile. UIKit owns its temporary preview and
+/// source visibility; the app keeps no duplicate or delayed cleanup view.
+private struct InteractiveAssetTile: UIViewRepresentable {
+    @Environment(SessionStore.self) private var session
+    let asset: Asset
+    let showsBackupBadge: Bool
+    let registry: AssetTileRegistry
     let menu: () -> UIMenu
-    let preview: (CGSize) -> UIViewController
-    /// true while the system owns the tile visuals, so the swiftui tile can
-    /// hide underneath the lift.
-    let onLiftChange: (Bool) -> Void
-    let onOpen: () -> Void
+    let makeViewer: (_ startsAsContextPreview: Bool, _ bounds: CGSize) -> AssetViewerHostingController?
 
     func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+        let view = configuration.makeContentView()
         view.backgroundColor = .clear
         view.addInteraction(UIContextMenuInteraction(delegate: context.coordinator))
-        view.addGestureRecognizer(UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped)))
+        view.addGestureRecognizer(UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.tapped(_:))
+        ))
+        context.coordinator.register(view, assetID: asset.id, in: registry)
         return view
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.host = self
+        context.coordinator.register(uiView, assetID: asset.id, in: registry)
+        (uiView as? UIContentView)?.configuration = configuration
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(host: self) }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
+        coordinator.unregister(uiView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(host: self, registry: registry)
+    }
+
+    /// the hosted root does not inherit this screen's environment, so the
+    /// session is re-injected.
+    private var configuration: UIHostingConfiguration<some View, some View> {
+        UIHostingConfiguration {
+            AssetTile(asset: asset, showsBackupBadge: showsBackupBadge)
+                .environment(session)
+        }
+        .margins(.all, 0)
+    }
 
     final class Coordinator: NSObject, UIContextMenuInteractionDelegate {
-        var host: TileInteractionHost
-        /// copy of the tile's on-screen pixels, installed inside the
-        /// interaction view for the duration of the lift.
-        private var snapshot: UIView?
-        private var lifted = false
+        var host: InteractiveAssetTile
+        private var registry: AssetTileRegistry
+        private var registeredAssetID: String?
 
-        init(host: TileInteractionHost) { self.host = host }
+        init(host: InteractiveAssetTile, registry: AssetTileRegistry) {
+            self.host = host
+            self.registry = registry
+        }
 
-        @objc func tapped() { host.onOpen() }
+        func register(_ view: UIView, assetID: String, in registry: AssetTileRegistry) {
+            if (self.registry !== registry || registeredAssetID != assetID),
+               let registeredAssetID {
+                self.registry.unregister(view, for: registeredAssetID)
+            }
+            self.registry = registry
+            registeredAssetID = assetID
+            registry.register(view, for: assetID)
+        }
+
+        func unregister(_ view: UIView) {
+            guard let registeredAssetID else { return }
+            registry.unregister(view, for: registeredAssetID)
+            self.registeredAssetID = nil
+        }
+
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view,
+                  let bounds = view.window?.bounds.size,
+                  let presenter = presentationAnchor(for: view),
+                  let viewer = host.makeViewer(false, bounds)
+            else { return }
+            viewer.presentDirectly(from: presenter)
+        }
 
         func contextMenuInteraction(
             _ interaction: UIContextMenuInteraction,
             configurationForMenuAtLocation location: CGPoint
         ) -> UIContextMenuConfiguration? {
-            endLift()
-            let bounds = interaction.view?.window?.bounds.size ?? UIScreen.main.bounds.size
+            guard let bounds = interaction.view?.window?.bounds.size else { return nil }
+            let viewer = host.makeViewer(true, bounds)
             return UIContextMenuConfiguration(
-                previewProvider: { self.host.preview(bounds) },
+                identifier: host.asset.id as NSString,
+                previewProvider: { viewer },
                 actionProvider: { _ in self.host.menu() }
             )
         }
@@ -821,181 +870,43 @@ private struct TileInteractionHost: UIViewRepresentable {
             willPerformPreviewActionForMenuWith configuration: UIContextMenuConfiguration,
             animator: UIContextMenuInteractionCommitAnimating
         ) {
-            animator.addCompletion { self.host.onOpen() }
-        }
+            guard let view = interaction.view,
+                  let presenter = presentationAnchor(for: view),
+                  let viewer = animator.previewViewController as? AssetViewerHostingController,
+                  viewer.prepareForContextCommit()
+            else { return }
 
-        func contextMenuInteraction(
-            _ interaction: UIContextMenuInteraction,
-            previewForHighlightingMenuWithConfiguration configuration: UIContextMenuConfiguration
-        ) -> UITargetedPreview? {
-            beginLift(interaction)
-        }
-
-        func contextMenuInteraction(
-            _ interaction: UIContextMenuInteraction,
-            previewForDismissingMenuWithConfiguration configuration: UIContextMenuConfiguration
-        ) -> UITargetedPreview? {
-            targetedTilePreview(interaction)
-        }
-
-        func contextMenuInteraction(
-            _ interaction: UIContextMenuInteraction,
-            willEndFor configuration: UIContextMenuConfiguration,
-            animator: UIContextMenuInteractionAnimating?
-        ) {
-            if let animator {
-                animator.addCompletion { self.endLift() }
-            } else {
-                endLift()
+            // `.pop` expands the preview that is already on screen. Once that
+            // animation releases it, install that exact controller with no
+            // second animation or delayed full-screen-cover presentation.
+            animator.preferredCommitStyle = .pop
+            animator.addAnimations {
+                viewer.revealViewerForContextCommit()
+            }
+            animator.addCompletion {
+                viewer.attachAfterContextCommit(to: presenter)
             }
         }
 
-        /// the interaction sits on a transparent overlay, so the default lift
-        /// would raise an empty view. copying the pixels already on screen
-        /// into the overlay and hiding the swiftui tile underneath makes the
-        /// system lift the tile itself out of the grid, photos style: no
-        /// duplicate, no reload, and the spot empties while the menu is up.
-        private func beginLift(_ interaction: UIContextMenuInteraction) -> UITargetedPreview? {
-            guard let view = interaction.view, view.window != nil,
-                  let container = liftContainer(for: view),
-                  let copy = container.resizableSnapshotView(
-                      from: view.convert(view.bounds, to: container),
-                      afterScreenUpdates: false,
-                      withCapInsets: .zero
-                  )
-            else { return nil }
-            snapshot?.removeFromSuperview()
-            copy.frame = view.bounds
-            copy.isUserInteractionEnabled = false
-            view.addSubview(copy)
-            snapshot = copy
-            lifted = true
-            host.onLiftChange(true)
-            return targetedTilePreview(interaction)
-        }
-
-        private func targetedTilePreview(_ interaction: UIContextMenuInteraction) -> UITargetedPreview? {
-            guard let view = interaction.view, view.window != nil, snapshot != nil else { return nil }
-            let parameters = UIPreviewParameters()
-            parameters.backgroundColor = .clear
-            return UITargetedPreview(view: view, parameters: parameters)
-        }
-
-        /// snapshots come from the scroll view subtree so chrome hovering
-        /// over the grid, like the scrubber or the tab bar, never bakes into
-        /// the lifted tile.
-        private func liftContainer(for view: UIView) -> UIView? {
-            var ancestor = view.superview
-            while let current = ancestor, !(current is UIScrollView) {
-                ancestor = current.superview
+        /// Presents from the stable container above SwiftUI's hosting child.
+        /// The context-menu presentation itself is transient and has completed
+        /// by the time the captured controller is asked to attach the viewer.
+        private func presentationAnchor(for view: UIView) -> UIViewController? {
+            var responder: UIResponder? = view
+            var controller: UIViewController?
+            while let current = responder {
+                if let current = current as? UIViewController {
+                    controller = current
+                    break
+                }
+                responder = current.next
             }
-            return ancestor ?? view.window
-        }
-
-        private func endLift() {
-            guard lifted || snapshot != nil else { return }
-            lifted = false
-            host.onLiftChange(false)
-            // the swiftui tile returns with the exact pixels the copy shows,
-            // so the copy outlives the restore by a beat and no frame ever
-            // exposes the empty spot.
-            guard let copy = snapshot else { return }
-            snapshot = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                copy.removeFromSuperview()
+            guard var controller else { return nil }
+            while let parent = controller.parent {
+                controller = parent
             }
+            return controller
         }
-    }
-}
-
-/// floating media shown while the tile context menu is up. the grid's 640px
-/// render is usually cached, so it paints instantly while the bigger one
-/// loads, and videos start a muted loop over the still like the photos app.
-private struct AssetContextPreview: View {
-    @Environment(SessionStore.self) private var session
-    let asset: Asset
-
-    @State private var player: AVQueuePlayer?
-    @State private var looper: AVPlayerLooper?
-
-    private var pairedLocalIdentifier: String? {
-        asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
-    }
-
-    var body: some View {
-        ZStack {
-            if let localId = pairedLocalIdentifier {
-                LocalPhotoImage(
-                    localIdentifier: localId,
-                    targetPixelSize: 1280,
-                    fallbackTargetPixelSize: 640
-                )
-            } else if let client = session.client {
-                RemoteImage(
-                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash),
-                    targetPixelSize: 1280,
-                    thumbhash: asset.thumbhash,
-                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
-                    fallbackTargetPixelSize: 640
-                )
-            }
-            if let player {
-                PlayerLayerView(player: player)
-            }
-        }
-        .clipped()
-        .task { await startVideo() }
-        .onDisappear {
-            player?.pause()
-            looper = nil
-            player = nil
-        }
-    }
-
-    private func startVideo() async {
-        guard asset.isVideo, player == nil else { return }
-        var item: AVPlayerItem?
-        if let localId = pairedLocalIdentifier {
-            // the paired device copy is free; a backed-up one stuck in icloud
-            // falls through to the server stream instead of downloading.
-            item = await LocalImageLoader.shared.playerItem(localIdentifier: localId, allowsNetwork: false)
-        }
-        if item == nil, let client = session.client {
-            let av = AVURLAsset(
-                url: client.playbackURL(assetID: asset.id),
-                options: ["AVURLAssetHTTPHeaderFieldsKey": client.authHeaders]
-            )
-            item = AVPlayerItem(asset: av)
-        }
-        guard let item, !Task.isCancelled else { return }
-        let queue = AVQueuePlayer()
-        queue.isMuted = true
-        looper = AVPlayerLooper(player: queue, templateItem: item)
-        queue.play()
-        player = queue
-    }
-}
-
-/// bare video layer, no transport chrome. transparent until the first frame
-/// renders so the still underneath shows through while the video spins up.
-private struct PlayerLayerView: UIViewRepresentable {
-    let player: AVPlayer
-
-    final class LayerView: UIView {
-        override static var layerClass: AnyClass { AVPlayerLayer.self }
-    }
-
-    func makeUIView(context: Context) -> LayerView {
-        let view = LayerView()
-        view.backgroundColor = .clear
-        let layer = view.layer as? AVPlayerLayer
-        layer?.player = player
-        layer?.videoGravity = .resizeAspectFill
-        return view
-    }
-
-    func updateUIView(_ uiView: LayerView, context: Context) {
-        (uiView.layer as? AVPlayerLayer)?.player = player
     }
 }
 

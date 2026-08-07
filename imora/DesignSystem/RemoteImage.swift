@@ -51,6 +51,10 @@ struct RemoteImage: View {
                 Image(uiImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
+                    // swiftui does not animate an image content swap on its
+                    // own, so without this the slow-path fade below lands as
+                    // a hard cut when the sharper render arrives.
+                    .contentTransition(.opacity)
             } else {
                 Color(.secondarySystemFill)
             }
@@ -154,6 +158,9 @@ struct LocalPhotoImage: View {
                 Image(uiImage: display)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
+                    // same as remoteimage: makes the slow-path fade real
+                    // instead of a hard cut on the content swap.
+                    .contentTransition(.opacity)
             } else {
                 Color(.secondarySystemFill)
             }

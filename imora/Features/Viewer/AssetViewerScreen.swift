@@ -76,8 +76,12 @@ struct AssetViewerScreen: View {
 
     let onChange: (AssetChange) -> Void
     let onDismissed: () -> Void
+    let onRequestDismissal: (() -> Void)?
+    let onSelectionChanged: (String) -> Void
+    let onPageZoomChanged: (Bool) -> Void
     let presentationID: UUID
     let zoomNamespace: Namespace.ID?
+    let isContextPreview: Bool
     /// set when the grid behind is an album, which adds removal to the menu.
     let album: AlbumContext?
 
@@ -109,7 +113,11 @@ struct AssetViewerScreen: View {
         initialIndex: Int,
         presentationID: UUID,
         zoomNamespace: Namespace.ID? = nil,
+        isContextPreview: Bool = false,
         album: AlbumContext? = nil,
+        onRequestDismissal: (() -> Void)? = nil,
+        onSelectionChanged: @escaping (String) -> Void = { _ in },
+        onPageZoomChanged: @escaping (Bool) -> Void = { _ in },
         onDismissed: @escaping () -> Void,
         onChange: @escaping (AssetChange) -> Void
     ) {
@@ -119,7 +127,11 @@ struct AssetViewerScreen: View {
         _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
         self.presentationID = presentationID
         self.zoomNamespace = zoomNamespace
+        self.isContextPreview = isContextPreview
         self.album = album
+        self.onRequestDismissal = onRequestDismissal
+        self.onSelectionChanged = onSelectionChanged
+        self.onPageZoomChanged = onPageZoomChanged
         self.onDismissed = onDismissed
         self.onChange = onChange
     }
@@ -170,10 +182,12 @@ struct AssetViewerScreen: View {
                 // dismissal state changes in this screen never re-diff the pages.
                 AssetPager(
                     assets: assets,
-                    selection: $selectedAssetID
+                    selection: $selectedAssetID,
+                    mutesVideo: isContextPreview
                 ) { id, isZoomed in
                     guard id == selectedAssetID else { return }
                     currentPageZoomed = isZoomed
+                    onPageZoomChanged(isZoomed)
                 }
                 .ignoresSafeArea()
                 .onTapGesture {
@@ -188,29 +202,35 @@ struct AssetViewerScreen: View {
                     .allowsHitTesting(false)
             }
             .overlay(alignment: .bottom) {
-                if chromeVisible, let current, current.isLocal {
+                if !isContextPreview, chromeVisible, let current, current.isLocal {
                     backupStatePill(current)
                         .padding(.bottom, 10)
                         .transition(.opacity)
                 }
             }
             .toolbar { toolbarContent }
-            .toolbarVisibility(chromeVisible ? .visible : .hidden, for: .navigationBar)
-            .toolbarVisibility(chromeVisible ? .visible : .hidden, for: .bottomBar)
+            .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .navigationBar)
+            .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .bottomBar)
             .navigationBarTitleDisplayMode(.inline)
         }
-        .statusBarHidden(!chromeVisible)
-        .allowsHitTesting(!isDismissing)
+        .statusBarHidden(isContextPreview || !chromeVisible)
+        .allowsHitTesting(!isContextPreview && !isDismissing)
+        .onAppear {
+            if let selectedAssetID { onSelectionChanged(selectedAssetID) }
+        }
         .onChange(of: selectedAssetID) { _, id in
             guard let id, let index = assets.firstIndex(where: { $0.id == id }) else { return }
             currentIndex = index
             currentPageZoomed = false
+            onSelectionChanged(id)
+            onPageZoomChanged(false)
         }
         .onDisappear {
             prefetcher.cancel()
             guard !didNotifyDismissal else { return }
             didNotifyDismissal = true
             currentPageZoomed = false
+            onPageZoomChanged(false)
             onDismissed()
         }
         .sheet(isPresented: $showInfo) {
@@ -716,6 +736,13 @@ struct AssetViewerScreen: View {
     // MARK: - actions
 
     private func requestDismissal() {
+        // UIKit-owned viewers dedupe and track cancellation in their controller
+        // phase. Keeping this local latch set after a cancelled fluid zoom-out
+        // would leave the restored viewer permanently unable to receive taps.
+        if let onRequestDismissal {
+            onRequestDismissal()
+            return
+        }
         guard !isDismissing else { return }
         isDismissing = true
         dismiss()
@@ -968,13 +995,18 @@ private struct AirPlayRoutePicker: UIViewRepresentable {
 private struct AssetPager: View {
     let assets: [Asset]
     @Binding var selection: String?
+    let mutesVideo: Bool
     let onZoomChanged: (String, Bool) -> Void
 
     var body: some View {
         ScrollView(.horizontal) {
             LazyHStack(spacing: 0) {
                 ForEach(assets) { asset in
-                    AssetPage(asset: asset, isActive: asset.id == selection) { isZoomed in
+                    AssetPage(
+                        asset: asset,
+                        isActive: asset.id == selection,
+                        mutesVideo: mutesVideo
+                    ) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
                     .containerRelativeFrame([.horizontal, .vertical])
@@ -994,6 +1026,7 @@ private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
+    let mutesVideo: Bool
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -1025,6 +1058,7 @@ private struct AssetPage: View {
                 LocalVideoPage(
                     localIdentifier: localId,
                     isActive: isActive,
+                    isMuted: mutesVideo,
                     allowsNetwork: asset.isLocal,
                     onUnavailable: { localUnavailable = true }
                 )
@@ -1040,7 +1074,7 @@ private struct AssetPage: View {
                 }
             }
         } else if asset.isVideo {
-            VideoPage(asset: asset, isActive: isActive)
+            VideoPage(asset: asset, isActive: isActive, isMuted: mutesVideo)
         } else if let client = session.client {
             // the thumbhash cache key re-renders the page when edits land.
             ZoomableScrollView(contentID: "\(asset.id)#\(asset.thumbhash ?? "")", onZoomChanged: onZoomChanged) {
@@ -1061,6 +1095,7 @@ private struct AssetPage: View {
 private struct LocalVideoPage: View {
     let localIdentifier: String
     let isActive: Bool
+    let isMuted: Bool
     /// device-only assets have nowhere else to go, so they may pull from
     /// icloud; a backed-up one falls back to the server stream instead.
     var allowsNetwork = true
@@ -1075,7 +1110,7 @@ private struct LocalVideoPage: View {
                 ProgressView().tint(.white)
             }
         }
-        .task(id: "\(localIdentifier):\(isActive)") {
+        .task(id: "\(localIdentifier):\(isActive):\(isMuted)") {
             guard isActive else {
                 tearDownPlayer()
                 return
@@ -1092,6 +1127,7 @@ private struct LocalVideoPage: View {
                 }
                 player = AVPlayer(playerItem: item)
             }
+            player?.isMuted = isMuted
             player?.play()
         }
         .onDisappear { tearDownPlayer() }
@@ -1108,6 +1144,7 @@ private struct VideoPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
+    let isMuted: Bool
     @State private var player: AVPlayer?
 
     var body: some View {
@@ -1118,7 +1155,7 @@ private struct VideoPage: View {
                 ProgressView().tint(.white)
             }
         }
-        .task(id: "\(asset.id):\(isActive)") {
+        .task(id: "\(asset.id):\(isActive):\(isMuted)") {
             guard isActive else {
                 tearDownPlayer()
                 return
@@ -1130,6 +1167,7 @@ private struct VideoPage: View {
                 )
                 player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
             }
+            player?.isMuted = isMuted
             player?.play()
         }
         .onDisappear { tearDownPlayer() }
