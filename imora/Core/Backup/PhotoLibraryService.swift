@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import ImageIO
 import Photos
 import UniformTypeIdentifiers
 import os
@@ -126,6 +127,109 @@ nonisolated enum PhotoLibraryService {
 
     private static func fetchPHAsset(_ localIdentifier: String) -> PHAsset? {
         PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil).firstObject
+    }
+
+    // MARK: - local info
+
+    /// camera fields read from the image file's own metadata.
+    private struct CameraMetadata: Sendable {
+        var make: String?
+        var model: String?
+        var lens: String?
+        var fNumber: Double?
+        var focalLength: Double?
+        var iso: Double?
+        var exposureTime: String?
+    }
+
+    /// synthesized detail for a device-only asset, so the info sheet renders
+    /// local photos through the same layout it uses for server ones. server
+    /// notions like people, caption or rating stay nil by construction.
+    @concurrent
+    static func localDetail(localIdentifier: String) async -> AssetDetail? {
+        guard let asset = fetchPHAsset(localIdentifier) else { return nil }
+        let resource = primaryResource(for: asset)
+        let camera = await cameraMetadata(of: asset)
+        let created = asset.creationDate ?? asset.modificationDate ?? .distantPast
+        let isVideo = asset.mediaType == .video
+
+        let exif = ExifInfo(
+            make: camera?.make,
+            model: camera?.model,
+            exifImageWidth: asset.pixelWidth > 0 ? Double(asset.pixelWidth) : nil,
+            exifImageHeight: asset.pixelHeight > 0 ? Double(asset.pixelHeight) : nil,
+            fileSizeInByte: resource?.value(forKey: "fileSize") as? Int64,
+            lensModel: camera?.lens,
+            fNumber: camera?.fNumber,
+            focalLength: camera?.focalLength,
+            iso: camera?.iso,
+            exposureTime: camera?.exposureTime,
+            latitude: asset.location?.coordinate.latitude,
+            longitude: asset.location?.coordinate.longitude,
+            city: nil,
+            state: nil,
+            country: nil,
+            dateTimeOriginal: nil,
+            timeZone: nil,
+            description: nil,
+            rating: nil
+        )
+        return AssetDetail(
+            id: "local-\(localIdentifier)",
+            ownerId: "",
+            type: isVideo ? .video : .image,
+            originalFileName: resource?.originalFilename ?? "Unknown",
+            originalMimeType: resource.flatMap { UTType($0.uniformTypeIdentifier)?.preferredMIMEType },
+            thumbhash: nil,
+            fileCreatedAt: created.ISO8601Format(),
+            localDateTime: created.ISO8601Format(),
+            createdAt: nil,
+            isFavorite: asset.isFavorite,
+            isArchived: nil,
+            isTrashed: false,
+            visibility: nil,
+            width: asset.pixelWidth > 0 ? asset.pixelWidth : nil,
+            height: asset.pixelHeight > 0 ? asset.pixelHeight : nil,
+            duration: isVideo ? Int(asset.duration * 1000) : nil,
+            exifInfo: exif,
+            livePhotoVideoId: nil,
+            people: nil,
+            tags: nil,
+            checksum: nil,
+            isEdited: nil
+        )
+    }
+
+    /// exif straight from the picture on device. icloud-offloaded originals
+    /// are never downloaded for an info panel - the fields just stay empty.
+    private static func cameraMetadata(of asset: PHAsset) async -> CameraMetadata? {
+        guard asset.mediaType == .image else { return nil }
+        let options = PHContentEditingInputRequestOptions()
+        options.isNetworkAccessAllowed = false
+        return await withCheckedContinuation { continuation in
+            asset.requestContentEditingInput(with: options) { input, _ in
+                guard let url = input?.fullSizeImageURL,
+                      let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+                else { return continuation.resume(returning: nil) }
+
+                let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+                let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any]
+                var metadata = CameraMetadata()
+                metadata.make = tiff?[kCGImagePropertyTIFFMake] as? String
+                metadata.model = tiff?[kCGImagePropertyTIFFModel] as? String
+                metadata.lens = exif?[kCGImagePropertyExifLensModel] as? String
+                metadata.fNumber = exif?[kCGImagePropertyExifFNumber] as? Double
+                metadata.focalLength = exif?[kCGImagePropertyExifFocalLength] as? Double
+                metadata.iso = (exif?[kCGImagePropertyExifISOSpeedRatings] as? [Double])?.first
+                if let seconds = exif?[kCGImagePropertyExifExposureTime] as? Double, seconds > 0 {
+                    metadata.exposureTime = seconds < 1
+                        ? "1/\(Int((1 / seconds).rounded()))"
+                        : "\(seconds.formatted(.number.precision(.fractionLength(0...1)))) s"
+                }
+                continuation.resume(returning: metadata)
+            }
+        }
     }
 
     // MARK: - resource selection

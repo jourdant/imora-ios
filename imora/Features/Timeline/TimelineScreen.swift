@@ -483,9 +483,11 @@ struct TimelineScreen<Header: View>: View {
     }
 
     @ViewBuilder private var overlayState: some View {
-        if model.isLoading && model.sections.isEmpty {
+        // rows, not sections: cache-restored months and merged device photos
+        // are real content, and a failed server load must not cover them.
+        if model.isLoading && model.rows.isEmpty {
             ProgressView()
-        } else if let error = model.loadError, model.sections.isEmpty {
+        } else if let error = model.loadError, model.rows.isEmpty {
             ContentUnavailableView {
                 Label("Couldn't load", systemImage: "wifi.exclamationmark")
             } description: {

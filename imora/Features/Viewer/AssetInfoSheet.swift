@@ -181,7 +181,8 @@ struct AssetInfoSheet: View {
 
         detailsSection(detail)
 
-        if session.preferences?.ratingsEnabled == true {
+        // rating is a server concept; a device-only photo has none to show.
+        if session.preferences?.ratingsEnabled == true, !asset.isLocal {
             ratingSection
         }
 
@@ -696,11 +697,29 @@ struct AssetInfoSheet: View {
             albums = []
         }
 
-        guard let client = session.client, !asset.isLocal else {
-            loadState = .failed("This photo has not been backed up yet.")
+        // device-only assets answer from photokit: same layout, no server
+        // notions like people, caption or rating.
+        if asset.isLocal {
+            if detail == nil { loadState = .loading }
+            var local: AssetDetail?
+            if let localIdentifier = asset.localIdentifier {
+                local = await PhotoLibraryService.localDetail(localIdentifier: localIdentifier)
+            }
+            guard draftAssetID == asset.id else { return }
+            if let local {
+                loadState = .loaded(local)
+            } else {
+                loadState = .failed("This photo could not be read from the library.")
+            }
+            return
+        }
+
+        guard let client = session.client else {
+            loadState = .failed("Not signed in.")
             return
         }
         if detail == nil { loadState = .loading }
+        let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
 
         do {
             let detail = try await client.assetDetail(id: asset.id)
@@ -709,12 +728,35 @@ struct AssetInfoSheet: View {
             savedDescription = detail.exifInfo?.description ?? ""
             if !descriptionFocused { descriptionDraft = savedDescription }
             rating = detail.exifInfo?.rating.map { Int($0) } ?? 0
-        } catch {
-            loadState = .failed(error.localizedDescription)
-        }
 
-        let loaded = (try? await client.albums(assetID: asset.id)) ?? []
-        guard draftAssetID == asset.id else { return }
-        albums = loaded
+            let loaded = (try? await client.albums(assetID: asset.id)) ?? []
+            guard draftAssetID == asset.id else { return }
+            albums = loaded
+            if let account {
+                let envelope = CachedAssetInfo(detail: detail, albums: loaded)
+                Task.detached(priority: .utility) {
+                    OfflineCache.store(envelope, key: "asset-info/\(detail.id)", account: account)
+                }
+            }
+        } catch {
+            // offline: the last fetched copy still answers most questions.
+            guard draftAssetID == asset.id else { return }
+            if let account,
+               let cached: CachedAssetInfo = OfflineCache.value(key: "asset-info/\(asset.id)", account: account) {
+                loadState = .loaded(cached.detail)
+                savedDescription = cached.detail.exifInfo?.description ?? ""
+                if !descriptionFocused { descriptionDraft = savedDescription }
+                rating = cached.detail.exifInfo?.rating.map { Int($0) } ?? 0
+                albums = cached.albums
+            } else {
+                loadState = .failed(error.localizedDescription)
+            }
+        }
     }
+}
+
+/// offline copy of the info sheet payload, one file per asset.
+private nonisolated struct CachedAssetInfo: Codable {
+    let detail: AssetDetail
+    let albums: [Album]
 }

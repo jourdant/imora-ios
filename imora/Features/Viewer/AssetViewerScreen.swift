@@ -485,8 +485,8 @@ struct AssetViewerScreen: View {
         }
     }
 
-    /// device-only assets can be shared and deleted locally; server actions
-    /// come after they are backed up.
+    /// device-only assets can be shared, inspected and deleted locally;
+    /// server actions come after they are backed up.
     @ToolbarContentBuilder private func localToolbarItems(_ current: Asset) -> some ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
             if let localId = current.localIdentifier {
@@ -497,6 +497,17 @@ struct AssetViewerScreen: View {
                     Image(systemName: "square.and.arrow.up")
                 }
             }
+        }
+
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+
+        ToolbarItem(placement: .bottomBar) {
+            Button {
+                showInfo = true
+            } label: {
+                Image(systemName: "info.circle")
+            }
+            .accessibilityIdentifier("viewer-info")
         }
 
         ToolbarSpacer(.flexible, placement: .bottomBar)

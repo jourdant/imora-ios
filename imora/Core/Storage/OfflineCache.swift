@@ -31,8 +31,10 @@ nonisolated enum OfflineCache {
 
     static func store<T: Codable>(_ value: T, key: String, account: String) {
         guard let data = try? JSONEncoder().encode(Entry(account: account, value: value)) else { return }
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try? data.write(to: root.appending(path: key + ".json"), options: .atomic)
+        let file = root.appending(path: key + ".json")
+        // keys may nest, like asset-info/<id>.
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: file, options: .atomic)
     }
 
     // MARK: - storage
