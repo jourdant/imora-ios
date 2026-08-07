@@ -63,6 +63,15 @@ struct RootView: View {
             }
         }
         .animation(.smooth, value: session.state)
+        .task {
+            // full access is asked once at launch so saving to the device or
+            // backup never stalls on the system dialog mid-action.
+            guard await PhotoLibraryService.requestFullAccess() else { return }
+            // a grant landing after the session was adopted has to re-prime
+            // the observer, badges and auto backup by hand.
+            await session.backup?.primeLocalState()
+            session.backup?.startIfIdle()
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
