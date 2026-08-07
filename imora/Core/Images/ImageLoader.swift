@@ -12,14 +12,23 @@ nonisolated final class ImageLoader: Sendable {
     private let pipeline: ImagePipeline
     private let authorization = AuthorizingDelegate()
     private let prefetcher: ImagePrefetcher
+    /// held directly so storage settings can measure and wipe it.
+    private let dataCache: DataCache?
 
     private init() {
         // an aggressive data cache instead of urlcache: immich thumbnails are
         // immutable per cache key, so revalidating them is wasted latency.
-        var configuration = ImagePipeline.Configuration.withDataCache(
-            name: "imora-images",
-            sizeLimit: 1 << 30
-        )
+        let dataCache = try? DataCache(name: "imora-images")
+        dataCache?.sizeLimit = 1 << 30
+        self.dataCache = dataCache
+
+        var configuration = ImagePipeline.Configuration()
+        configuration.dataLoader = {
+            let config = URLSessionConfiguration.default
+            config.urlCache = nil
+            return DataLoader(configuration: config)
+        }()
+        configuration.dataCache = dataCache
         configuration.imageCache = ImageCache(costLimit: 256 << 20)
         // the sanitized key drops the thumbnail size, so one download serves
         // every pixel size the grid and the viewer ask for.
@@ -56,6 +65,68 @@ nonisolated final class ImageLoader: Sendable {
 
     func stopPrefetching(urls: [URL], targetPixelSize: CGFloat) {
         prefetcher.stopPrefetching(with: requests(for: urls, targetPixelSize: targetPixelSize))
+    }
+
+    // MARK: - offline sweep
+
+    /// tail of thumbnails a sweep will fetch; roughly what fits the disk cache.
+    private static let sweepLimit = 20_000
+
+    /// background pass that fills the disk cache with every thumbnail not yet
+    /// stored, so offline browsing shows photos beyond the regions already
+    /// visited. bytes land on disk without decoding, at a priority visible
+    /// tiles always beat. best effort: failures are skipped and a new sweep
+    /// replaces the previous one.
+    func sweepThumbnails(urls: [URL]) {
+        let pipeline = pipeline
+        let task = Task.detached(priority: .utility) {
+            await withTaskGroup(of: Void.self) { group in
+                var iterator = urls.prefix(Self.sweepLimit).makeIterator()
+                func nextRequest() -> ImageRequest? {
+                    while let url = iterator.next() {
+                        var request = ImageRequest(url: url)
+                        request.priority = .veryLow
+                        if !pipeline.cache.containsData(for: request) { return request }
+                    }
+                    return nil
+                }
+                // two lanes are slow enough to never crowd out visible tiles
+                // and still cover a large library over a session.
+                for _ in 0..<2 {
+                    guard let request = nextRequest() else { break }
+                    group.addTask { _ = try? await pipeline.data(for: request) }
+                }
+                for await _ in group {
+                    guard !Task.isCancelled, let request = nextRequest() else { continue }
+                    group.addTask { _ = try? await pipeline.data(for: request) }
+                }
+            }
+        }
+        sweepTask.withLock { current in
+            current?.cancel()
+            current = task
+        }
+    }
+
+    private let sweepTask = Mutex<Task<Void, Never>?>(nil)
+
+    // MARK: - storage
+
+    /// bytes the downloaded images occupy on disk. disk io, keep off main.
+    func diskUsage() -> Int64 {
+        Int64(dataCache?.totalAllocatedSize ?? 0)
+    }
+
+    /// wipes downloaded images from memory and disk. cancels a running sweep
+    /// first, otherwise it would quietly refill what was just reclaimed.
+    func clearCache() {
+        sweepTask.withLock { current in
+            current?.cancel()
+            current = nil
+        }
+        pipeline.cache.removeAll()
+        // deletions are queued; waiting makes the recount deterministic.
+        dataCache?.flush()
     }
 
     // MARK: - requests

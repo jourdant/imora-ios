@@ -87,6 +87,12 @@ final class TimelineModel {
     private var client: ImmichClient?
     private var backup: BackupManager?
     private var inflightBuckets: Set<String> = []
+    /// buckets whose days came from the offline cache or were flagged changed
+    /// by a fresh list. they render immediately but refetch when reachable.
+    private var staleBucketIDs: Set<String> = []
+    /// one offline thumbnail sweep per model lifetime, after the first
+    /// complete online prefetch pass.
+    private var hasSwept = false
     private var flatAssetIndexByID: [String: Int] = [:]
     private var prefetchTask: Task<Void, Never>?
     private var prefetchID: UUID?
@@ -141,14 +147,57 @@ final class TimelineModel {
         loadError = nil
         defer { isLoading = false }
 
+        // paint everything the offline store has before touching the network,
+        // so the grid is browsable instantly - and stays that way offline.
+        await restoreCachedBuckets(using: client)
+
         do {
             try await reloadSections(using: client)
             hasLoaded = true
             await refreshLocalItems()
+            // small libraries finish inside reloadSections with no prefetch
+            // pass left to trigger the sweep, so it is offered here too.
+            sweepThumbnailsIfNeeded()
         } catch is CancellationError {
             return
         } catch {
             loadError = error.localizedDescription
+            // device photos still belong in the grid when the server is away.
+            await refreshLocalItems()
+        }
+    }
+
+    private func account(for client: ImmichClient) -> String? {
+        client.apiURL.host().map { SessionCache.accountKey(host: $0) }
+    }
+
+    /// fills placeholder sections with their last fetched assets from disk.
+    /// restored buckets are marked stale so the next reachable pass refetches
+    /// them, keeping freshness identical to an uncached launch.
+    private func restoreCachedBuckets(using client: ImmichClient) async {
+        guard let account = account(for: client) else { return }
+        let missing = sections.filter { $0.days == nil }.map(\.id)
+        guard !missing.isEmpty else { return }
+        let filter = filter
+        let restored = await Task.detached(priority: .userInitiated) {
+            TimelineCache.restoreBuckets(missing, filter: filter, account: account)
+        }.value
+        guard !restored.isEmpty else { return }
+        for index in sections.indices where sections[index].days == nil {
+            guard let assets = restored[sections[index].id] else { continue }
+            sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
+            staleBucketIDs.insert(sections[index].id)
+        }
+        rebuildRows(rebuildAssets: true)
+    }
+
+    /// persists a fetched bucket for offline browsing. fire and forget, off
+    /// the main actor - a lost write only costs a refetch next launch.
+    private func cacheBucket(_ id: String, assets: [Asset]) {
+        guard let client, let account = account(for: client) else { return }
+        let filter = filter
+        Task.detached(priority: .utility) {
+            TimelineCache.storeBucketAssets(assets, bucketID: id, filter: filter, account: account)
         }
     }
 
@@ -165,20 +214,46 @@ final class TimelineModel {
 
     private func reloadSections(using client: ImmichClient) async throws {
         let buckets = try await client.timeBuckets(filter)
-        if let host = client.apiURL.host() {
-            TimelineCache.store(buckets, for: filter, account: SessionCache.accountKey(host: host))
+        if let account = account(for: client) {
+            TimelineCache.store(buckets, for: filter, account: account)
         }
-        sections = Self.sections(from: buckets)
+        // diff instead of wipe: days already on screen - restored from disk or
+        // fetched live - stay put, and only what the fresh list says changed
+        // gets flagged for refetch.
+        let existingByID = Dictionary(sections.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var fresh: [TimelineSection] = []
+        for bucket in buckets {
+            if let existing = existingByID[bucket.timeBucket] {
+                if existing.count != bucket.count, existing.isLoaded {
+                    staleBucketIDs.insert(bucket.timeBucket)
+                }
+                fresh.append(TimelineSection(
+                    id: existing.id,
+                    monthTitle: existing.monthTitle,
+                    count: bucket.count,
+                    days: existing.days
+                ))
+            } else {
+                fresh.append(TimelineSection(
+                    id: bucket.timeBucket,
+                    monthTitle: Self.monthTitle(for: bucket.timeBucket),
+                    count: bucket.count,
+                    days: nil
+                ))
+            }
+        }
+        sections = fresh
+        staleBucketIDs.formIntersection(buckets.map(\.timeBucket))
         rebuildRows(rebuildAssets: true)
         if let first = sections.first { await loadBucket(first.id) }
         startPrefetch()
     }
 
-    func loadBucket(_ id: String, immediateRows: Bool = true) async {
+    func loadBucket(_ id: String, immediateRows: Bool = true, refresh: Bool = false) async {
         guard !isViewerSuspended,
               let client,
               let index = sections.firstIndex(where: { $0.id == id }),
-              sections[index].days == nil,
+              sections[index].days == nil || refresh,
               !inflightBuckets.contains(id)
         else { return }
         inflightBuckets.insert(id)
@@ -189,23 +264,54 @@ final class TimelineModel {
             guard !isViewerSuspended,
                   let current = sections.firstIndex(where: { $0.id == id })
             else { return }
+            staleBucketIDs.remove(id)
             sections[current].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
+            cacheBucket(id, assets: assets)
             if immediateRows {
                 rebuildRows(rebuildAssets: true)
             } else {
                 scheduleRebuild()
             }
+        } catch is CancellationError {
+            // leave the placeholder; a retry happens next time it scrolls in.
         } catch {
-            // leave the placeholder; a retry happens next time it scrolls into view.
+            // offline, most likely. the disk copy beats an empty placeholder,
+            // and a live retry happens next time the row scrolls into view.
+            await fallBackToCachedBucket(id)
         }
     }
 
+    /// offline fallback for a single bucket whose fetch just failed. only
+    /// fills placeholders - a failed refresh keeps the days it already had.
+    private func fallBackToCachedBucket(_ id: String) async {
+        guard let client, let account = account(for: client),
+              sections.first(where: { $0.id == id })?.days == nil
+        else { return }
+        let filter = filter
+        let cached = await Task.detached(priority: .utility) {
+            TimelineCache.bucketAssets(id, filter: filter, account: account)
+        }.value
+        guard let cached, !cached.isEmpty,
+              !isViewerSuspended,
+              let current = sections.firstIndex(where: { $0.id == id }),
+              sections[current].days == nil
+        else { return }
+        staleBucketIDs.insert(id)
+        sections[current].days = Self.groupByDay(cached, byUploadDate: filter.groupsByUploadDate)
+        scheduleRebuild()
+    }
+
     /// loads every remaining bucket in the background so heights become exact
-    /// and the scrubber can jump anywhere without triggering churn.
+    /// and the scrubber can jump anywhere without triggering churn. buckets
+    /// restored from disk count as remaining - they refetch here, so cached
+    /// launches end up exactly as fresh as uncached ones.
     private func startPrefetch() {
         guard !isViewerSuspended, prefetchTask == nil else { return }
-        let bucketIDs = sections.filter { !$0.isLoaded }.map(\.id)
-        guard !bucketIDs.isEmpty else { return }
+        let bucketIDs = sections.filter { !$0.isLoaded || staleBucketIDs.contains($0.id) }.map(\.id)
+        guard !bucketIDs.isEmpty else {
+            sweepThumbnailsIfNeeded()
+            return
+        }
         let id = UUID()
         prefetchID = id
         prefetchTask = Task { [weak self] in
@@ -218,12 +324,39 @@ final class TimelineModel {
             }
             for bucketID in bucketIDs {
                 guard !Task.isCancelled, !self.isViewerSuspended else { return }
-                await self.loadBucket(bucketID, immediateRows: false)
+                await self.loadBucket(
+                    bucketID,
+                    immediateRows: false,
+                    refresh: self.staleBucketIDs.contains(bucketID)
+                )
             }
             guard !Task.isCancelled, !self.isViewerSuspended else { return }
             self.rebuildPending = false
             self.rebuildRows(rebuildAssets: true)
+            // cleared here rather than left to the defer so the sweep sees a
+            // finished pass; the defer then has nothing left to reset.
+            if self.prefetchID == id {
+                self.prefetchTask = nil
+                self.prefetchID = nil
+            }
+            self.sweepThumbnailsIfNeeded()
         }
+    }
+
+    /// hands the whole library to the offline thumbnail sweep once the first
+    /// complete online pass settles. main merged timeline only - it is the
+    /// grid that spans everything. assets with a paired device copy render
+    /// from photokit and need no network, so they are skipped.
+    private func sweepThumbnailsIfNeeded() {
+        guard mergesLocal, hasLoaded, !hasSwept, prefetchTask == nil, let client else { return }
+        hasSwept = true
+        let urls = flatAssets.compactMap { asset -> URL? in
+            guard asset.localIdentifier == nil,
+                  backup?.localIdentifierByRemoteId[asset.id] == nil
+            else { return nil }
+            return client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash)
+        }
+        ImageLoader.shared.sweepThumbnails(urls: urls)
     }
 
     // MARK: - rows
@@ -416,6 +549,9 @@ final class TimelineModel {
         guard let client else { return }
         do {
             let buckets = try await client.timeBuckets(filter)
+            if let account = account(for: client) {
+                TimelineCache.store(buckets, for: filter, account: account)
+            }
             guard !isViewerSuspended else {
                 resyncPending = true
                 return
@@ -428,6 +564,13 @@ final class TimelineModel {
                 if let existing = existingByID[bucket.timeBucket] {
                     if existing.count == bucket.count {
                         fresh.append(existing)
+                        // an unchanged count does not clear a stale restore -
+                        // this is where offline-restored buckets get their
+                        // refetch once the server answers again.
+                        if staleBucketIDs.contains(bucket.timeBucket), existing.isLoaded {
+                            dirty = true
+                            toFetch.append(bucket.timeBucket)
+                        }
                     } else {
                         dirty = true
                         fresh.append(TimelineSection(
@@ -459,7 +602,9 @@ final class TimelineModel {
                 }
                 if let assets = try? await client.timeBucket(id, filter: filter),
                    let index = sections.firstIndex(where: { $0.id == id }) {
+                    staleBucketIDs.remove(id)
                     sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
+                    cacheBucket(id, assets: assets)
                 }
             }
             rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)

@@ -37,6 +37,9 @@ final class RealtimeHub {
     /// bumped after album events so album lists reload without a listener.
     private(set) var albumsGeneration = 0
     private(set) var isConnected = false
+    /// set when a connection drops or fails so the next successful connect
+    /// broadcasts a catch-up resync.
+    private var resyncOnConnect = false
     /// wired by sessionstore to the backup manager, which retires the device
     /// twins of assets the server has repainted.
     @ObservationIgnored var onRemoteEdit: ((Set<String>) -> Void)?
@@ -188,6 +191,12 @@ final class RealtimeHub {
                 } catch {
                     realtimeLog.info("socket dropped: \(error)")
                 }
+                // a dropped or refused socket means missed events; the next
+                // successful connect catches up immediately instead of
+                // waiting out the safety tick. this is also what turns an
+                // offline launch into a live grid the moment the network
+                // returns.
+                self.resyncOnConnect = true
                 self.isConnected = false
                 guard self.active, !Task.isCancelled else { return }
                 let jitter = Double.random(in: 0...0.4) * backoff
@@ -220,6 +229,10 @@ final class RealtimeHub {
             case .connected:
                 realtimeLog.info("socket connected")
                 isConnected = true
+                if resyncOnConnect {
+                    resyncOnConnect = false
+                    broadcastResyncNow()
+                }
             case .connectError(let detail):
                 throw ImmichError.http(401, detail)
             case .event(let name, let payload):

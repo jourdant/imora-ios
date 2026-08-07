@@ -176,8 +176,9 @@ nonisolated enum AssetVisibility: String, Codable {
     case locked
 }
 
-/// lightweight asset used across grids. built from timeline buckets or full dtos.
-nonisolated struct Asset: Identifiable, Hashable {
+/// lightweight asset used across grids. built from timeline buckets or full
+/// dtos. codable so fetched buckets can persist for offline browsing.
+nonisolated struct Asset: Identifiable, Hashable, Codable {
     let id: String
     let ownerId: String
     let isImage: Bool

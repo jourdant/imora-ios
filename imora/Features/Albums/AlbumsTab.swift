@@ -123,8 +123,21 @@ struct AlbumsTab: View {
     private func load() async {
         guard let client = session.client else { return }
         isLoading = true
+        let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
+        // a fresh tab paints the last known list first, and keeps it when the
+        // server is unreachable.
+        if albums.isEmpty, let account,
+           let cached: [Album] = OfflineCache.value(key: "albums", account: account) {
+            albums = cached
+        }
         if let fetched = try? await client.albums() {
             albums = fetched.sorted { $0.updatedAt > $1.updatedAt }
+            if let account {
+                let snapshot = albums
+                Task.detached(priority: .utility) {
+                    OfflineCache.store(snapshot, key: "albums", account: account)
+                }
+            }
         }
         isLoading = false
     }
