@@ -1091,6 +1091,15 @@ private struct AssetPage: View {
     }
 }
 
+/// the app's default ambient audio session is silenced by the ring switch.
+/// claiming playback before audible video makes sound play regardless, like
+/// the system photos app.
+private func activatePlaybackAudioSession() {
+    let audioSession = AVAudioSession.sharedInstance()
+    try? audioSession.setCategory(.playback, mode: .moviePlayback)
+    try? audioSession.setActive(true)
+}
+
 /// plays a device-only video straight from the photo library.
 private struct LocalVideoPage: View {
     let localIdentifier: String
@@ -1128,6 +1137,7 @@ private struct LocalVideoPage: View {
                 player = AVPlayer(playerItem: item)
             }
             player?.isMuted = isMuted
+            if !isMuted { activatePlaybackAudioSession() }
             player?.play()
         }
         .onDisappear { tearDownPlayer() }
@@ -1168,6 +1178,7 @@ private struct VideoPage: View {
                 player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
             }
             player?.isMuted = isMuted
+            if !isMuted { activatePlaybackAudioSession() }
             player?.play()
         }
         .onDisappear { tearDownPlayer() }
