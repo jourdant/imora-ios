@@ -61,7 +61,7 @@ private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
 
 /// pixels a page asks for. every warm-up has to name the same size to land on
 /// the request the page will make, so it lives next to both.
-private let pagePixelSize: CGFloat = 2048
+let pagePixelSize: CGFloat = 2048
 
 struct AssetViewerScreen: View {
     /// pages either side of the current one kept warm. the pager mounts a page
@@ -107,6 +107,7 @@ struct AssetViewerScreen: View {
     @State private var isDismissing = false
     @State private var didNotifyDismissal = false
     @State private var prefetcher = ThumbnailPrefetcher(targetPixelSize: pagePixelSize)
+    @State private var playback = VideoPlayback()
 
     init(
         assets: [Asset],
@@ -183,7 +184,8 @@ struct AssetViewerScreen: View {
                 AssetPager(
                     assets: assets,
                     selection: $selectedAssetID,
-                    mutesVideo: isContextPreview
+                    mutesVideo: isContextPreview,
+                    playback: playback
                 ) { id, isZoomed in
                     guard id == selectedAssetID else { return }
                     currentPageZoomed = isZoomed
@@ -202,10 +204,17 @@ struct AssetViewerScreen: View {
                     .allowsHitTesting(false)
             }
             .overlay(alignment: .bottom) {
-                if !isContextPreview, chromeVisible, let current, current.isLocal {
-                    backupStatePill(current)
-                        .padding(.bottom, 10)
-                        .transition(.opacity)
+                if !isContextPreview, chromeVisible, let current {
+                    VStack(spacing: 10) {
+                        if current.isLocal {
+                            backupStatePill(current)
+                        }
+                        if current.isVideo, playback.ownerID == current.id, playback.player != nil {
+                            VideoControlsBar(playback: playback)
+                        }
+                    }
+                    .padding(.bottom, 10)
+                    .transition(.opacity)
                 }
             }
             .toolbar { toolbarContent }
@@ -996,6 +1005,7 @@ private struct AssetPager: View {
     let assets: [Asset]
     @Binding var selection: String?
     let mutesVideo: Bool
+    let playback: VideoPlayback
     let onZoomChanged: (String, Bool) -> Void
 
     var body: some View {
@@ -1005,7 +1015,8 @@ private struct AssetPager: View {
                     AssetPage(
                         asset: asset,
                         isActive: asset.id == selection,
-                        mutesVideo: mutesVideo
+                        mutesVideo: mutesVideo,
+                        playback: playback
                     ) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
@@ -1027,6 +1038,7 @@ private struct AssetPage: View {
     let asset: Asset
     let isActive: Bool
     let mutesVideo: Bool
+    let playback: VideoPlayback
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -1053,28 +1065,25 @@ private struct AssetPage: View {
     }
 
     @ViewBuilder private var pageContent: some View {
-        if let localId = deviceIdentifier {
-            if asset.isVideo {
-                LocalVideoPage(
+        if asset.isVideo {
+            VideoPlayerPage(
+                asset: asset,
+                deviceIdentifier: deviceIdentifier,
+                isActive: isActive,
+                forcesMute: mutesVideo,
+                playback: playback,
+                onZoomChanged: onZoomChanged
+            )
+        } else if let localId = deviceIdentifier {
+            ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
+                LocalPhotoImage(
                     localIdentifier: localId,
-                    isActive: isActive,
-                    isMuted: mutesVideo,
-                    allowsNetwork: asset.isLocal,
+                    targetPixelSize: pagePixelSize,
+                    fallbackTargetPixelSize: 640,
+                    contentMode: .fit,
                     onUnavailable: { localUnavailable = true }
                 )
-            } else {
-                ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
-                    LocalPhotoImage(
-                        localIdentifier: localId,
-                        targetPixelSize: pagePixelSize,
-                        fallbackTargetPixelSize: 640,
-                        contentMode: .fit,
-                        onUnavailable: { localUnavailable = true }
-                    )
-                }
             }
-        } else if asset.isVideo {
-            VideoPage(asset: asset, isActive: isActive, isMuted: mutesVideo)
         } else if let client = session.client {
             // the thumbhash cache key re-renders the page when edits land.
             ZoomableScrollView(contentID: "\(asset.id)#\(asset.thumbhash ?? "")", onZoomChanged: onZoomChanged) {
@@ -1091,109 +1100,9 @@ private struct AssetPage: View {
     }
 }
 
-/// the app's default ambient audio session is silenced by the ring switch.
-/// claiming playback before audible video makes sound play regardless, like
-/// the system photos app.
-private func activatePlaybackAudioSession() {
-    let audioSession = AVAudioSession.sharedInstance()
-    try? audioSession.setCategory(.playback, mode: .moviePlayback)
-    try? audioSession.setActive(true)
-}
-
-/// plays a device-only video straight from the photo library.
-private struct LocalVideoPage: View {
-    let localIdentifier: String
-    let isActive: Bool
-    let isMuted: Bool
-    /// device-only assets have nowhere else to go, so they may pull from
-    /// icloud; a backed-up one falls back to the server stream instead.
-    var allowsNetwork = true
-    var onUnavailable: (() -> Void)?
-    @State private var player: AVPlayer?
-
-    var body: some View {
-        ZStack {
-            if let player {
-                VideoPlayer(player: player)
-            } else {
-                ProgressView().tint(.white)
-            }
-        }
-        .task(id: "\(localIdentifier):\(isActive):\(isMuted)") {
-            guard isActive else {
-                tearDownPlayer()
-                return
-            }
-            if player == nil {
-                let loaded = await LocalImageLoader.shared.playerItem(
-                    localIdentifier: localIdentifier,
-                    allowsNetwork: allowsNetwork
-                )
-                guard let item = loaded else {
-                    // the device copy is gone or stuck in icloud - stream the
-                    // server one rather than spinning forever.
-                    return onUnavailable?() ?? ()
-                }
-                player = AVPlayer(playerItem: item)
-            }
-            player?.isMuted = isMuted
-            if !isMuted { activatePlaybackAudioSession() }
-            player?.play()
-        }
-        .onDisappear { tearDownPlayer() }
-    }
-
-    private func tearDownPlayer() {
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-    }
-}
-
-private struct VideoPage: View {
-    @Environment(SessionStore.self) private var session
-    let asset: Asset
-    let isActive: Bool
-    let isMuted: Bool
-    @State private var player: AVPlayer?
-
-    var body: some View {
-        ZStack {
-            if let player {
-                VideoPlayer(player: player)
-            } else {
-                ProgressView().tint(.white)
-            }
-        }
-        .task(id: "\(asset.id):\(isActive):\(isMuted)") {
-            guard isActive else {
-                tearDownPlayer()
-                return
-            }
-            if player == nil, let client = session.client {
-                let asset = AVURLAsset(
-                    url: client.playbackURL(assetID: self.asset.id),
-                    options: ["AVURLAssetHTTPHeaderFieldsKey": client.authHeaders]
-                )
-                player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
-            }
-            player?.isMuted = isMuted
-            if !isMuted { activatePlaybackAudioSession() }
-            player?.play()
-        }
-        .onDisappear { tearDownPlayer() }
-    }
-
-    private func tearDownPlayer() {
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-    }
-}
-
 // MARK: - zoom container
 
-private struct ZoomableScrollView<Content: View>: UIViewRepresentable {
+struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     let contentID: String
     let onZoomChanged: (Bool) -> Void
     @ViewBuilder let content: Content
