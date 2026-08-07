@@ -192,6 +192,7 @@ struct AssetViewerScreen: View {
                     onPageZoomChanged(isZoomed)
                 }
                 .ignoresSafeArea()
+                .scrollEdgeEffectHidden(true, for: .top)
                 .onTapGesture {
                     withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
                         chromeVisible.toggle()
@@ -220,6 +221,9 @@ struct AssetViewerScreen: View {
             .toolbar { toolbarContent }
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .navigationBar)
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .bottomBar)
+            // the header stays fully transparent: no bar backdrop, no top
+            // scroll edge blur, just the floating glass controls and pill.
+            .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
             .navigationBarTitleDisplayMode(.inline)
         }
         .statusBarHidden(isContextPreview || !chromeVisible)
@@ -379,13 +383,7 @@ struct AssetViewerScreen: View {
 
         ToolbarItem(placement: .principal) {
             if let current {
-                VStack(spacing: 1) {
-                    Text(current.localDate, format: dateTitleFormat(for: current.localDate))
-                        .font(.subheadline.weight(.semibold))
-                    Text(current.localDate, format: .dateTime.hour().minute().utc())
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                titlePill(current)
             }
         }
 
@@ -643,6 +641,38 @@ struct AssetViewerScreen: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .glassEffect(.regular, in: .capsule)
+    }
+
+    /// floating glass title: the place when known, the relative day and time.
+    private func titlePill(_ current: Asset) -> some View {
+        let date = current.localDate
+        let day = relativeDayLabel(for: date) ?? date.formatted(dateTitleFormat(for: date))
+        let time = date.formatted(.dateTime.hour().minute().utc())
+        let place = current.city ?? current.country
+        return VStack(spacing: 1) {
+            Text(place ?? day)
+                .font(.subheadline.weight(.semibold))
+            Text(place == nil ? time : "\(day), \(time)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    /// today and yesterday compare the asset's local wall clock against the
+    /// device's, both mapped into the utc calendar space the viewer formats in.
+    private func relativeDayLabel(for date: Date) -> String? {
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let todayWall = Date().addingTimeInterval(TimeInterval(TimeZone.current.secondsFromGMT()))
+        if calendar.isDate(date, inSameDayAs: todayWall) { return String(localized: "Today") }
+        if let yesterdayWall = calendar.date(byAdding: .day, value: -1, to: todayWall),
+           calendar.isDate(date, inSameDayAs: yesterdayWall) {
+            return String(localized: "Yesterday")
+        }
+        return nil
     }
 
     /// photos-style title: day and month, with the year once it differs from
