@@ -112,6 +112,13 @@ final class SessionStore {
         cacheSnapshot()
     }
 
+    /// called after the user grants library access mid-session, so the change
+    /// observer, badges and auto backup pick it up without a relaunch.
+    func adoptPhotoAccess() async {
+        await backup?.primeLocalState()
+        backup?.startIfIdle()
+    }
+
     /// the share extension uploads with this session, and the app group is
     /// all it can read.
     private func mirrorForShareExtension(apiURL: URL) {

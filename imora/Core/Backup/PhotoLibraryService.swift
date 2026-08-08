@@ -73,16 +73,12 @@ nonisolated enum PhotoLibraryService {
         PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
     }
 
+    /// every request funnels through here so the observable mirror stays
+    /// current no matter which action triggered the prompt.
     static func requestFullAccess() async -> Bool {
-        await PHPhotoLibrary.requestAuthorization(for: .readWrite) == .authorized
-    }
-
-    /// true when the user must go through system settings to grant full access.
-    static var accessIsBlocked: Bool {
-        switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
-        case .denied, .restricted, .limited: true
-        default: false
-        }
+        let granted = await PHPhotoLibrary.requestAuthorization(for: .readWrite) == .authorized
+        await PhotoAccess.shared.refresh()
+        return granted
     }
 
     // MARK: - scanning

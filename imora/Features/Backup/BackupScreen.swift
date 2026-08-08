@@ -46,7 +46,18 @@ struct BackupScreen: View {
     @ViewBuilder
     private func statusSection(_ backup: BackupManager) -> some View {
         Section("Status") {
-            if PhotoLibraryService.accessIsBlocked {
+            if PhotoAccess.shared.canAsk {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Full photo library access is required for backup.")
+                        .font(.callout)
+                    Button("Allow Access") {
+                        requestAccess()
+                    }
+                    .font(.callout.weight(.semibold))
+                    .accessibilityIdentifier("backup-allow-access")
+                }
+                .padding(.vertical, 2)
+            } else if PhotoAccess.shared.isBlocked {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Full photo library access is required for backup.")
                         .font(.callout)
@@ -84,6 +95,13 @@ struct BackupScreen: View {
                 .disabled(cleanup == .verifying || cleanup == .deleting)
                 .accessibilityIdentifier("backup-start")
             }
+        }
+    }
+
+    private func requestAccess() {
+        Task {
+            guard await PhotoLibraryService.requestFullAccess() else { return }
+            await session.adoptPhotoAccess()
         }
     }
 

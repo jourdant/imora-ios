@@ -11,7 +11,10 @@ struct TimelineTab: View {
                 filter: TimelineFilter(withPartners: true, withStacked: true),
                 mergesLocalPhotos: true
             ) {
-                MemoryLane()
+                VStack(spacing: 0) {
+                    LocalPhotosBanner()
+                    MemoryLane()
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

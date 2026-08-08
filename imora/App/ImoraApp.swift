@@ -64,11 +64,11 @@ struct RootView: View {
         }
         .animation(.smooth, value: session.state)
         .task {
-            // full access is asked once at launch so saving to the device or
-            // backup never stalls on the system dialog mid-action.
-            guard await PhotoLibraryService.requestFullAccess() else { return }
-            // a grant landing after the session was adopted has to re-prime
-            // the observer, badges and auto backup by hand.
+            // never prompts at launch - access is asked from the timeline
+            // banner or the backup settings instead. an already granted
+            // session still primes here so device photos show even when
+            // refreshuser cannot reach the server.
+            guard PhotoLibraryService.hasFullAccess else { return }
             await session.backup?.primeLocalState()
             session.backup?.startIfIdle()
         }
