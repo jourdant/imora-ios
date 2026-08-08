@@ -41,6 +41,7 @@ private final class ScrubberState {
 struct TimelineScreen<Header: View>: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openURL) private var openURL
 
     let title: String
     let filter: TimelineFilter
@@ -71,6 +72,14 @@ struct TimelineScreen<Header: View>: View {
     @State private var scrollContext = ScrollContext()
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
+    @State private var pendingEditAsset: Asset?
+    @State private var preparedShare: PreparedAssetShare?
+    @State private var sharingAssetIDs = Set<String>()
+    @State private var downloadingAssetIDs = Set<String>()
+    /// Downloads update the persisted pairing asynchronously. Keeping the new
+    /// identifier here makes a reopened context menu correct immediately.
+    @State private var downloadedLocalIdentifiers: [String: String] = [:]
+    @State private var actionError: String?
     @State private var columnCount = 3
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
@@ -266,6 +275,31 @@ struct TimelineScreen<Header: View>: View {
                 exitSelection()
             }
         }
+        .sheet(item: $preparedShare) { share in
+            TimelineShareSheet(url: share.url)
+        }
+        .fullScreenCover(item: $pendingEditAsset) { asset in
+            AssetEditScreen(asset: asset) { outcome in
+                guard case .saved(let detail) = outcome else { return }
+                model.updateAssets(ids: [asset.id]) { current in
+                    if let thumbhash = detail?.thumbhash { current.thumbhash = thumbhash }
+                }
+                // The device original is no longer a valid render source for
+                // the edited server asset, even when refreshing its detail fails.
+                session.backup?.noteRemoteEdits([asset.id])
+            }
+        }
+        .alert(
+            "Action Failed",
+            isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
     }
 
     // MARK: - rows
@@ -316,18 +350,19 @@ struct TimelineScreen<Header: View>: View {
                 .frame(height: 56, alignment: .bottomLeading)
 
         case .dayHeader(_, let dayTitle, let assetIDs):
+            let selectableIDs = assetIDs.filter(isSelectableAssetID)
             HStack {
                 Text(dayTitle)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if isSelecting, !assetIDs.isEmpty {
-                    let allSelected = assetIDs.allSatisfy { selection.contains($0) }
+                if isSelecting, !selectableIDs.isEmpty {
+                    let allSelected = selectableIDs.allSatisfy { selection.contains($0) }
                     Button {
                         if allSelected {
-                            selection.subtract(assetIDs)
+                            selection.subtract(selectableIDs)
                         } else {
-                            selection.formUnion(assetIDs)
+                            selection.formUnion(selectableIDs)
                         }
                     } label: {
                         Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
@@ -371,7 +406,7 @@ struct TimelineScreen<Header: View>: View {
         if isSelecting {
             AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
                 .overlay(alignment: .topLeading) {
-                    if !asset.isLocal {
+                    if isSelectable(asset) {
                         Image(systemName: selection.contains(asset.id) ? "checkmark.circle.fill" : "circle")
                             .font(.title3)
                             .symbolRenderingMode(.palette)
@@ -387,8 +422,7 @@ struct TimelineScreen<Header: View>: View {
                     }
                 }
                 .onTapGesture {
-                    // server actions cannot target device-only photos.
-                    if !asset.isLocal { toggle(asset) }
+                    if isSelectable(asset) { toggle(asset) }
                 }
         } else {
             InteractiveAssetTile(
@@ -409,77 +443,203 @@ struct TimelineScreen<Header: View>: View {
 
     // MARK: - context menu
 
-    /// single-asset menu behind the long-press preview. mirrors the action
-    /// set of the selection bar for the current screen.
+    /// Single-asset menu behind the long-press preview. Eligibility comes from
+    /// the same device/server/owner policy as the viewer, so partner assets and
+    /// paired device copies cannot accidentally receive owner-only actions.
     private func menuElements(for asset: Asset) -> [UIMenuElement] {
-        if asset.isLocal { return localMenuElements(for: asset) }
-        var main: [UIMenuElement] = []
-        if filter.isTrashed == true {
-            main.append(UIAction(title: "Restore", image: UIImage(systemName: "arrow.uturn.backward")) { _ in
-                Task { await restore(ids: [asset.id]) }
+        let serverID = serverIdentifier(for: asset)
+        let pairedLocalID = pairedLocalIdentifier(for: asset)
+        let availability = AssetActionAvailability(
+            asset: asset,
+            ownsAsset: owns(asset),
+            localRemoteIdentifier: asset.isLocal ? serverID : nil,
+            pairedLocalIdentifier: pairedLocalID
+        )
+
+        var primary: [UIMenuElement] = []
+        if availability.canRestore, let serverID {
+            primary.append(UIAction(title: "Restore", image: UIImage(systemName: "arrow.uturn.backward")) { _ in
+                Task { _ = await restore(ids: [serverID]) }
             })
-        } else {
-            main.append(UIAction(
+        }
+        if availability.canFavorite, let serverID {
+            primary.append(UIAction(
                 title: asset.isFavorite ? "Unfavorite" : "Favorite",
                 image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart")
             ) { _ in
-                Task { await favorite(ids: [asset.id], value: !asset.isFavorite) }
+                Task { _ = await favorite(ids: [serverID], value: !asset.isFavorite) }
             })
-            main.append(UIAction(title: "Add to Album", image: UIImage(systemName: "rectangle.stack.badge.plus")) { _ in
-                pendingAlbumAssets = [asset.id]
+        }
+        if availability.canEdit {
+            primary.append(UIAction(title: "Edit", image: UIImage(systemName: "slider.horizontal.3")) { _ in
+                pendingEditAsset = asset
             })
-            if filter.albumId != nil {
-                main.append(UIAction(title: "Remove from Album", image: UIImage(systemName: "rectangle.stack.badge.minus")) { _ in
-                    Task { await removeFromAlbum(ids: [asset.id]) }
-                })
+        }
+        if availability.canAddToAlbum, let serverID {
+            primary.append(UIAction(title: "Add to Album", image: UIImage(systemName: "rectangle.stack.badge.plus")) { _ in
+                pendingAlbumAssets = [serverID]
+            })
+        }
+        if canRemoveFromAlbum(asset), let serverID {
+            primary.append(UIAction(title: "Remove from Album", image: UIImage(systemName: "rectangle.stack.badge.minus")) { _ in
+                Task { _ = await removeFromAlbum(ids: [serverID]) }
+            })
+        }
+        if availability.canArchive, let serverID {
+            let isArchived = asset.visibility == .archive
+            primary.append(UIAction(
+                title: isArchived ? "Unarchive" : "Archive",
+                image: UIImage(systemName: isArchived ? "tray.and.arrow.up" : "archivebox")
+            ) { _ in
+                Task { _ = await setVisibility(ids: [serverID], isArchived ? .timeline : .archive) }
+            })
+        }
+        if isSelectable(asset) {
+            primary.append(UIAction(title: "Select", image: UIImage(systemName: "checkmark.circle")) { _ in
+                isSelecting = true
+                selection.insert(asset.id)
+            })
+        }
+
+        var transfer: [UIMenuElement] = []
+        if sharingAssetIDs.contains(asset.id) {
+            transfer.append(UIAction(
+                title: "Preparing Share…",
+                image: UIImage(systemName: "square.and.arrow.up"),
+                attributes: .disabled
+            ) { _ in })
+        } else {
+            transfer.append(UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { _ in
+                Task { await share(asset) }
+            })
+        }
+        if asset.isLocal, let localID = asset.localIdentifier {
+            transfer.append(backupMenuElement(for: asset, localID: localID, availability: availability))
+        }
+        if availability.canDownload {
+            if downloadingAssetIDs.contains(asset.id) {
+                transfer.append(UIAction(
+                    title: "Downloading…",
+                    image: UIImage(systemName: "arrow.down.circle.dotted"),
+                    attributes: .disabled
+                ) { _ in })
             } else {
-                main.append(UIAction(
-                    title: filter.visibility == .archive ? "Unarchive" : "Archive",
-                    image: UIImage(systemName: filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox")
-                ) { _ in
-                    Task { await setVisibility(ids: [asset.id], filter.visibility == .archive ? .timeline : .archive) }
+                transfer.append(UIAction(title: "Download to Device", image: UIImage(systemName: "arrow.down.circle")) { _ in
+                    Task { await download(asset) }
                 })
             }
         }
-        main.append(UIAction(title: "Select", image: UIImage(systemName: "checkmark.circle")) { _ in
-            isSelecting = true
-            selection.insert(asset.id)
-        })
-        let trash = UIAction(
-            title: filter.isTrashed == true ? "Delete" : "Move to Trash",
-            image: UIImage(systemName: "trash"),
-            attributes: .destructive
-        ) { _ in
-            Task { await self.trash(ids: [asset.id]) }
+        if let serverID, !asset.isTrashed {
+            transfer.append(UIAction(title: "Open in Browser", image: UIImage(systemName: "safari")) { _ in
+                Task { await openInBrowser(serverID: serverID) }
+            })
         }
-        return [
-            UIMenu(options: .displayInline, children: main),
-            UIMenu(options: .displayInline, children: [trash]),
-        ]
+
+        var destructive: [UIMenuElement] = []
+        if availability.canDeleteFromDevice, let pairedLocalID {
+            destructive.append(UIAction(
+                title: "Delete from This Device",
+                image: UIImage(systemName: "iphone.slash"),
+                attributes: .destructive
+            ) { _ in
+                Task { await deleteFromDevice(asset: asset, localID: pairedLocalID) }
+            })
+        }
+        if availability.canTrashEverywhere, serverID != nil {
+            destructive.append(UIAction(
+                title: pairedLocalID == nil ? "Move to Trash" : "Move to Trash Everywhere",
+                image: UIImage(systemName: "trash"),
+                attributes: .destructive
+            ) { _ in
+                Task { _ = await deleteAssets([asset], force: false) }
+            })
+        }
+        if availability.canDeletePermanently, serverID != nil {
+            destructive.append(UIAction(
+                title: "Delete Permanently",
+                image: UIImage(systemName: "trash.slash"),
+                attributes: .destructive
+            ) { _ in
+                Task { _ = await deleteAssets([asset], force: true) }
+            })
+        }
+
+        var sections: [UIMenuElement] = []
+        if !primary.isEmpty { sections.append(UIMenu(options: .displayInline, children: primary)) }
+        if !transfer.isEmpty { sections.append(UIMenu(options: .displayInline, children: transfer)) }
+        if !destructive.isEmpty { sections.append(UIMenu(options: .displayInline, children: destructive)) }
+        return sections
     }
 
-    /// device-only photos have no server actions. deletion goes through the
-    /// system photo library dialog, so no extra confirmation is needed, and
-    /// the library observer removes the tile once the change lands.
-    private func localMenuElements(for asset: Asset) -> [UIMenuElement] {
-        guard let localId = asset.localIdentifier else { return [] }
-        let delete = UIAction(
-            title: "Delete from Device",
-            image: UIImage(systemName: "trash"),
-            attributes: .destructive
-        ) { _ in
-            Task {
-                // declining the system dialog throws and must not be
-                // recorded as a deletion.
-                do {
-                    try await PhotoLibraryService.delete(localIdentifiers: [localId])
-                } catch {
-                    return
-                }
-                session.backup?.noteLocalDeletion([localId])
+    private func backupMenuElement(
+        for asset: Asset,
+        localID: String,
+        availability: AssetActionAvailability
+    ) -> UIMenuElement {
+        switch session.backup?.uploadStates[localID] {
+        case .uploading(let fraction):
+            let percent = Int((fraction * 100).rounded())
+            return UIAction(
+                title: "Backing Up… \(percent)%",
+                image: UIImage(systemName: "icloud.and.arrow.up"),
+                attributes: .disabled
+            ) { _ in }
+        case .failed:
+            return UIAction(title: "Retry Backup", image: UIImage(systemName: "exclamationmark.icloud")) { _ in
+                Task { await backUp(localID: localID) }
+            }
+        case nil:
+            if !availability.canBackUp {
+                return UIAction(
+                    title: "Backed Up",
+                    image: UIImage(systemName: "checkmark.icloud"),
+                    attributes: .disabled
+                ) { _ in }
+            }
+            guard session.backup != nil else {
+                return UIAction(
+                    title: "Backup Unavailable",
+                    image: UIImage(systemName: "icloud.slash"),
+                    attributes: .disabled
+                ) { _ in }
+            }
+            return UIAction(title: "Back Up Now", image: UIImage(systemName: "icloud.and.arrow.up")) { _ in
+                Task { await backUp(localID: localID) }
             }
         }
-        return [UIMenu(options: .displayInline, children: [delete])]
+    }
+
+    private func serverIdentifier(for asset: Asset) -> String? {
+        guard asset.isLocal else { return asset.id }
+        guard let localID = asset.localIdentifier else { return nil }
+        return session.backup?.remoteIdentifierByLocalId[localID]
+    }
+
+    private func pairedLocalIdentifier(for asset: Asset) -> String? {
+        if let localID = asset.localIdentifier { return localID }
+        return downloadedLocalIdentifiers[asset.id]
+            ?? session.backup?.pairedLocalIdentifierByRemoteId[asset.id]
+    }
+
+    private func owns(_ asset: Asset) -> Bool {
+        if asset.isLocal { return true }
+        guard let userID = session.user?.id else { return true }
+        return asset.ownerId == userID
+    }
+
+    private func canRemoveFromAlbum(_ asset: Asset) -> Bool {
+        guard filter.albumId != nil, !asset.isLocal else { return false }
+        guard let userID = session.user?.id else { return true }
+        return asset.ownerId == userID || albumOwnerID == userID
+    }
+
+    private func isSelectable(_ asset: Asset) -> Bool {
+        !asset.isLocal && owns(asset)
+    }
+
+    private func isSelectableAssetID(_ id: String) -> Bool {
+        guard let index = model.flatAssetIndex(for: id) else { return false }
+        return isSelectable(model.flatAssets[index])
     }
 
     @ViewBuilder private var overlayState: some View {
@@ -628,82 +788,224 @@ struct TimelineScreen<Header: View>: View {
 
     // MARK: - asset actions
 
-    private func favorite(ids: [String], value: Bool) async {
-        guard let client = session.client else { return }
-        try? await client.setFavorite(ids: ids, value)
-        model.updateAssets(ids: Set(ids)) { $0.isFavorite = value }
-    }
-
-    private func setVisibility(ids: [String], _ value: AssetVisibility) async {
-        guard let client = session.client else { return }
-        try? await client.setVisibility(ids: ids, value)
-        model.removeAssets(ids: Set(ids))
-    }
-
-    /// false when the user declines deleting the paired device copies.
     @discardableResult
-    private func trash(ids: [String]) async -> Bool {
-        guard let client = session.client else { return false }
-        // a server delete also removes device copies when they exist. declining
-        // the system dialog aborts the whole delete.
-        if let backup = session.backup {
-            var localIds: [String] = []
-            for id in ids {
-                if let localId = await backup.localIdentifier(forRemote: id) {
-                    localIds.append(localId)
-                }
+    private func favorite(ids: [String], value: Bool) async -> Bool {
+        guard let client = session.client else {
+            actionError = "The server is not available."
+            return false
+        }
+        do {
+            try await client.setFavorite(ids: ids, value)
+            model.updateAssets(ids: Set(ids)) { $0.isFavorite = value }
+            return true
+        } catch {
+            actionError = "Could not update favorites: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    private func setVisibility(ids: [String], _ value: AssetVisibility) async -> Bool {
+        guard let client = session.client else {
+            actionError = "The server is not available."
+            return false
+        }
+        do {
+            try await client.setVisibility(ids: ids, value)
+            model.removeAssets(ids: Set(ids))
+            return true
+        } catch {
+            actionError = value == .archive
+                ? "Could not archive: \(error.localizedDescription)"
+                : "Could not unarchive: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func share(_ asset: Asset) async {
+        guard sharingAssetIDs.insert(asset.id).inserted else { return }
+        defer { sharingAssetIDs.remove(asset.id) }
+        do {
+            let url: URL
+            if let localID = asset.localIdentifier {
+                url = try await LocalSharedAssetFile(localIdentifier: localID).exportedURL()
+            } else if let client = session.client {
+                url = try await SharedAssetFile(client: client, asset: asset).exportedURL()
+            } else {
+                actionError = "Sharing is not available while signed out."
+                return
             }
-            if !localIds.isEmpty {
-                do {
-                    try await PhotoLibraryService.delete(localIdentifiers: localIds)
-                } catch {
-                    return false
-                }
-                backup.noteLocalDeletion(localIds)
+            preparedShare = PreparedAssetShare(url: url)
+        } catch {
+            actionError = "Could not prepare this item for sharing: \(error.localizedDescription)"
+        }
+    }
+
+    private func backUp(localID: String) async {
+        guard let backup = session.backup else {
+            actionError = "Backup is not available."
+            return
+        }
+        do {
+            _ = try await backup.backUp(localIdentifier: localID)
+            await model.refreshLocalItems()
+        } catch {
+            actionError = "Could not back up: \(error.localizedDescription)"
+        }
+    }
+
+    private func download(_ asset: Asset) async {
+        guard let backup = session.backup else {
+            actionError = "Download is not available."
+            return
+        }
+        guard downloadingAssetIDs.insert(asset.id).inserted else { return }
+        defer { downloadingAssetIDs.remove(asset.id) }
+        do {
+            downloadedLocalIdentifiers[asset.id] = try await backup.download(asset: asset)
+        } catch {
+            actionError = "Could not download: \(error.localizedDescription)"
+        }
+    }
+
+    private func openInBrowser(serverID: String) async {
+        guard let client = session.client else {
+            actionError = "The server is not available."
+            return
+        }
+        let base = await client.serverWebURL()
+        openURL(base.appending(path: "photos/\(serverID)"))
+    }
+
+    private func deleteFromDevice(asset: Asset, localID: String) async {
+        do {
+            try await PhotoLibraryService.delete(localIdentifiers: [localID])
+        } catch {
+            if !PhotoLibraryService.isUserCancelled(error) {
+                actionError = "Could not delete from this device: \(error.localizedDescription)"
+            }
+            return
+        }
+        downloadedLocalIdentifiers[asset.id] = nil
+        session.backup?.noteLocalDeletion([localID])
+    }
+
+    /// Device deletion happens first so cancelling the system prompt leaves the
+    /// server untouched. If the later server call fails, the remote grid item is
+    /// preserved and the partial result is reported instead of hidden.
+    @discardableResult
+    private func deleteAssets(_ assets: [Asset], force: Bool) async -> Bool {
+        guard let client = session.client else {
+            actionError = "The server is not available."
+            return false
+        }
+        let targets = assets.compactMap { asset -> (sourceID: String, serverID: String)? in
+            serverIdentifier(for: asset).map { (asset.id, $0) }
+        }
+        guard targets.count == assets.count, !targets.isEmpty else {
+            actionError = "This item does not have a server copy yet."
+            return false
+        }
+
+        var localIDs = Set<String>()
+        for (asset, target) in zip(assets, targets) {
+            if let localID = pairedLocalIdentifier(for: asset) {
+                localIDs.insert(localID)
+            } else if let backup = session.backup,
+                      let localID = await backup.localIdentifier(forRemote: target.serverID) {
+                localIDs.insert(localID)
             }
         }
-        try? await client.trashAssets(ids: ids)
-        model.removeAssets(ids: Set(ids))
+        if !localIDs.isEmpty {
+            do {
+                try await PhotoLibraryService.delete(localIdentifiers: Array(localIDs))
+            } catch {
+                if !PhotoLibraryService.isUserCancelled(error) {
+                    actionError = "Could not delete from this device: \(error.localizedDescription)"
+                }
+                return false
+            }
+            session.backup?.noteLocalDeletion(Array(localIDs))
+            for target in targets { downloadedLocalIdentifiers[target.serverID] = nil }
+        }
+
+        do {
+            try await client.trashAssets(ids: targets.map { $0.serverID }, force: force)
+        } catch {
+            let operation = force ? "delete permanently" : "move to trash"
+            actionError = localIDs.isEmpty
+                ? "Could not \(operation): \(error.localizedDescription)"
+                : "Deleted from this device, but the server copy could not be deleted: \(error.localizedDescription)"
+            return false
+        }
+        model.removeAssets(ids: Set(targets.map { $0.sourceID }))
         return true
     }
 
-    private func restore(ids: [String]) async {
-        guard let client = session.client else { return }
-        try? await client.restoreAssets(ids: ids)
-        model.removeAssets(ids: Set(ids))
+    @discardableResult
+    private func restore(ids: [String]) async -> Bool {
+        guard let client = session.client else {
+            actionError = "The server is not available."
+            return false
+        }
+        do {
+            try await client.restoreAssets(ids: ids)
+            model.removeAssets(ids: Set(ids))
+            return true
+        } catch {
+            actionError = "Could not restore: \(error.localizedDescription)"
+            return false
+        }
     }
 
-    private func removeFromAlbum(ids: [String]) async {
-        guard let client = session.client, let albumID = filter.albumId else { return }
-        _ = try? await client.removeAssets(albumID: albumID, ids: ids)
-        model.removeAssets(ids: Set(ids))
+    /// Returns only the ids the server actually removed. Immich can accept a
+    /// bulk request while rejecting individual assets for permission reasons.
+    private func removeFromAlbum(ids: [String]) async -> Set<String> {
+        guard let client = session.client, let albumID = filter.albumId else {
+            actionError = "The album is not available."
+            return []
+        }
+        do {
+            let results = try await client.removeAssets(albumID: albumID, ids: ids)
+            let removed = Set(results.filter(\.success).map(\.id))
+            model.removeAssets(ids: removed)
+            if removed.count != Set(ids).count {
+                actionError = "Some items could not be removed from the album."
+            }
+            return removed
+        } catch {
+            actionError = "Could not remove from the album: \(error.localizedDescription)"
+            return []
+        }
     }
 
     // MARK: - bulk actions
 
     private func applyFavorite() async {
-        await favorite(ids: Array(selection), value: true)
+        guard await favorite(ids: Array(selection), value: true) else { return }
         exitSelection()
     }
 
     private func applyVisibility(_ value: AssetVisibility) async {
-        await setVisibility(ids: Array(selection), value)
+        guard await setVisibility(ids: Array(selection), value) else { return }
         exitSelection()
     }
 
     private func applyTrash() async {
-        guard await trash(ids: Array(selection)) else { return }
+        let selected = model.flatAssets.filter { selection.contains($0.id) && isSelectable($0) }
+        guard await deleteAssets(selected, force: filter.isTrashed == true) else { return }
         exitSelection()
     }
 
     private func applyRestore() async {
-        await restore(ids: Array(selection))
+        guard await restore(ids: Array(selection)) else { return }
         exitSelection()
     }
 
     private func applyRemoveFromAlbum() async {
-        await removeFromAlbum(ids: Array(selection))
-        exitSelection()
+        let removed = await removeFromAlbum(ids: Array(selection))
+        selection.subtract(removed)
+        if selection.isEmpty { exitSelection() }
     }
 
     private func showScrubber() {
@@ -736,6 +1038,27 @@ struct TimelineScreen<Header: View>: View {
             scrubberGrabbable = false
         }
     }
+}
+
+private struct PreparedAssetShare: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+/// UIKit owns context-menu actions, so their asynchronously prepared export is
+/// handed to the system share controller through a small SwiftUI sheet bridge.
+private struct TimelineShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in
+            try? FileManager.default.removeItem(at: url)
+        }
+        return controller
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 extension [String]: @retroactive Identifiable {
@@ -941,10 +1264,17 @@ private struct SelectionActionBar: View {
                     barButton("rectangle.stack.badge.minus", "Remove") { Task { await onRemoveFromAlbum() } }
                 } else {
                     barButton("heart", "Favorite") { Task { await onFavorite() } }
-                    barButton(filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox", "Archive") { Task { await onArchive() } }
+                    barButton(
+                        filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox",
+                        filter.visibility == .archive ? "Unarchive" : "Archive"
+                    ) { Task { await onArchive() } }
                     barButton("rectangle.stack.badge.plus", "Album", action: onAddToAlbum)
                 }
-                barButton("trash", "Trash", role: .destructive) { Task { await onTrash() } }
+                barButton(
+                    filter.isTrashed == true ? "trash.slash" : "trash",
+                    filter.isTrashed == true ? "Delete" : "Trash",
+                    role: .destructive
+                ) { Task { await onTrash() } }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 10)

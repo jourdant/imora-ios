@@ -35,6 +35,20 @@ nonisolated enum LocalUploadState: Equatable, Sendable {
     case failed
 }
 
+nonisolated enum SingleAssetBackupError: LocalizedError {
+    case missing
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missing:
+            "the photo is no longer available on this device."
+        case .failed(let reason):
+            reason
+        }
+    }
+}
+
 /// device asset paired with what the backup index knows about it.
 nonisolated struct LocalTimelineItem: Sendable {
     let device: DeviceAsset
@@ -80,6 +94,13 @@ final class BackupManager {
     /// finished uploading keeps rendering the same local thumbnail while the
     /// server thumbnail loads - the swap never flashes.
     private(set) var localIdentifierByRemoteId: [String: String] = [:]
+    /// every verified index pairing, including server assets whose pixels were
+    /// edited after upload. Action availability needs presence, while rendering
+    /// deliberately uses the stricter map above.
+    private(set) var pairedLocalIdentifierByRemoteId: [String: String] = [:]
+    /// inverse of the complete pairing map. A still-open local viewer uses this
+    /// immediately after a manual upload to address its new server copy.
+    private(set) var remoteIdentifierByLocalId: [String: String] = [:]
     /// wired by sessionstore to the realtime hub, which debounces.
     var onLocalChange: (() -> Void)?
     /// wired by sessionstore to raise the end-of-run notification. carries the
@@ -218,10 +239,17 @@ final class BackupManager {
     private func localChanged() {
         Task { [weak self] in
             guard let self else { return }
-            self.backedUpRemoteIds = await self.index.backedUpRemoteIds()
-            self.localIdentifierByRemoteId = await self.index.renderableRemoteToLocalMap()
-            self.onLocalChange?()
+            await self.refreshLocalSnapshots()
         }
+    }
+
+    private func refreshLocalSnapshots() async {
+        let pairs = await index.remoteToLocalMap()
+        backedUpRemoteIds = await index.backedUpRemoteIds()
+        pairedLocalIdentifierByRemoteId = pairs
+        remoteIdentifierByLocalId = Dictionary(uniqueKeysWithValues: pairs.map { ($0.value, $0.key) })
+        localIdentifierByRemoteId = await index.renderableRemoteToLocalMap()
+        onLocalChange?()
     }
 
     /// the server repainted these assets, so their device twins are stale
@@ -242,11 +270,9 @@ final class BackupManager {
     func primeLocalState() async {
         guard let userId else { return }
         await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
-        backedUpRemoteIds = await index.backedUpRemoteIds()
-        localIdentifierByRemoteId = await index.renderableRemoteToLocalMap()
+        await refreshLocalSnapshots()
         updateChangeObserver()
         adoptBackgroundUploads()
-        onLocalChange?()
     }
 
     // MARK: - background uploads
@@ -601,6 +627,7 @@ final class BackupManager {
             }
         }
         guard let entry else { return .failed("no index entry") }
+        if entry.unsupported { return .failed("this file format is not supported by the server.") }
         if entry.isBackedUp { return .duplicate }
 
         let createdAt = current.creationDate ?? current.modificationDate ?? Date()
@@ -671,6 +698,82 @@ final class BackupManager {
 
     // MARK: - viewer support
 
+    /// Backs up exactly one device asset. This is intentionally independent of
+    /// automatic-backup preferences: tapping Back Up is an explicit user action.
+    /// The existing per-item pipeline retains checksum deduplication, Live Photo
+    /// ordering, background transfer support, and progress reporting.
+    func backUp(localIdentifier: String) async throws -> String {
+        guard await PhotoLibraryService.requestFullAccess() else {
+            throw ImmichError.http(0, "full photo library access is required for backup.")
+        }
+        let user = try await client.currentUser()
+        userId = user.id
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: user.id)
+
+        if case .uploading = uploadStates[localIdentifier] {
+            try await waitForUpload(localIdentifier: localIdentifier)
+        }
+        if let entry = await index.entry(for: localIdentifier),
+           entry.isBackedUp,
+           let remoteID = entry.primaryRemoteId {
+            await refreshLocalSnapshots()
+            return remoteID
+        }
+        guard let asset = await PhotoLibraryService.assetInfo(localIdentifier: localIdentifier) else {
+            throw SingleAssetBackupError.missing
+        }
+
+        uploadStates[localIdentifier] = .uploading(0)
+        let progress: @Sendable (String, Double) -> Void = { [weak self] id, fraction in
+            guard let self else { return }
+            Task { @MainActor in self.noteUploadProgress(id, fraction) }
+        }
+        let outcome = await Self.uploadOne(
+            asset: asset,
+            client: client,
+            index: index,
+            deviceId: DeviceID.current,
+            scratch: Self.scratchDirectory,
+            account: accountKey,
+            onProgress: progress
+        )
+
+        switch outcome {
+        case .uploaded, .duplicate:
+            uploadStates[localIdentifier] = nil
+        case .failed(let reason):
+            markUploadFailed(localIdentifier)
+            throw SingleAssetBackupError.failed(reason)
+        case .skipped:
+            uploadStates[localIdentifier] = nil
+            throw SingleAssetBackupError.missing
+        case .quota(let message):
+            uploadStates[localIdentifier] = nil
+            throw ImmichError.http(400, message)
+        }
+
+        await index.save()
+        await refreshLocalSnapshots()
+        guard let remoteID = await index.entry(for: localIdentifier)?.primaryRemoteId else {
+            throw SingleAssetBackupError.failed("the server did not return a backup identifier.")
+        }
+        return remoteID
+    }
+
+    private func waitForUpload(localIdentifier: String) async throws {
+        while case .uploading = uploadStates[localIdentifier] {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    func remoteIdentifier(forLocal localIdentifier: String) async -> String? {
+        guard PhotoLibraryService.hasFullAccess, let userId else { return nil }
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
+        guard await PhotoLibraryService.assetExists(localIdentifier: localIdentifier) else { return nil }
+        return await index.entry(for: localIdentifier)?.primaryRemoteId
+    }
+
     /// resolves a remote asset to a device asset when the index proves the
     /// pairing and the phasset still exists. never prompts for access.
     func localIdentifier(forRemote remoteId: String) async -> String? {
@@ -735,6 +838,9 @@ final class BackupManager {
             await index.setPrimaryRemoteId(localId: localId, asset.id)
             if let motionId = detail.livePhotoVideoId {
                 await index.setMotionRemoteId(localId: localId, motionId)
+            }
+            if detail.isEdited == true {
+                _ = await index.markRemoteEdited([asset.id])
             }
             await index.save()
             localChanged()

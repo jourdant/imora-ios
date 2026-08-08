@@ -41,6 +41,11 @@ private enum ViewerConfirmationSource {
     case menu
 }
 
+private nonisolated enum AssetViewerPage: Hashable, Sendable {
+    case media
+    case information
+}
+
 /// shared body for the viewer's per-source confirmation attachments.
 private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
     @Binding var isPresented: Bool
@@ -90,6 +95,7 @@ struct AssetViewerScreen: View {
     @State private var selectedAssetID: String?
     @State private var chromeVisible = true
     @State private var showInfo = false
+    @State private var viewerScrollPosition = ScrollPosition(edge: .top)
     @State private var showAddToAlbum = false
     @State private var showShareLinks = false
     @State private var showSimilar = false
@@ -101,6 +107,8 @@ struct AssetViewerScreen: View {
     @State private var currentPageZoomed = false
     /// device copy of the current asset, when the backup index proves one exists.
     @State private var localIdentifier: String?
+    /// server copy of a still-open local asset after it has been backed up.
+    @State private var backedUpRemoteID: String?
     @State private var downloading = false
     @State private var actionError: String?
     @State private var toast: String?
@@ -141,6 +149,21 @@ struct AssetViewerScreen: View {
         assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
     }
 
+    private var serverAssetID: String? {
+        guard let current else { return nil }
+        return current.isLocal ? backedUpRemoteID : current.id
+    }
+
+    private var actionAvailability: AssetActionAvailability? {
+        guard let current else { return nil }
+        return AssetActionAvailability(
+            asset: current,
+            ownsAsset: current.isLocal || ownsCurrent,
+            localRemoteIdentifier: backedUpRemoteID,
+            pairedLocalIdentifier: current.isLocal ? current.localIdentifier : localIdentifier
+        )
+    }
+
     /// mutations are only offered on assets the signed-in user owns. an
     /// unknown user - offline restore - is treated as the owner, best effort.
     private var ownsCurrent: Bool {
@@ -170,54 +193,52 @@ struct AssetViewerScreen: View {
 
     private var core: some View {
         NavigationStack {
-            ZStack {
-                // photos-style backdrop: system background under chrome, pure
-                // black once the chrome is tapped away.
-                Color(uiColor: chromeVisible ? .systemBackground : .black)
-                    .ignoresSafeArea()
-                    .accessibilityIdentifier("asset-viewer")
-                    // lets ui tests confirm the pager landed on the tapped asset.
-                    .accessibilityValue(selectedAssetID ?? "")
+            GeometryReader { geometry in
+                let pageLayout = AssetViewerPageLayout(
+                    viewportHeight: geometry.size.height,
+                    viewportWidth: geometry.size.width,
+                    topSafeAreaInset: geometry.safeAreaInsets.top,
+                    bottomSafeAreaInset: geometry.safeAreaInsets.bottom
+                )
 
-                // the pager lives in its own child view so per frame chrome and
-                // dismissal state changes in this screen never re-diff the pages.
-                AssetPager(
-                    assets: assets,
-                    selection: $selectedAssetID,
-                    mutesVideo: isContextPreview,
-                    playback: playback
-                ) { id, isZoomed in
-                    guard id == selectedAssetID else { return }
-                    currentPageZoomed = isZoomed
-                    onPageZoomChanged(isZoomed)
-                }
-                .ignoresSafeArea()
-                .scrollEdgeEffectHidden(true, for: .top)
-                .onTapGesture {
-                    withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
-                        chromeVisible.toggle()
-                    }
-                }
-                .simultaneousGesture(swipeUpForInfo)
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        mediaStage
+                            .frame(height: pageLayout.mediaHeight)
+                            .id(AssetViewerPage.media)
 
-                AirPlayRoutePicker(trigger: $airPlayTrigger)
-                    .frame(width: 1, height: 1)
-                    .allowsHitTesting(false)
-            }
-            .overlay(alignment: .bottom) {
-                if !isContextPreview, chromeVisible, let current {
-                    VStack(spacing: 10) {
-                        if current.isLocal {
-                            backupStatePill(current)
-                        }
-                        if current.isVideo, playback.ownerID == current.id, playback.player != nil {
-                            VideoControlsBar(playback: playback)
+                        if let current {
+                            AssetInfoPanel(
+                                asset: current,
+                                onDateAdjusted: { fileCreatedAt, offsetHours in
+                                    guard let index = assets.firstIndex(where: { $0.id == current.id }) else { return }
+                                    assets[index].fileCreatedAt = fileCreatedAt
+                                    assets[index].localOffsetHours = offsetHours
+                                },
+                                onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+                                topContentInset: pageLayout.informationTopContentInset,
+                                bottomContentInset: pageLayout.informationBottomContentInset
+                            )
+                            .frame(minHeight: pageLayout.informationHeight, alignment: .top)
+                            .id(AssetViewerPage.information)
                         }
                     }
-                    .padding(.bottom, 10)
-                    .transition(.opacity)
+                    .scrollTargetLayout()
+                }
+                .scrollPosition($viewerScrollPosition)
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne, anchor: .top))
+                .scrollIndicators(.hidden)
+                .scrollDisabled(currentPageZoomed)
+                .onScrollGeometryChange(for: Bool.self) { scroll in
+                    let viewportHeight = scroll.containerSize.height
+                    return viewportHeight > 0
+                        && max(0, scroll.contentOffset.y) >= viewportHeight * 0.5
+                } action: { _, isVisible in
+                    guard isVisible != showInfo else { return }
+                    showInfo = isVisible
                 }
             }
+            .ignoresSafeArea()
             .toolbar { toolbarContent }
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .navigationBar)
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .bottomBar)
@@ -246,30 +267,16 @@ struct AssetViewerScreen: View {
             onPageZoomChanged(false)
             onDismissed()
         }
-        .sheet(isPresented: $showInfo) {
-            if let current {
-                AssetInfoSheet(asset: current) { fileCreatedAt, offsetHours in
-                    guard let index = assets.firstIndex(where: { $0.id == current.id }) else { return }
-                    assets[index].fileCreatedAt = fileCreatedAt
-                    assets[index].localOffsetHours = offsetHours
-                }
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-                .presentationBackground(.regularMaterial)
-                .presentationCornerRadius(28)
-                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
-            }
-        }
         .sheet(isPresented: $showAddToAlbum) {
-            if let current {
-                AddToAlbumSheet(assetIDs: [current.id]) { message in
+            if let serverAssetID {
+                AddToAlbumSheet(assetIDs: [serverAssetID]) { message in
                     toast = message
                 }
             }
         }
         .sheet(isPresented: $showShareLinks) {
-            if let current {
-                ShareLinksSheet(target: .assets([current.id]))
+            if let serverAssetID {
+                ShareLinksSheet(target: .assets([serverAssetID]))
             }
         }
         .sheet(isPresented: $showSimilar) {
@@ -311,7 +318,15 @@ struct AssetViewerScreen: View {
         .task(id: current?.id) {
             warmNeighbours()
             localIdentifier = nil
-            guard let asset = current, !asset.isLocal, let backup = session.backup else { return }
+            backedUpRemoteID = nil
+            guard let asset = current, let backup = session.backup else { return }
+            if let localID = asset.localIdentifier {
+                localIdentifier = localID
+                let remoteID = await backup.remoteIdentifier(forLocal: localID)
+                guard !Task.isCancelled, current?.id == asset.id else { return }
+                backedUpRemoteID = remoteID
+                return
+            }
             let identifier = await backup.localIdentifier(forRemote: asset.id)
             guard !Task.isCancelled, current?.id == asset.id else { return }
             localIdentifier = identifier
@@ -328,6 +343,43 @@ struct AssetViewerScreen: View {
         .overlay(alignment: .top) {
             if let toast {
                 ToastBanner(text: toast) { self.toast = nil }
+            }
+        }
+    }
+
+    private var mediaStage: some View {
+        ZStack {
+            Color(uiColor: chromeVisible ? .systemBackground : .black)
+                .accessibilityIdentifier("asset-viewer")
+                .accessibilityValue(selectedAssetID ?? "")
+
+            AssetPager(
+                assets: assets,
+                selection: $selectedAssetID,
+                mutesVideo: isContextPreview,
+                playback: playback
+            ) { id, isZoomed in
+                guard id == selectedAssetID else { return }
+                currentPageZoomed = isZoomed
+                onPageZoomChanged(isZoomed)
+            }
+            .scrollEdgeEffectHidden(true, for: .top)
+            .onTapGesture {
+                withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
+                    chromeVisible.toggle()
+                }
+            }
+
+            AirPlayRoutePicker(trigger: $airPlayTrigger)
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottom) {
+            if !isContextPreview, chromeVisible, let current,
+               current.isVideo, playback.ownerID == current.id, playback.player != nil {
+                VideoControlsBar(playback: playback)
+                    .padding(.bottom, 10)
+                    .transition(.opacity)
             }
         }
     }
@@ -356,17 +408,23 @@ struct AssetViewerScreen: View {
         prefetcher.warm(remote: remote, local: local)
     }
 
-    // MARK: - gestures
+    private func toggleInfo() {
+        setInfoVisible(!showInfo)
+    }
 
-    /// photos-style swipe up on the picture reveals the info panel.
-    private var swipeUpForInfo: some Gesture {
-        DragGesture(minimumDistance: 30)
-            .onEnded { value in
-                guard !currentPageZoomed, !showInfo else { return }
-                let up = -value.translation.height
-                guard up > 60, up > abs(value.translation.width) else { return }
-                showInfo = true
+    private func setInfoVisible(_ visible: Bool) {
+        showInfo = visible
+        if reduceMotion {
+            scroll(to: visible ? .information : .media)
+        } else {
+            withAnimation(.smooth(duration: 0.35)) {
+                scroll(to: visible ? .information : .media)
             }
+        }
+    }
+
+    private func scroll(to page: AssetViewerPage) {
+        viewerScrollPosition.scrollTo(id: page, anchor: .top)
     }
 
     // MARK: - chrome
@@ -387,11 +445,12 @@ struct AssetViewerScreen: View {
             }
         }
 
-        ToolbarItem(placement: .topBarTrailing) {
-            if current?.isLocal != true {
-                moreMenu
-                    .accessibilityIdentifier("viewer-menu")
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            if let current {
+                backupStatusControl(current)
             }
+            moreMenu
+                .accessibilityIdentifier("viewer-menu")
         }
 
         if let current {
@@ -405,8 +464,9 @@ struct AssetViewerScreen: View {
         }
     }
 
-    /// bottom bar for server assets, mirroring the photos app: share,
-    /// favorite, info, trash as evenly spaced glass circles.
+    /// Photos-style placement: share stands alone on the left, the common
+    /// nondestructive controls form the center cluster, and delete stays at the
+    /// far right with explicit device/everywhere choices.
     @ToolbarContentBuilder private func remoteToolbarItems(_ current: Asset) -> some ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
             if let client = session.client {
@@ -422,8 +482,8 @@ struct AssetViewerScreen: View {
 
         ToolbarSpacer(.flexible, placement: .bottomBar)
 
-        ToolbarItem(placement: .bottomBar) {
-            if ownsCurrent {
+        if actionAvailability?.canFavorite == true {
+            ToolbarItem(placement: .bottomBar) {
                 Button {
                     Task { await toggleFavorite() }
                 } label: {
@@ -433,30 +493,36 @@ struct AssetViewerScreen: View {
                 }
                 .accessibilityIdentifier("viewer-favorite")
             }
+            ToolbarSpacer(.fixed, placement: .bottomBar)
         }
-
-        ToolbarSpacer(.flexible, placement: .bottomBar)
 
         ToolbarItem(placement: .bottomBar) {
             Button {
-                showInfo = true
+                toggleInfo()
             } label: {
-                Image(systemName: "info.circle")
+                Image(systemName: showInfo ? "info.circle.fill" : "info.circle")
+                    .contentTransition(.symbolEffect(.replace))
             }
             .accessibilityIdentifier("viewer-info")
         }
 
-        ToolbarSpacer(.flexible, placement: .bottomBar)
-
-        ToolbarItem(placement: .bottomBar) {
-            if ownsCurrent {
-                Button(role: .destructive) {
-                    ask(.trash, from: .toolbar)
+        if actionAvailability?.canEdit == true {
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    showEditor = true
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "slider.horizontal.3")
                 }
-                .accessibilityIdentifier("viewer-trash")
-                .modifier(confirmationDialog(from: .toolbar))
+                .accessibilityIdentifier("viewer-edit")
+            }
+        }
+
+        if actionAvailability?.canDeleteFromDevice == true
+            || actionAvailability?.canTrashEverywhere == true {
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                deleteMenu
             }
         }
     }
@@ -464,24 +530,31 @@ struct AssetViewerScreen: View {
     /// trashed assets offer restore and permanent delete, like the photos
     /// app's recently deleted album.
     @ToolbarContentBuilder private func trashedToolbarItems(_ current: Asset) -> some ToolbarContent {
-        ToolbarItem(placement: .bottomBar) {
-            Button {
-                Task { await restore() }
-            } label: {
-                Image(systemName: "arrow.uturn.backward")
+        if actionAvailability?.canRestore == true {
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    Task { await restore() }
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                }
+                .accessibilityIdentifier("viewer-restore")
             }
-            .accessibilityIdentifier("viewer-restore")
         }
 
-        ToolbarSpacer(.flexible, placement: .bottomBar)
+        if actionAvailability?.canRestore == true,
+           actionAvailability?.canDeletePermanently == true {
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+        }
 
-        ToolbarItem(placement: .bottomBar) {
-            Button(role: .destructive) {
-                ask(.deletePermanently, from: .toolbar)
-            } label: {
-                Image(systemName: "trash")
+        if actionAvailability?.canDeletePermanently == true {
+            ToolbarItem(placement: .bottomBar) {
+                Button(role: .destructive) {
+                    ask(.deletePermanently, from: .toolbar)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .modifier(confirmationDialog(from: .toolbar))
             }
-            .modifier(confirmationDialog(from: .toolbar))
         }
     }
 
@@ -503,9 +576,10 @@ struct AssetViewerScreen: View {
 
         ToolbarItem(placement: .bottomBar) {
             Button {
-                showInfo = true
+                toggleInfo()
             } label: {
-                Image(systemName: "info.circle")
+                Image(systemName: showInfo ? "info.circle.fill" : "info.circle")
+                    .contentTransition(.symbolEffect(.replace))
             }
             .accessibilityIdentifier("viewer-info")
         }
@@ -513,126 +587,153 @@ struct AssetViewerScreen: View {
         ToolbarSpacer(.flexible, placement: .bottomBar)
 
         ToolbarItem(placement: .bottomBar) {
-            Button(role: .destructive) {
-                ask(.deleteFromDevice, from: .toolbar)
-            } label: {
-                Image(systemName: "trash")
-            }
-            .modifier(confirmationDialog(from: .toolbar))
+            deleteMenu
         }
+    }
+
+    private var deleteMenu: some View {
+        Menu {
+            if actionAvailability?.canDeleteFromDevice == true {
+                Button(role: .destructive) {
+                    ask(.deleteFromDevice, from: .toolbar)
+                } label: {
+                    Label("Delete from This Device", systemImage: "iphone.slash")
+                }
+                .accessibilityIdentifier("viewer-delete-device")
+            }
+            if actionAvailability?.canTrashEverywhere == true {
+                Button(role: .destructive) {
+                    ask(.trash, from: .toolbar)
+                } label: {
+                    Label(
+                        localIdentifier == nil ? "Move to Trash" : "Move to Trash Everywhere",
+                        systemImage: "trash"
+                    )
+                }
+                .accessibilityIdentifier("viewer-trash")
+            }
+        } label: {
+            Image(systemName: "trash")
+        }
+        .accessibilityLabel("Delete")
+        .modifier(confirmationDialog(from: .toolbar))
     }
 
     private var moreMenu: some View {
         Menu {
-            Section {
-                Button {
-                    showInfo = true
-                } label: {
-                    Label("Info", systemImage: "info.circle")
-                }
-                if current?.isImage == true, !currentIsTrashed {
-                    Button {
-                        showEditor = true
-                    } label: {
-                        Label("Edit", systemImage: "slider.horizontal.3")
-                    }
-                    .accessibilityIdentifier("viewer-edit")
-                }
-                Button {
-                    showAddToAlbum = true
-                } label: {
-                    Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
-                }
-                .accessibilityIdentifier("viewer-add-to-album")
-                if canRemoveFromAlbum {
-                    Button {
-                        Task { await removeFromAlbum() }
-                    } label: {
-                        Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
-                    }
-                    .accessibilityIdentifier("viewer-remove-from-album")
-                }
-                if ownsCurrent {
-                    Button {
-                        showShareLinks = true
-                    } label: {
-                        Label("Share Link", systemImage: "link")
-                    }
-                    .accessibilityIdentifier("viewer-share-link")
-                }
-            }
-
-            Section {
-                Button {
-                    airPlayTrigger += 1
-                } label: {
-                    Label("Cast", systemImage: "airplay.video")
-                }
-                if session.features?.smartSearch == true {
-                    Button {
-                        showSimilar = true
-                    } label: {
-                        Label("View Similar", systemImage: "sparkle.magnifyingglass")
-                    }
-                    .accessibilityIdentifier("viewer-similar")
-                }
-                if current?.isImage == true {
-                    Button {
-                        showProfileCrop = true
-                    } label: {
-                        Label("Set as Profile Picture", systemImage: "person.crop.circle")
-                    }
-                }
-                if localIdentifier == nil {
-                    if downloading {
-                        Button {} label: {
-                            Label("Downloading...", systemImage: "arrow.down.circle.dotted")
-                        }
-                        .disabled(true)
-                    } else {
-                        Button {
-                            Task { await download() }
-                        } label: {
-                            Label("Download", systemImage: "arrow.down.circle")
-                        }
-                        .accessibilityIdentifier("viewer-download")
-                    }
-                }
-                Button {
-                    Task { await openInBrowser() }
-                } label: {
-                    Label("Open in Browser", systemImage: "safari")
-                }
-            }
-
-            if ownsCurrent {
+            if let current {
                 Section {
-                    Button {
-                        Task { await archive() }
-                    } label: {
-                        Label("Archive", systemImage: "archivebox")
+                    Button { toggleInfo() } label: {
+                        Label(showInfo ? "Hide Info" : "Show Info", systemImage: "info.circle")
+                    }
+                    if actionAvailability?.canEdit == true {
+                        Button { showEditor = true } label: {
+                            Label("Edit", systemImage: "slider.horizontal.3")
+                        }
+                        .accessibilityIdentifier("viewer-edit")
+                    }
+                    if actionAvailability?.canAddToAlbum == true {
+                        Button { showAddToAlbum = true } label: {
+                            Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                        }
+                        .accessibilityIdentifier("viewer-add-to-album")
+                    }
+                    if canRemoveFromAlbum {
+                        Button { Task { await removeFromAlbum() } } label: {
+                            Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                        }
+                        .accessibilityIdentifier("viewer-remove-from-album")
+                    }
+                    if serverAssetID != nil, (current.isLocal || ownsCurrent) {
+                        Button { showShareLinks = true } label: {
+                            Label("Share Link", systemImage: "link")
+                        }
+                        .accessibilityIdentifier("viewer-share-link")
                     }
                 }
 
-                Section {
-                    Button(role: .destructive) {
-                        ask(.trash, from: .menu)
-                    } label: {
-                        Label("Move to Trash", systemImage: "trash")
-                    }
-                    .accessibilityIdentifier("viewer-delete")
-                    if localIdentifier != nil {
-                        Button(role: .destructive) {
-                            ask(.deleteFromDevice, from: .menu)
-                        } label: {
-                            Label("Delete from Device Only", systemImage: "iphone.slash")
+                if current.isLocal, serverAssetID != nil {
+                    Section {
+                        Button { Task { await openInBrowser() } } label: {
+                            Label("Open in Browser", systemImage: "safari")
                         }
-                        .accessibilityIdentifier("viewer-delete-device")
                     }
-                    Button(role: .destructive) {
-                        ask(.deletePermanently, from: .menu)
-                    } label: {
-                        Label("Delete Permanently", systemImage: "trash.slash")
+                } else if !current.isTrashed {
+                    Section {
+                        Button { airPlayTrigger += 1 } label: {
+                            Label("Cast", systemImage: "airplay.video")
+                        }
+                        if session.features?.smartSearch == true {
+                            Button { showSimilar = true } label: {
+                                Label("View Similar", systemImage: "sparkle.magnifyingglass")
+                            }
+                            .accessibilityIdentifier("viewer-similar")
+                        }
+                        if current.isImage, ownsCurrent {
+                            Button { showProfileCrop = true } label: {
+                                Label("Set as Profile Picture", systemImage: "person.crop.circle")
+                            }
+                        }
+                        if actionAvailability?.canDownload == true {
+                            if downloading {
+                                Button {} label: {
+                                    Label("Downloading…", systemImage: "arrow.down.circle.dotted")
+                                }
+                                .disabled(true)
+                            } else {
+                                Button { Task { await download() } } label: {
+                                    Label("Download to Device", systemImage: "arrow.down.circle")
+                                }
+                                .accessibilityIdentifier("viewer-download")
+                            }
+                        }
+                        Button { Task { await openInBrowser() } } label: {
+                            Label("Open in Browser", systemImage: "safari")
+                        }
+                    }
+                }
+
+                if actionAvailability?.canArchive == true {
+                    Section {
+                        Button { Task { await toggleArchive() } } label: {
+                            Label(
+                                current.visibility == .archive ? "Unarchive" : "Archive",
+                                systemImage: current.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
+                            )
+                        }
+                    }
+                }
+
+                if actionAvailability?.canDeleteFromDevice == true
+                    || actionAvailability?.canTrashEverywhere == true
+                    || actionAvailability?.canDeletePermanently == true {
+                    Section {
+                        if actionAvailability?.canDeleteFromDevice == true {
+                            Button(role: .destructive) {
+                                ask(.deleteFromDevice, from: .menu)
+                            } label: {
+                                Label("Delete from This Device", systemImage: "iphone.slash")
+                            }
+                            .accessibilityIdentifier("viewer-delete-device")
+                        }
+                        if actionAvailability?.canTrashEverywhere == true {
+                            Button(role: .destructive) {
+                                ask(.trash, from: .menu)
+                            } label: {
+                                Label(
+                                    localIdentifier == nil ? "Move to Trash" : "Move to Trash Everywhere",
+                                    systemImage: "trash"
+                                )
+                            }
+                            .accessibilityIdentifier("viewer-delete")
+                        }
+                        if actionAvailability?.canDeletePermanently == true {
+                            Button(role: .destructive) {
+                                ask(.deletePermanently, from: .menu)
+                            } label: {
+                                Label("Delete Permanently", systemImage: "trash.slash")
+                            }
+                        }
                     }
                 }
             }
@@ -643,15 +744,69 @@ struct AssetViewerScreen: View {
         .modifier(confirmationDialog(from: .menu))
     }
 
-    private func backupStatePill(_ current: Asset) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: current.isLocalBackedUp ? "checkmark.icloud" : "icloud.slash")
-            Text(current.isLocalBackedUp ? "Backed up" : "Not backed up yet")
+    @ViewBuilder private func backupStatusControl(_ current: Asset) -> some View {
+        if let localID = current.localIdentifier {
+            switch session.backup?.uploadStates[localID] {
+            case .uploading(let fraction):
+                ProgressView(value: fraction)
+                    .progressViewStyle(.circular)
+                    .frame(width: 24, height: 24)
+                    .accessibilityLabel("Backing up")
+                    .accessibilityValue("\(Int(fraction * 100)) percent")
+            case .failed:
+                Button { Task { await backUpCurrent() } } label: {
+                    Image(systemName: "exclamationmark.icloud")
+                }
+                .accessibilityLabel("Backup failed. Try again")
+            case nil:
+                if current.isLocalBackedUp || backedUpRemoteID != nil {
+                    Menu {
+                        Button {} label: {
+                            Label("Backed Up", systemImage: "checkmark.icloud")
+                        }
+                        .disabled(true)
+                        if serverAssetID != nil {
+                            Button { showAddToAlbum = true } label: {
+                                Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "checkmark.icloud")
+                    }
+                    .accessibilityLabel("Backed up")
+                } else {
+                    Button { Task { await backUpCurrent() } } label: {
+                        Image(systemName: "icloud.slash")
+                    }
+                    .accessibilityLabel("Not backed up. Back up now")
+                    .accessibilityIdentifier("viewer-back-up")
+                }
+            }
+        } else if !current.isTrashed {
+            Menu {
+                Button {} label: {
+                    Label("Backed Up", systemImage: "checkmark.icloud")
+                }
+                .disabled(true)
+                if actionAvailability?.canDownload == true {
+                    Button { Task { await download() } } label: {
+                        Label(
+                            downloading ? "Downloading…" : "Download to Device",
+                            systemImage: downloading ? "arrow.down.circle.dotted" : "arrow.down.circle"
+                        )
+                    }
+                    .disabled(downloading)
+                }
+                if actionAvailability?.canAddToAlbum == true {
+                    Button { showAddToAlbum = true } label: {
+                        Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                    }
+                }
+            } label: {
+                Image(systemName: "checkmark.icloud")
+            }
+            .accessibilityLabel("Backed up")
         }
-        .font(.footnote.weight(.semibold))
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .glassEffect(.regular, in: .capsule)
     }
 
     /// floating glass title: the place when known, the relative day and time.
@@ -663,10 +818,13 @@ struct AssetViewerScreen: View {
         return VStack(spacing: 1) {
             Text(place ?? day)
                 .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
             Text(place == nil ? time : "\(day), \(time)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
+        .frame(minWidth: 136, idealWidth: 156, maxWidth: 210)
         .padding(.horizontal, 14)
         .padding(.vertical, 5)
         .glassEffect(.regular, in: .capsule)
@@ -698,8 +856,6 @@ struct AssetViewerScreen: View {
         return style.year()
     }
 
-    private var currentIsTrashed: Bool { current?.isTrashed == true }
-
     // MARK: - confirmation dialogs
 
     private func ask(_ kind: ViewerConfirmation, from source: ViewerConfirmationSource) {
@@ -722,7 +878,10 @@ struct AssetViewerScreen: View {
     private var confirmationTitle: String {
         let noun = current?.isVideo == true ? "Video" : "Photo"
         switch confirmation {
-        case .trash: return "Move \(noun) to Trash?"
+        case .trash:
+            return localIdentifier == nil
+                ? "Move \(noun) to Trash?"
+                : "Move \(noun) to Trash Everywhere?"
         case .deletePermanently: return "Delete \(noun) Permanently?"
         case .deleteFromDevice: return "Delete from This Device?"
         case nil: return ""
@@ -733,7 +892,9 @@ struct AssetViewerScreen: View {
         switch confirmation {
         case .trash:
             if current?.isLocal == true {
-                return "This will remove it from your device photo library."
+                return serverAssetID == nil
+                    ? "This photo is not backed up. It will be removed from your device photo library."
+                    : "It will move to the server trash and the copy in your device photo library will be deleted."
             }
             return localIdentifier != nil
                 ? "It will move to the server trash and the copy in your device photo library will be deleted."
@@ -743,9 +904,10 @@ struct AssetViewerScreen: View {
                 ? "It will be permanently deleted from the server and from this device. This cannot be undone."
                 : "It will be permanently deleted from the server. This cannot be undone."
         case .deleteFromDevice:
-            return current?.isLocal == true
-                ? "This photo is not backed up. It will be removed from your device photo library permanently."
-                : "The copy in your device photo library will be deleted. The server copy is kept."
+            if current?.isLocal == true, serverAssetID == nil {
+                return "This photo is not backed up. It will be removed from your device photo library permanently."
+            }
+            return "The copy in your device photo library will be deleted. The server copy is kept."
         case nil:
             return ""
         }
@@ -754,27 +916,17 @@ struct AssetViewerScreen: View {
     @ViewBuilder private var confirmationActions: some View {
         switch confirmation {
         case .trash:
-            if current?.isLocal == true {
-                Button("Delete", role: .destructive) {
-                    Task { await deleteLocalOnlyAsset() }
-                }
-            } else {
-                Button("Move to Trash", role: .destructive) {
-                    Task { await trash() }
-                }
-                .accessibilityIdentifier("viewer-trash-confirm")
+            Button(localIdentifier == nil ? "Move to Trash" : "Move to Trash Everywhere", role: .destructive) {
+                Task { await trash() }
             }
+            .accessibilityIdentifier("viewer-trash-confirm")
         case .deletePermanently:
             Button("Delete Permanently", role: .destructive) {
                 Task { await deletePermanently() }
             }
         case .deleteFromDevice:
             Button("Delete from Device", role: .destructive) {
-                if current?.isLocal == true {
-                    Task { await deleteLocalOnlyAsset() }
-                } else {
-                    Task { await deleteFromDevice() }
-                }
+                Task { await deleteFromDevice() }
             }
             .accessibilityIdentifier("viewer-delete-device-confirm")
         case nil:
@@ -830,16 +982,24 @@ struct AssetViewerScreen: View {
     private func toggleFavorite() async {
         guard let client = session.client, let asset = current else { return }
         let newValue = !asset.isFavorite
-        assets[currentIndex].isFavorite = newValue
-        onChange(.favorite(asset.id, newValue))
-        try? await client.setFavorite(ids: [asset.id], newValue)
+        do {
+            try await client.setFavorite(ids: [asset.id], newValue)
+            apply(.favorite(asset.id, newValue))
+        } catch {
+            actionError = "Could not update the favorite: \(error.localizedDescription)"
+        }
     }
 
-    private func archive() async {
+    private func toggleArchive() async {
         guard let client = session.client, let asset = current else { return }
-        try? await client.setVisibility(ids: [asset.id], .archive)
-        onChange(.removed(asset.id))
-        removeCurrent()
+        let visibility: AssetVisibility = asset.visibility == .archive ? .timeline : .archive
+        do {
+            try await client.setVisibility(ids: [asset.id], visibility)
+            onChange(.removed(asset.id))
+            removeCurrent()
+        } catch {
+            actionError = "Could not update the archive: \(error.localizedDescription)"
+        }
     }
 
     /// takes the photo out of the album only - it stays in the library, which
@@ -868,25 +1028,43 @@ struct AssetViewerScreen: View {
     }
 
     private func trash() async {
-        // a server delete also removes the device copy when one exists.
-        if await resolveLocalIdentifier() != nil {
-            await deleteEverywhere(force: false)
+        guard let asset = current else { return }
+        guard let serverAssetID else {
+            await deleteLocalOnlyAsset()
             return
         }
-        guard let client = session.client, let asset = current else { return }
-        try? await client.trashAssets(ids: [asset.id])
-        onChange(.removed(asset.id))
-        removeCurrent()
+        guard let client = session.client else { return }
+        if let localID = await resolveLocalIdentifier() {
+            await deleteEverywhere(
+                serverID: serverAssetID,
+                sourceAssetID: asset.id,
+                localIdentifier: localID,
+                force: false
+            )
+            return
+        }
+        do {
+            try await client.trashAssets(ids: [serverAssetID])
+            onChange(.removed(asset.id))
+            removeCurrent()
+        } catch {
+            actionError = "Could not move to trash: \(error.localizedDescription)"
+        }
     }
 
     private func deletePermanently() async {
-        if await resolveLocalIdentifier() != nil {
-            await deleteEverywhere(force: true)
+        guard let client = session.client, let asset = current, let serverAssetID else { return }
+        if let localID = await resolveLocalIdentifier() {
+            await deleteEverywhere(
+                serverID: serverAssetID,
+                sourceAssetID: asset.id,
+                localIdentifier: localID,
+                force: true
+            )
             return
         }
-        guard let client = session.client, let asset = current else { return }
         do {
-            try await client.trashAssets(ids: [asset.id], force: true)
+            try await client.trashAssets(ids: [serverAssetID], force: true)
             onChange(.removed(asset.id))
             removeCurrent()
         } catch {
@@ -898,7 +1076,12 @@ struct AssetViewerScreen: View {
     /// missing it would leave an orphaned copy on the device.
     private func resolveLocalIdentifier() async -> String? {
         if let localIdentifier { return localIdentifier }
-        guard let asset = current, !asset.isLocal, let backup = session.backup else { return nil }
+        guard let asset = current else { return nil }
+        if let localID = asset.localIdentifier {
+            localIdentifier = localID
+            return localID
+        }
+        guard let backup = session.backup else { return nil }
         let resolved = await backup.localIdentifier(forRemote: asset.id)
         if current?.id == asset.id { localIdentifier = resolved }
         return resolved
@@ -907,21 +1090,26 @@ struct AssetViewerScreen: View {
     /// device first: declining the system dialog aborts with nothing changed.
     /// after the device copy is gone the index is updated immediately, even if
     /// the server call then fails.
-    private func deleteEverywhere(force: Bool) async {
-        guard let client = session.client, let asset = current, let localId = localIdentifier else { return }
+    private func deleteEverywhere(
+        serverID: String,
+        sourceAssetID: String,
+        localIdentifier: String,
+        force: Bool
+    ) async {
+        guard let client = session.client else { return }
         do {
-            try await PhotoLibraryService.delete(localIdentifiers: [localId])
+            try await PhotoLibraryService.delete(localIdentifiers: [localIdentifier])
         } catch {
             return
         }
-        session.backup?.noteLocalDeletion([localId])
-        localIdentifier = nil
+        session.backup?.noteLocalDeletion([localIdentifier])
+        self.localIdentifier = nil
         do {
-            try await client.trashAssets(ids: [asset.id], force: force)
-            onChange(.removed(asset.id))
+            try await client.trashAssets(ids: [serverID], force: force)
+            onChange(.removed(sourceAssetID))
             removeCurrent()
         } catch {
-            onChange(.localDeleted(asset.id))
+            onChange(.localDeleted(sourceAssetID))
             actionError = "Deleted from this device, but the server copy could not be deleted."
         }
     }
@@ -954,8 +1142,24 @@ struct AssetViewerScreen: View {
         }
     }
 
+    private func backUpCurrent() async {
+        guard let asset = current,
+              let localID = asset.localIdentifier,
+              let backup = session.backup
+        else { return }
+        do {
+            let remoteID = try await backup.backUp(localIdentifier: localID)
+            guard current?.id == asset.id else { return }
+            backedUpRemoteID = remoteID
+            assets[currentIndex].isLocalBackedUp = true
+            toast = "Backed up"
+        } catch {
+            actionError = "Could not back up: \(error.localizedDescription)"
+        }
+    }
+
     private func deleteFromDevice() async {
-        guard let asset = current, let localId = localIdentifier else { return }
+        guard let asset = current, let localId = await resolveLocalIdentifier() else { return }
         do {
             try await PhotoLibraryService.delete(localIdentifiers: [localId])
         } catch {
@@ -963,13 +1167,22 @@ struct AssetViewerScreen: View {
         }
         session.backup?.noteLocalDeletion([localId])
         localIdentifier = nil
+        if asset.isLocal {
+            if serverAssetID == nil {
+                onChange(.removed(asset.id))
+            } else {
+                onChange(.localDeleted(asset.id))
+            }
+            removeCurrent()
+            return
+        }
         onChange(.localDeleted(asset.id))
     }
 
     private func openInBrowser() async {
-        guard let client = session.client, let asset = current else { return }
+        guard let client = session.client, let serverAssetID else { return }
         let base = await client.serverWebURL()
-        openURL(base.appending(path: "photos/\(asset.id)"))
+        openURL(base.appending(path: "photos/\(serverAssetID)"))
     }
 
     private func removeCurrent() {
@@ -1260,28 +1473,33 @@ nonisolated struct SharedAssetFile: Transferable {
     let client: ImmichClient
     let asset: Asset
 
+    func exportedURL() async throws -> URL {
+        let url = client.editedOriginalURL(assetID: asset.id)
+        var request = URLRequest(url: url)
+        for (key, value) in client.authHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        var filename = "photo"
+        if let http = response as? HTTPURLResponse,
+           let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
+           let range = disposition.range(of: "filename=\"") {
+            filename = String(disposition[range.upperBound...].prefix(while: { $0 != "\"" }))
+        } else if asset.isVideo {
+            filename = "video.mov"
+        } else {
+            filename = "photo.jpg"
+        }
+        let directory = FileManager.default.temporaryDirectory.appending(path: "share")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let target = directory.appending(path: "\(UUID().uuidString)-\(filename)")
+        try data.write(to: target)
+        return target
+    }
+
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .item) { wrapper in
-            let url = wrapper.client.editedOriginalURL(assetID: wrapper.asset.id)
-            var request = URLRequest(url: url)
-            for (key, value) in wrapper.client.authHeaders {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
-            let (data, response) = try await URLSession.shared.data(for: request)
-            var filename = "photo"
-            if let http = response as? HTTPURLResponse,
-               let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
-               let range = disposition.range(of: "filename=\"") {
-                filename = String(disposition[range.upperBound...].prefix(while: { $0 != "\"" }))
-            } else if wrapper.asset.isVideo {
-                filename = "video.mov"
-            } else {
-                filename = "photo.jpg"
-            }
-            let target = FileManager.default.temporaryDirectory.appending(path: filename)
-            try? FileManager.default.removeItem(at: target)
-            try data.write(to: target)
-            return SentTransferredFile(target)
+            SentTransferredFile(try await wrapper.exportedURL())
         }
     }
 }
@@ -1290,14 +1508,17 @@ nonisolated struct SharedAssetFile: Transferable {
 nonisolated struct LocalSharedAssetFile: Transferable {
     let localIdentifier: String
 
+    func exportedURL() async throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "share")
+        return try await PhotoLibraryService.exportPrimary(
+            localIdentifier: localIdentifier,
+            to: directory
+        ).fileURL
+    }
+
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .item) { wrapper in
-            let directory = FileManager.default.temporaryDirectory.appending(path: "share")
-            let exported = try await PhotoLibraryService.exportPrimary(
-                localIdentifier: wrapper.localIdentifier,
-                to: directory
-            )
-            return SentTransferredFile(exported.fileURL)
+            SentTransferredFile(try await wrapper.exportedURL())
         }
     }
 }

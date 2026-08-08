@@ -250,13 +250,55 @@ nonisolated enum QuickLink: String, Hashable {
 
 /// flat paged grid shared by the search tab and canned searches like videos.
 struct SearchResultsGrid: View {
+    @Environment(\.openURL) private var openURL
+    @Environment(SessionStore.self) private var session
+
     let model: SearchModel
     let zoomNamespace: Namespace.ID
     let onTap: (Int) -> Void
 
+    @State private var albumAsset: Asset?
+    @State private var editingAsset: Asset?
+    @State private var workingAssetIDs: Set<String> = []
+    @State private var actionError: String?
+    @State private var toast: String?
+
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
 
     var body: some View {
+        gridContent
+            .sheet(item: $albumAsset) { asset in
+                AddToAlbumSheet(assetIDs: [asset.id]) { message in
+                    toast = message
+                }
+            }
+            .fullScreenCover(item: $editingAsset) { asset in
+                AssetEditScreen(asset: asset) { outcome in
+                    guard case .saved(let detail) = outcome else { return }
+                    model.updateAssets(ids: [asset.id]) { current in
+                        if let thumbhash = detail?.thumbhash { current.thumbhash = thumbhash }
+                    }
+                    session.backup?.noteRemoteEdits([asset.id])
+                    toast = "Edits saved"
+                }
+            }
+            .alert("Action Failed", isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(actionError ?? "")
+            }
+            .overlay(alignment: .top) {
+                if let toast {
+                    ToastBanner(text: toast) { self.toast = nil }
+                        .padding(.top, 8)
+                }
+            }
+    }
+
+    @ViewBuilder private var gridContent: some View {
         if model.isLoading && model.assets.isEmpty {
             ProgressView()
                 .frame(maxWidth: .infinity)
@@ -274,6 +316,11 @@ struct SearchResultsGrid: View {
                     AssetTile(asset: asset)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture { onTap(index) }
+                        .contextMenu {
+                            assetMenu(for: asset)
+                        } preview: {
+                            contextPreview(for: asset)
+                        }
                         .onAppear {
                             if index >= model.assets.count - 12 {
                                 model.loadMore()
@@ -292,6 +339,254 @@ struct SearchResultsGrid: View {
                     .padding(.vertical, 24)
             }
         }
+    }
+
+    // MARK: - context menu
+
+    private func pairedLocalIdentifier(for asset: Asset) -> String? {
+        session.backup?.pairedLocalIdentifierByRemoteId[asset.id]
+    }
+
+    private func owns(_ asset: Asset) -> Bool {
+        guard let userID = session.user?.id else { return true }
+        return asset.ownerId == userID
+    }
+
+    private func availability(for asset: Asset) -> AssetActionAvailability {
+        AssetActionAvailability(
+            asset: asset,
+            ownsAsset: owns(asset),
+            pairedLocalIdentifier: pairedLocalIdentifier(for: asset)
+        )
+    }
+
+    @ViewBuilder private func assetMenu(for asset: Asset) -> some View {
+        let actions = availability(for: asset)
+        let isWorking = workingAssetIDs.contains(asset.id)
+
+        Section {
+            if let client = session.client {
+                ShareLink(
+                    item: SharedAssetFile(client: client, asset: asset),
+                    preview: SharePreview(asset.localDate.formatted(date: .abbreviated, time: .omitted))
+                ) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
+
+            if actions.canFavorite {
+                Button {
+                    Task { await toggleFavorite(asset) }
+                } label: {
+                    Label(
+                        asset.isFavorite ? "Unfavorite" : "Favorite",
+                        systemImage: asset.isFavorite ? "heart.slash" : "heart"
+                    )
+                }
+                .disabled(isWorking)
+            }
+
+            if actions.canAddToAlbum {
+                Button {
+                    albumAsset = asset
+                } label: {
+                    Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                }
+                .disabled(isWorking)
+            }
+
+            if actions.canEdit {
+                Button {
+                    editingAsset = asset
+                } label: {
+                    Label("Edit", systemImage: "slider.horizontal.3")
+                }
+                .disabled(isWorking)
+            }
+
+            if actions.canArchive {
+                Button {
+                    Task { await toggleArchive(asset) }
+                } label: {
+                    Label(
+                        asset.visibility == .archive ? "Unarchive" : "Archive",
+                        systemImage: asset.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
+                    )
+                }
+                .disabled(isWorking)
+            }
+
+            if !asset.isTrashed {
+                Button {
+                    Task { await openInBrowser(asset) }
+                } label: {
+                    Label("Open in Browser", systemImage: "safari")
+                }
+            }
+        }
+
+        if actions.canDownload || actions.canDeleteFromDevice {
+            Section {
+                if actions.canDownload {
+                    Button {
+                        Task { await download(asset) }
+                    } label: {
+                        Label("Download to Device", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(isWorking)
+                }
+
+                if actions.canDeleteFromDevice {
+                    Button(role: .destructive) {
+                        Task { await deleteFromDevice(asset) }
+                    } label: {
+                        Label("Delete from This Device", systemImage: "iphone.slash")
+                    }
+                    .disabled(isWorking)
+                }
+            }
+        }
+
+        if actions.canTrashEverywhere {
+            Section {
+                Button(role: .destructive) {
+                    Task { await moveToTrash(asset) }
+                } label: {
+                    Label("Move to Trash", systemImage: "trash")
+                }
+                .disabled(isWorking)
+            }
+        }
+    }
+
+    private func contextPreview(for asset: Asset) -> some View {
+        let ratio = CGFloat(min(max(asset.ratio, 0.65), 1.8))
+        return AssetContextPreview(asset: asset)
+            .frame(width: 300, height: 300 / ratio)
+            .clipShape(.rect(cornerRadius: 18))
+    }
+
+    // MARK: - asset actions
+
+    private func toggleFavorite(_ asset: Asset) async {
+        guard beginAction(for: asset) else { return }
+        defer { finishAction(for: asset) }
+        guard let client = session.client else {
+            reportUnavailableAction()
+            return
+        }
+
+        let newValue = !asset.isFavorite
+        do {
+            try await client.setFavorite(ids: [asset.id], newValue)
+            model.updateAssets(ids: [asset.id]) { $0.isFavorite = newValue }
+        } catch {
+            actionError = "Could not update the favorite: \(error.localizedDescription)"
+        }
+    }
+
+    private func toggleArchive(_ asset: Asset) async {
+        guard beginAction(for: asset) else { return }
+        defer { finishAction(for: asset) }
+        guard let client = session.client else {
+            reportUnavailableAction()
+            return
+        }
+
+        let visibility: AssetVisibility = asset.visibility == .archive ? .timeline : .archive
+        do {
+            try await client.setVisibility(ids: [asset.id], visibility)
+            model.removeAssets(ids: [asset.id])
+        } catch {
+            actionError = "Could not update the archive: \(error.localizedDescription)"
+        }
+    }
+
+    private func download(_ asset: Asset) async {
+        guard beginAction(for: asset) else { return }
+        defer { finishAction(for: asset) }
+        guard let backup = session.backup else {
+            reportUnavailableAction()
+            return
+        }
+
+        do {
+            _ = try await backup.download(asset: asset)
+            toast = "Saved to your photo library"
+        } catch {
+            actionError = "Could not download: \(error.localizedDescription)"
+        }
+    }
+
+    private func deleteFromDevice(_ asset: Asset) async {
+        guard beginAction(for: asset) else { return }
+        defer { finishAction(for: asset) }
+        guard let backup = session.backup,
+              let localIdentifier = pairedLocalIdentifier(for: asset)
+        else {
+            reportUnavailableAction()
+            return
+        }
+
+        do {
+            try await PhotoLibraryService.delete(localIdentifiers: [localIdentifier])
+            backup.noteLocalDeletion([localIdentifier])
+            toast = "Deleted from this device"
+        } catch {
+            guard !PhotoLibraryService.isUserCancelled(error) else { return }
+            actionError = "Could not delete from this device: \(error.localizedDescription)"
+        }
+    }
+
+    private func moveToTrash(_ asset: Asset) async {
+        guard beginAction(for: asset) else { return }
+        defer { finishAction(for: asset) }
+        guard let client = session.client else {
+            reportUnavailableAction()
+            return
+        }
+
+        let localIdentifier = pairedLocalIdentifier(for: asset)
+        if let localIdentifier {
+            do {
+                try await PhotoLibraryService.delete(localIdentifiers: [localIdentifier])
+                session.backup?.noteLocalDeletion([localIdentifier])
+            } catch {
+                guard !PhotoLibraryService.isUserCancelled(error) else { return }
+                actionError = "Could not delete from this device: \(error.localizedDescription)"
+                return
+            }
+        }
+
+        do {
+            try await client.trashAssets(ids: [asset.id])
+            model.removeAssets(ids: [asset.id])
+        } catch {
+            actionError = localIdentifier == nil
+                ? "Could not move to trash: \(error.localizedDescription)"
+                : "Deleted from this device, but the server copy could not be moved to trash."
+        }
+    }
+
+    private func openInBrowser(_ asset: Asset) async {
+        guard let client = session.client else {
+            reportUnavailableAction()
+            return
+        }
+        let baseURL = await client.serverWebURL()
+        openURL(baseURL.appending(path: "photos/\(asset.id)"))
+    }
+
+    private func beginAction(for asset: Asset) -> Bool {
+        workingAssetIDs.insert(asset.id).inserted
+    }
+
+    private func finishAction(for asset: Asset) {
+        workingAssetIDs.remove(asset.id)
+    }
+
+    private func reportUnavailableAction() {
+        actionError = "This action is no longer available."
     }
 }
 

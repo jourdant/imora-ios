@@ -1,16 +1,23 @@
 import SwiftUI
 import MapKit
 
-/// photos-style info panel: date, caption, people, map, technical details,
-/// rating and containing albums. owners can edit caption, date and location.
-struct AssetInfoSheet: View {
-    @Environment(\.dismiss) private var dismiss
+/// Photos-style metadata panel designed to sit directly below the viewer's
+/// media inside the viewer's vertical scroll view. It deliberately owns no
+/// vertical scroll view or navigation container.
+struct AssetInfoPanel: View {
     @Environment(SessionStore.self) private var session
 
     let asset: Asset
-    /// fires after an adjust-date save so the viewer can refresh its copy:
-    /// utc capture instant + photographer-local offset in hours.
+    /// Fires after an adjust-date save so the viewer can refresh its copy:
+    /// UTC capture instant + photographer-local offset in hours.
     var onDateAdjusted: ((Date, Double) -> Void)? = nil
+    /// The viewer owns presentation of the album picker because it knows the
+    /// remote ID for local assets that have just been backed up.
+    var onAddToAlbum: (() -> Void)? = nil
+    /// Keeps readable content below edge-to-edge viewer chrome while the
+    /// information surface itself still fills the entire page.
+    var topContentInset: CGFloat = 0
+    var bottomContentInset: CGFloat = 0
 
     private enum LoadState {
         case loading
@@ -22,7 +29,7 @@ struct AssetInfoSheet: View {
     @State private var albums: [Album] = []
     @State private var descriptionDraft = ""
     @State private var savedDescription = ""
-    /// which asset the caption draft belongs to.
+    /// Which asset the caption draft belongs to.
     @State private var draftAssetID: String?
     @State private var isSavingCaption = false
     @State private var rating = 0
@@ -33,7 +40,7 @@ struct AssetInfoSheet: View {
     @State private var editError: String?
     @FocusState private var descriptionFocused: Bool
 
-    /// mutations are for the signed-in owner only; unknown user counts as
+    /// Mutations are for the signed-in owner only; unknown user counts as
     /// owner so an offline session stays usable.
     private var isOwner: Bool {
         guard let userID = session.user?.id else { return true }
@@ -46,52 +53,38 @@ struct AssetInfoSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 22) {
-                    dateHeader
+        VStack(alignment: .leading, spacing: 0) {
+            panelHeader
+            Divider()
 
-                    switch loadState {
-                    case .loading:
-                        ProgressView()
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 80)
-                    case .failed(let message):
-                        ContentUnavailableView {
-                            Label("Couldn't Load Info", systemImage: "exclamationmark.circle")
-                        } description: {
-                            Text(message)
-                        } actions: {
-                            Button("Try Again") { Task { await load() } }
-                                .buttonStyle(.borderedProminent)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 36)
-                    case .loaded(let detail):
-                        detailContent(detail)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 32)
-            }
-            .navigationTitle("Info")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        // awaited: dismissing first would strand the failure
-                        // alert on a sheet that is already gone.
-                        Task {
-                            if await commitDescription() { dismiss() }
-                        }
-                    }
+            VStack(alignment: .leading, spacing: 0) {
+                switch loadState {
+                case .loading:
+                    loadingState
+                case .failed(let message):
+                    failureState(message)
+                case .loaded(let detail):
+                    detailContent(detail)
                 }
             }
-            .scrollDismissesKeyboard(.interactively)
+            .padding(.horizontal, 18)
         }
+        .padding(.bottom, bottomContentInset)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color(uiColor: .systemBackground))
+        .clipShape(UnevenRoundedRectangle(
+            topLeadingRadius: 28,
+            bottomLeadingRadius: 0,
+            bottomTrailingRadius: 0,
+            topTrailingRadius: 28,
+            style: .continuous
+        ))
+        .scrollDismissesKeyboard(.interactively)
         .accessibilityIdentifier("asset-details")
         .task(id: asset.id) { await load() }
+        .onDisappear {
+            Task { await commitDescription() }
+        }
         .sheet(isPresented: $showAdjustDate) {
             if let detail {
                 AdjustDateTimeSheet(asset: asset, detail: detail) { fileCreatedAt, offsetHours in
@@ -126,96 +119,157 @@ struct AssetInfoSheet: View {
         }
     }
 
-    // MARK: - date header
+    // MARK: - Panel header
 
-    private var dateHeader: some View {
-        HStack(alignment: .top, spacing: 8) {
+    private var panelHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Capsule()
+                .fill(.secondary.opacity(0.3))
+                .frame(width: 36, height: 5)
+                .frame(maxWidth: .infinity)
+                .accessibilityHidden(true)
+
+            HStack(alignment: .firstTextBaseline) {
+                Text("Information")
+                    .font(.title2.bold())
+                Spacer()
+                if isSavingCaption {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Saving")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Saving caption")
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 10 + topContentInset)
+        .padding(.bottom, 14)
+    }
+
+    private var loadingState: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+            Text("Loading photo information…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func failureState(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Couldn't Load Info", systemImage: "exclamationmark.circle")
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Button("Try Again") { Task { await load() } }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.tint)
+                .buttonStyle(.plain)
+        }
+        .padding(.vertical, 28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Capture date
+
+    private var captureDateRow: some View {
+        HStack(alignment: .center, spacing: 12) {
+            metadataIcon("calendar")
+
             VStack(alignment: .leading, spacing: 3) {
                 Text(asset.localDate, format: .dateTime.weekday(.wide).month(.wide).day().year().utc())
-                    .font(.title3.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                 HStack(spacing: 5) {
                     Text(asset.localDate, format: .dateTime.hour().minute().utc())
-                    Text("GMT\(Self.offsetLabel(hours: asset.localOffsetHours))")
+                    Text("GMT\(GMTOffsetFormatter.label(hours: asset.localOffsetHours))")
                         .foregroundStyle(.tertiary)
                 }
-                .font(.subheadline)
+                .font(.caption)
                 .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if isOwner, !asset.isLocal, detail != nil {
-                Button {
-                    showAdjustDate = true
-                } label: {
-                    Text("Adjust")
-                        .font(.subheadline.weight(.medium))
-                }
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.capsule)
-                .accessibilityIdentifier("info-adjust-date")
+                Button("Adjust") { showAdjustDate = true }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.tint)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("info-adjust-date")
             }
         }
+        .padding(14)
     }
 
-    static func offsetLabel(hours: Double) -> String {
-        let totalMinutes = Int((hours * 60).rounded())
-        let sign = totalMinutes < 0 ? "-" : "+"
-        let absolute = abs(totalMinutes)
-        return String(format: "%@%02d:%02d", sign, absolute / 60, absolute % 60)
-    }
-
-    // MARK: - sections
+    // MARK: - Sections
 
     @ViewBuilder private func detailContent(_ detail: AssetDetail) -> some View {
         captionSection
-
-        if let people = detail.people?.filter({ $0.isHidden != true }), !people.isEmpty {
-            peopleSection(people)
-        }
-
-        if let exif = detail.exifInfo, hasCoordinates(exif) {
-            locationSection(exif)
-        } else if isOwner, !asset.isLocal {
-            addLocationRow
-        }
-
+        sectionDivider
+        peopleSection(detail.people?.filter { $0.isHidden != true } ?? [])
+        sectionDivider
         detailsSection(detail)
+        sectionDivider
+        locationSection(detail.exifInfo)
 
-        // rating is a server concept; a device-only photo has none to show.
-        if session.preferences?.ratingsEnabled == true, !asset.isLocal {
+        if session.preferences?.tagsEnabled != false {
+            sectionDivider
+            tagsSection(detail.tags ?? [])
+        }
+
+        if session.preferences?.ratingsEnabled == true {
+            sectionDivider
             ratingSection
         }
 
-        if !albums.isEmpty {
-            albumsSection
-        }
+        sectionDivider
+        albumsSection
     }
 
-    // MARK: - caption
+    // MARK: - Caption
 
     @ViewBuilder private var captionSection: some View {
         if isOwner, !asset.isLocal {
             infoSection("Caption") {
                 TextField("Add a caption", text: $descriptionDraft, axis: .vertical)
+                    .font(.body)
+                    .textFieldStyle(.plain)
                     .lineLimit(1...6)
+                    .padding(.vertical, 4)
                     .focused($descriptionFocused)
                     .onChange(of: descriptionFocused) { was, isNow in
                         if was, !isNow { Task { await commitDescription() } }
                     }
                     .accessibilityIdentifier("info-caption")
             }
-        } else if !savedDescription.isEmpty {
+        } else {
             infoSection("Caption") {
-                Text(savedDescription)
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if savedDescription.isEmpty {
+                    emptyState(
+                        systemImage: "text.bubble",
+                        title: "No Caption",
+                        message: asset.isLocal
+                            ? "Back up this item before adding a caption."
+                            : "No caption has been added."
+                    )
+                } else {
+                    Text(savedDescription)
+                        .font(.body)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
     }
 
-    /// writes the draft back to the asset it was typed on - the sheet stays up
-    /// while the pager moves behind it, so `asset` may already be a different
-    /// photo by the time this runs.
+    /// Writes the draft back to the asset it was typed on. The panel can stay
+    /// mounted while the pager moves, so `asset` may already be another photo.
     @discardableResult
     private func commitDescription() async -> Bool {
         let trimmed = descriptionDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -235,21 +289,36 @@ struct AssetInfoSheet: View {
         }
     }
 
-    // MARK: - people
+    // MARK: - People
 
     private func peopleSection(_ people: [Person]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("People")
-                .font(.headline)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 14) {
-                    ForEach(people) { person in
-                        personCell(person)
+        infoSection("People") {
+            if people.isEmpty {
+                emptyState(
+                    systemImage: "person.crop.circle.badge.questionmark",
+                    title: "No People",
+                    message: peopleEmptyMessage
+                )
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 14) {
+                        ForEach(people) { person in
+                            personCell(person)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private var peopleEmptyMessage: String {
+        if session.preferences?.peopleEnabled == false {
+            return "People recognition is turned off."
+        }
+        if asset.isLocal {
+            return "Back up this item to make people available here."
+        }
+        return "No people have been identified in this item."
     }
 
     @ViewBuilder private func personCell(_ person: Person) -> some View {
@@ -264,7 +333,16 @@ struct AssetInfoSheet: View {
                     )
                     .frame(width: 72, height: 72)
                     .clipShape(.circle)
+                } else {
+                    Circle()
+                        .fill(.quaternary)
+                        .frame(width: 72, height: 72)
+                        .overlay {
+                            Image(systemName: "person.fill")
+                                .foregroundStyle(.secondary)
+                        }
                 }
+
                 if person.name.isEmpty {
                     Text("Add a Name")
                         .font(.caption.weight(.medium))
@@ -278,14 +356,15 @@ struct AssetInfoSheet: View {
                         Text(age)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
             }
-            .frame(width: 80)
+            .frame(width: 84)
         }
         .buttonStyle(.plain)
         .simultaneousGesture(
-            person.name.isEmpty
+            person.name.isEmpty && isOwner
                 ? TapGesture().onEnded {
                     personNameDraft = ""
                     renamingPerson = person
@@ -293,18 +372,22 @@ struct AssetInfoSheet: View {
                 : nil
         )
         .contextMenu {
-            Button {
-                personNameDraft = person.name
-                renamingPerson = person
-            } label: {
-                Label(person.name.isEmpty ? "Add a Name" : "Rename", systemImage: "pencil")
+            if isOwner {
+                Button {
+                    personNameDraft = person.name
+                    renamingPerson = person
+                } label: {
+                    Label(person.name.isEmpty ? "Add a Name" : "Rename", systemImage: "pencil")
+                }
             }
         }
     }
 
-    /// age at the time the photo was taken, like the reference client.
+    /// Age at the time the photo was taken, like the reference client.
     private func ageLabel(of person: Person) -> String? {
-        guard let raw = person.birthDate, let birth = APIDate.parse(raw) ?? Self.dateOnly(raw) else { return nil }
+        guard let raw = person.birthDate,
+              let birth = APIDate.parse(raw) ?? Self.dateOnly(raw)
+        else { return nil }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
         let months = calendar.dateComponents([.month], from: birth, to: asset.localDate).month ?? 0
@@ -332,193 +415,291 @@ struct AssetInfoSheet: View {
         }
     }
 
-    // MARK: - location
+    // MARK: - Location
 
-    private func hasCoordinates(_ exif: ExifInfo) -> Bool {
-        guard let latitude = exif.latitude, let longitude = exif.longitude else { return false }
+    @ViewBuilder private func locationSection(_ exif: ExifInfo?) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                sectionLabel("Location")
+                Spacer()
+                if isOwner, !asset.isLocal, detail != nil {
+                    Button(hasCoordinates(exif) ? "Adjust" : "Add") {
+                        showAdjustLocation = true
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.tint)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier(
+                        hasCoordinates(exif) ? "info-adjust-location" : "info-add-location"
+                    )
+                }
+            }
+
+            if let exif, hasCoordinates(exif) {
+                locatedContent(exif)
+            } else {
+                emptyState(
+                    systemImage: "map",
+                    title: "No Location",
+                    message: asset.isLocal
+                        ? "No location is stored with this item."
+                        : "Add a location to make this item easier to find."
+                )
+            }
+        }
+        .padding(.vertical, 20)
+    }
+
+    private func hasCoordinates(_ exif: ExifInfo?) -> Bool {
+        guard let latitude = exif?.latitude, let longitude = exif?.longitude else { return false }
         return latitude != 0 || longitude != 0
     }
 
-    private func locationSection(_ exif: ExifInfo) -> some View {
+    private func locatedContent(_ exif: ExifInfo) -> some View {
         let latitude = exif.latitude ?? 0
         let longitude = exif.longitude ?? 0
         let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-        let place = [exif.city, exif.state]
+        let place = [exif.city, exif.state, exif.country]
             .compactMap { value in
                 guard let value, !value.isEmpty else { return nil }
                 return value
             }
             .joined(separator: ", ")
+        let markerName = place.isEmpty ? "Photo Location" : place
 
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Location")
-                    .font(.headline)
-                Spacer()
-                if isOwner, !asset.isLocal {
-                    Button {
-                        showAdjustLocation = true
-                    } label: {
-                        Text("Adjust")
-                            .font(.subheadline.weight(.medium))
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                    .accessibilityIdentifier("info-adjust-location")
-                }
-            }
-
-            Button {
-                openInMaps(coordinate: coordinate, name: place)
-            } label: {
+        return Button {
+            openInMaps(coordinate: coordinate, name: markerName)
+        } label: {
+            VStack(alignment: .leading, spacing: 12) {
                 Map(initialPosition: .region(MKCoordinateRegion(
                     center: coordinate,
                     span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
                 ))) {
-                    Marker(place, coordinate: coordinate)
+                    Marker(markerName, coordinate: coordinate)
                 }
-                .frame(height: 180)
-                .clipShape(.rect(cornerRadius: 16))
+                .frame(height: 190)
+                .clipShape(.rect(cornerRadius: 18))
                 .allowsHitTesting(false)
-            }
-            .buttonStyle(.plain)
 
-            VStack(alignment: .leading, spacing: 2) {
-                if !place.isEmpty {
-                    Text(place)
-                        .font(.subheadline.weight(.medium))
+                HStack(spacing: 10) {
+                    Image(systemName: "mappin.and.ellipse")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        if !place.isEmpty {
+                            Text(place)
+                                .font(.subheadline.weight(.medium))
+                        }
+                        Text("\(latitude.formatted(.number.precision(.fractionLength(4)))), \(longitude.formatted(.number.precision(.fractionLength(4))))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "arrow.up.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
                 }
-                Text("\(latitude.formatted(.number.precision(.fractionLength(4)))), \(longitude.formatted(.number.precision(.fractionLength(4))))")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(.rect)
         }
-    }
-
-    private var addLocationRow: some View {
-        Button {
-            showAdjustLocation = true
-        } label: {
-            Label("Add a Location", systemImage: "location")
-                .font(.subheadline.weight(.medium))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
-                .background(.quaternary.opacity(0.55), in: .rect(cornerRadius: 16))
-        }
-        .accessibilityIdentifier("info-add-location")
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens this location in Maps")
     }
 
     private func openInMaps(coordinate: CLLocationCoordinate2D, name: String) {
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
         let item = MKMapItem(location: location, address: nil)
-        item.name = name.isEmpty ? "Photo Location" : name
+        item.name = name
         item.openInMaps()
     }
 
-    // MARK: - details
+    // MARK: - Technical details
 
-    @ViewBuilder private func detailsSection(_ detail: AssetDetail) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Details")
-                .font(.headline)
+    private func detailsSection(_ detail: AssetDetail) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("Details")
 
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: fileIcon(for: detail.type))
-                        .font(.system(size: 17, weight: .semibold))
-                        .frame(width: 34, height: 34)
-                        .background(.quaternary, in: .circle)
+            VStack(spacing: 0) {
+                captureDateRow
+                metadataDivider
+                fileRow(detail)
+                metadataDivider
+                cameraRow(detail.exifInfo)
+                metadataDivider
+                captureMetrics(detail.exifInfo)
+            }
+            .background(surfaceFill, in: .rect(cornerRadius: 18))
+        }
+        .padding(.vertical, 20)
+    }
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            Text(detail.originalFileName)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(2)
-                                .truncationMode(.middle)
-                            if detail.isEdited == true {
-                                Text("Edited")
-                                    .font(.caption2.weight(.semibold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(.tertiary.opacity(0.6), in: .capsule)
-                            }
-                        }
+    private func fileRow(_ detail: AssetDetail) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            metadataIcon(fileIcon(for: detail.type))
 
-                        if let summary = fileSummary(detail) {
-                            Text(summary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = detail.originalFileName
-                    } label: {
-                        Label("Copy File Name", systemImage: "doc.on.doc")
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(detail.originalFileName)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+
+                    if detail.isEdited == true {
+                        Text("Edited")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.tertiary.opacity(0.6), in: .capsule)
                     }
                 }
 
-                if let exif = detail.exifInfo, let camera = cameraName(exif) {
-                    Divider()
-                        .padding(.vertical, 12)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 12) {
-                            Image(systemName: "camera")
-                                .font(.system(size: 15, weight: .semibold))
-                                .frame(width: 34, height: 34)
-                                .background(.quaternary, in: .circle)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(camera)
-                                    .font(.subheadline.weight(.semibold))
-                                if let lens = exif.lensModel, !lens.isEmpty {
-                                    Text(lens)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        let specifications = cameraSpecifications(exif)
-                        if !specifications.isEmpty {
-                            ViewThatFits(in: .horizontal) {
-                                HStack(spacing: 8) {
-                                    specificationChips(specifications)
-                                }
-                                VStack(alignment: .leading, spacing: 8) {
-                                    specificationChips(specifications)
-                                }
-                            }
-                        }
-                    }
+                if let summary = fileSummary(detail) {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary.opacity(0.55), in: .rect(cornerRadius: 16))
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = detail.originalFileName
+            } label: {
+                Label("Copy File Name", systemImage: "doc.on.doc")
+            }
         }
     }
 
-    // MARK: - rating
+    private func cameraRow(_ exif: ExifInfo?) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            metadataIcon("camera")
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(exif.flatMap(cameraName) ?? "Camera not available")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+
+                Text(nonEmpty(exif?.lensModel) ?? "Lens not available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+    }
+
+    private func captureMetrics(_ exif: ExifInfo?) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            captureMetric("Focal", value: focalLength(exif))
+            metricDivider
+            captureMetric("Aperture", value: aperture(exif))
+            metricDivider
+            captureMetric("Shutter", value: exposure(exif))
+            metricDivider
+            captureMetric("ISO", value: iso(exif))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 12)
+    }
+
+    private func captureMetric(_ title: String, value: String?) -> some View {
+        VStack(spacing: 3) {
+            Text(value ?? "—")
+                .font(.subheadline.weight(.semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var metricDivider: some View {
+        Divider()
+            .frame(height: 38)
+    }
+
+    private var metadataDivider: some View {
+        Divider()
+            .padding(.leading, 52)
+    }
+
+    private func metadataIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 17, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(width: 26, height: 26)
+    }
+
+    // MARK: - Tags
+
+    private func tagsSection(_ tags: [Tag]) -> some View {
+        infoSection("Tags") {
+            if tags.isEmpty {
+                emptyState(
+                    systemImage: "tag.slash",
+                    title: "No Tags",
+                    message: asset.isLocal
+                        ? "Back up this item before adding tags."
+                        : "No tags have been added to this item."
+                )
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(tags) { tag in
+                            Label(tag.value, systemImage: "tag.fill")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(surfaceFill, in: .capsule)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Rating
 
     private var ratingSection: some View {
         infoSection("Rating") {
-            HStack(spacing: 10) {
-                ForEach(1...5, id: \.self) { star in
-                    Button {
-                        Task { await setRating(star == rating ? 0 : star) }
-                    } label: {
-                        Image(systemName: star <= rating ? "star.fill" : "star")
-                            .font(.system(size: 26))
-                            .foregroundStyle(star <= rating ? Color.accentColor : Color.secondary.opacity(0.5))
+            if asset.isLocal {
+                emptyState(
+                    systemImage: "star.slash",
+                    title: "Not Rated",
+                    message: "Back up this item before adding a rating."
+                )
+            } else {
+                HStack(spacing: 10) {
+                    ForEach(1...5, id: \.self) { star in
+                        Button {
+                            Task { await setRating(star == rating ? 0 : star) }
+                        } label: {
+                            Image(systemName: star <= rating ? "star.fill" : "star")
+                                .font(.system(size: 26))
+                                .foregroundStyle(
+                                    star <= rating ? Color.accentColor : Color.secondary.opacity(0.5)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!isOwner)
+                        .accessibilityLabel("\(star) stars")
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!isOwner)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -534,87 +715,143 @@ struct AssetInfoSheet: View {
         }
     }
 
-    // MARK: - albums
+    // MARK: - Albums
 
     private var albumsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Appears In")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("Appears In")
 
-            VStack(spacing: 0) {
-                ForEach(albums) { album in
-                    NavigationLink {
-                        AlbumDetailScreen(album: album)
-                    } label: {
-                        HStack(spacing: 12) {
-                            if let client = session.client, let cover = album.albumThumbnailAssetId {
-                                RemoteImage(
-                                    url: client.thumbnailURL(assetID: cover),
-                                    targetPixelSize: 120
-                                )
-                                .frame(width: 44, height: 44)
-                                .clipShape(.rect(cornerRadius: 8))
-                            } else {
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(.quaternary)
-                                    .frame(width: 44, height: 44)
-                            }
+            if albums.isEmpty {
+                VStack(alignment: .leading, spacing: 14) {
+                    emptyState(
+                        systemImage: "rectangle.stack.badge.plus",
+                        title: "No Albums",
+                        message: albumsEmptyMessage
+                    )
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(album.albumName)
-                                    .font(.subheadline.weight(.medium))
-                                    .lineLimit(1)
-                                Text("^[\(album.assetCount) item](inflect: true)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Spacer()
-
-                            Image(systemName: "chevron.forward")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
+                    if let onAddToAlbum {
+                        Button(action: onAddToAlbum) {
+                            Label("Add to Album", systemImage: "plus.circle.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.tint)
                         }
-                        .padding(.vertical, 8)
-                    }
-                    .buttonStyle(.plain)
-
-                    if album.id != albums.last?.id {
-                        Divider()
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("info-add-to-album")
                     }
                 }
+            } else {
+                albumRows
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .background(.quaternary.opacity(0.55), in: .rect(cornerRadius: 16))
+        }
+        .padding(.vertical, 20)
+        .padding(.bottom, 20)
+    }
+
+    private var albumsEmptyMessage: String {
+        if asset.isLocal, onAddToAlbum == nil {
+            return "Back up this item before adding it to an album."
+        }
+        return "This item isn't in an album yet."
+    }
+
+    private var albumRows: some View {
+        VStack(spacing: 0) {
+            ForEach(albums) { album in
+                NavigationLink {
+                    AlbumDetailScreen(album: album)
+                } label: {
+                    HStack(spacing: 12) {
+                        albumThumbnail(album)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(album.albumName)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                            Text("^[\(album.assetCount) item](inflect: true)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Image(systemName: "chevron.forward")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+
+                if album.id != albums.last?.id {
+                    Divider()
+                        .padding(.leading, 56)
+                }
+            }
         }
     }
 
-    // MARK: - shared pieces
+    @ViewBuilder private func albumThumbnail(_ album: Album) -> some View {
+        if let client = session.client, let cover = album.albumThumbnailAssetId {
+            RemoteImage(
+                url: client.thumbnailURL(assetID: cover),
+                targetPixelSize: 120
+            )
+            .frame(width: 44, height: 44)
+            .clipShape(.rect(cornerRadius: 8))
+        } else {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.quaternary)
+                .frame(width: 44, height: 44)
+                .overlay {
+                    Image(systemName: "rectangle.stack")
+                        .foregroundStyle(.secondary)
+                }
+        }
+    }
+
+    // MARK: - Shared pieces
+
+    private var surfaceFill: Color {
+        Color(uiColor: .secondarySystemBackground)
+    }
 
     private func infoSection<Content: View>(
         _ title: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel(title)
             content()
-                .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary.opacity(0.55), in: .rect(cornerRadius: 16))
         }
+        .padding(.vertical, 20)
     }
 
-    @ViewBuilder private func specificationChips(_ specifications: [String]) -> some View {
-        ForEach(Array(specifications.enumerated()), id: \.offset) { _, specification in
-            Text(specification)
-                .font(.caption.weight(.medium))
-                .monospacedDigit()
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(.tertiary.opacity(0.65), in: .capsule)
+    private func sectionLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.headline)
+    }
+
+    private var sectionDivider: some View {
+        Divider()
+    }
+
+    private func emptyState(systemImage: String, title: String, message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .frame(width: 24, height: 24)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func fileIcon(for type: AssetType) -> String {
@@ -632,11 +869,14 @@ struct AssetInfoSheet: View {
         if let mime = detail.originalMimeType?.split(separator: "/").last {
             parts.append(mime.uppercased())
         }
+        if let megapixels = megapixels(detail) {
+            parts.append(megapixels)
+        }
         if let dimensions = dimensions(detail) {
             parts.append(dimensions)
         }
-        if let bytes = detail.exifInfo?.fileSizeInByte {
-            parts.append(ByteCountFormatStyle().format(bytes))
+        if let size = fileSize(detail.exifInfo) {
+            parts.append(size)
         }
         if let duration = asset.durationLabel {
             parts.append(duration)
@@ -652,38 +892,61 @@ struct AssetInfoSheet: View {
         return "\(width) × \(height)"
     }
 
+    private func megapixels(_ detail: AssetDetail) -> String? {
+        let width = detail.width ?? detail.exifInfo?.exifImageWidth.map { Int($0) }
+        let height = detail.height ?? detail.exifInfo?.exifImageHeight.map { Int($0) }
+        guard let width, let height, width > 0, height > 0 else { return nil }
+        let value = Double(width) * Double(height) / 1_000_000
+        return "\(value.formatted(.number.precision(.fractionLength(0...1)))) MP"
+    }
+
     private func cameraName(_ exif: ExifInfo) -> String? {
-        let parts = [exif.make, exif.model]
-            .compactMap { (value: String?) -> String? in
-                guard let value, !value.isEmpty else { return nil }
-                return value
-            }
-        return parts.isEmpty ? nil : parts.joined(separator: " ")
+        let make = nonEmpty(exif.make)
+        let model = nonEmpty(exif.model)
+        guard let make else { return model }
+        guard let model else { return make }
+        if model.localizedCaseInsensitiveContains(make) { return model }
+        return "\(make) \(model)"
     }
 
-    private func cameraSpecifications(_ exif: ExifInfo) -> [String] {
-        var specifications: [String] = []
-        if let focalLength = exif.focalLength {
-            specifications.append("\(focalLength.formatted(.number.precision(.fractionLength(0...1)))) mm")
-        }
-        if let fNumber = exif.fNumber {
-            specifications.append("ƒ/\(fNumber.formatted(.number.precision(.fractionLength(0...1))))")
-        }
-        if let exposureTime = exif.exposureTime, !exposureTime.isEmpty {
-            specifications.append(exposureTime)
-        }
-        if let iso = exif.iso {
-            specifications.append("ISO \(Int(iso))")
-        }
-        return specifications
+    private func focalLength(_ exif: ExifInfo?) -> String? {
+        guard let focalLength = exif?.focalLength else { return nil }
+        let value = focalLength.formatted(.number.precision(.fractionLength(0...1)))
+        return "\(value) mm"
     }
 
-    // MARK: - loading
+    private func aperture(_ exif: ExifInfo?) -> String? {
+        guard let fNumber = exif?.fNumber else { return nil }
+        let value = fNumber.formatted(.number.precision(.fractionLength(0...1)))
+        return "ƒ/\(value)"
+    }
+
+    private func exposure(_ exif: ExifInfo?) -> String? {
+        guard let value = nonEmpty(exif?.exposureTime) else { return nil }
+        if value.localizedCaseInsensitiveContains("s") { return value }
+        return "\(value) s"
+    }
+
+    private func iso(_ exif: ExifInfo?) -> String? {
+        guard let value = exif?.iso else { return nil }
+        return "ISO \(Int(value))"
+    }
+
+    private func fileSize(_ exif: ExifInfo?) -> String? {
+        guard let bytes = exif?.fileSizeInByte else { return nil }
+        return ByteCountFormatStyle().format(bytes)
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    // MARK: - Loading
 
     private func load() async {
-        // paging behind the open sheet swaps the asset: flush the caption the
-        // user typed for the previous one before adopting the new one, or it
-        // would be written onto the photo that just slid into view.
+        // Paging swaps the asset while this panel stays mounted. Flush the old
+        // draft before adopting the next photo so it cannot be saved to it.
         if let draftAssetID, draftAssetID != asset.id {
             await commitDescription()
             descriptionFocused = false
@@ -695,12 +958,12 @@ struct AssetInfoSheet: View {
             savedDescription = ""
             rating = 0
             albums = []
+            loadState = .loading
         }
 
-        // device-only assets answer from photokit: same layout, no server
-        // notions like people, caption or rating.
+        // Device-only assets answer from PhotoKit. Server concepts remain as
+        // explicit empty sections instead of disappearing from the layout.
         if asset.isLocal {
-            if detail == nil { loadState = .loading }
             var local: AssetDetail?
             if let localIdentifier = asset.localIdentifier {
                 local = await PhotoLibraryService.localDetail(localIdentifier: localIdentifier)
@@ -718,7 +981,6 @@ struct AssetInfoSheet: View {
             loadState = .failed("Not signed in.")
             return
         }
-        if detail == nil { loadState = .loading }
         let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
 
         do {
@@ -739,10 +1001,13 @@ struct AssetInfoSheet: View {
                 }
             }
         } catch {
-            // offline: the last fetched copy still answers most questions.
+            // Offline: the last fetched copy still answers most questions.
             guard draftAssetID == asset.id else { return }
             if let account,
-               let cached: CachedAssetInfo = OfflineCache.value(key: "asset-info/\(asset.id)", account: account) {
+               let cached: CachedAssetInfo = OfflineCache.value(
+                   key: "asset-info/\(asset.id)",
+                   account: account
+               ) {
                 loadState = .loaded(cached.detail)
                 savedDescription = cached.detail.exifInfo?.description ?? ""
                 if !descriptionFocused { descriptionDraft = savedDescription }
@@ -755,7 +1020,31 @@ struct AssetInfoSheet: View {
     }
 }
 
-/// offline copy of the info sheet payload, one file per asset.
+/// Temporary source-compatibility wrapper for call sites that still use the
+/// old name. New viewer layouts should embed `AssetInfoPanel` directly.
+struct AssetInfoSheet: View {
+    let asset: Asset
+    var onDateAdjusted: ((Date, Double) -> Void)? = nil
+
+    var body: some View {
+        AssetInfoPanel(asset: asset, onDateAdjusted: onDateAdjusted)
+    }
+
+    static func offsetLabel(hours: Double) -> String {
+        GMTOffsetFormatter.label(hours: hours)
+    }
+}
+
+private enum GMTOffsetFormatter {
+    static func label(hours: Double) -> String {
+        let totalMinutes = Int((hours * 60).rounded())
+        let sign = totalMinutes < 0 ? "-" : "+"
+        let absolute = abs(totalMinutes)
+        return String(format: "%@%02d:%02d", sign, absolute / 60, absolute % 60)
+    }
+}
+
+/// Offline copy of the info panel payload, one file per asset.
 private nonisolated struct CachedAssetInfo: Codable {
     let detail: AssetDetail
     let albums: [Album]
