@@ -106,7 +106,7 @@ struct LoginFlowView: View {
     @ViewBuilder private var serverForm: some View {
         AuthField(
             systemImage: "server.rack",
-            placeholder: "server.example.com",
+            placeholder: "demo.immich.app",
             text: $serverInput,
             focus: $focus,
             field: .server
