@@ -203,7 +203,7 @@ struct AssetViewerScreen: View {
 
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
-                        mediaStage
+                        mediaStage(pageLayout)
                             .frame(height: pageLayout.mediaHeight)
                             .id(AssetViewerPage.media)
 
@@ -229,6 +229,9 @@ struct AssetViewerScreen: View {
                 .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne, anchor: .top))
                 .scrollIndicators(.hidden)
                 .scrollDisabled(currentPageZoomed)
+                // the outer scroll sits under the nav bar, so without this it
+                // paints the top edge dim behind the transparent header.
+                .scrollEdgeEffectHidden(true, for: .top)
                 .onScrollGeometryChange(for: Bool.self) { scroll in
                     let viewportHeight = scroll.containerSize.height
                     return viewportHeight > 0
@@ -347,7 +350,7 @@ struct AssetViewerScreen: View {
         }
     }
 
-    private var mediaStage: some View {
+    private func mediaStage(_ pageLayout: AssetViewerPageLayout) -> some View {
         ZStack {
             Color(uiColor: chromeVisible ? .systemBackground : .black)
                 .accessibilityIdentifier("asset-viewer")
@@ -378,7 +381,7 @@ struct AssetViewerScreen: View {
             if !isContextPreview, chromeVisible, let current,
                current.isVideo, playback.ownerID == current.id, playback.player != nil {
                 VideoControlsBar(playback: playback)
-                    .padding(.bottom, 10)
+                    .padding(.bottom, pageLayout.videoControlsBottomInset)
                     .transition(.opacity)
             }
         }
