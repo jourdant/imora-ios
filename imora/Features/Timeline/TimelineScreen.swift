@@ -342,53 +342,36 @@ struct TimelineScreen<Header: View>: View {
 
     @ViewBuilder private func rowView(_ row: TimelineRow, side: CGFloat) -> some View {
         switch row {
-        case .monthHeader(_, let monthTitle):
-            Text(monthTitle)
-                .font(.title2.weight(.bold))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .frame(height: 56, alignment: .bottomLeading)
+        case .titleBand(_, let segments):
+            // leading padding instead of offset keeps each segment in layout,
+            // so positions stay exact and hit testing needs no transforms.
+            ZStack(alignment: .bottomLeading) {
+                ForEach(segments, id: \.dayID) { segment in
+                    titleSegment(segment, side: side)
+                        .padding(.leading, CGFloat(segment.colStart) * (side + 2))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .bottomLeading)
+            .frame(height: 36, alignment: .bottomLeading)
 
-        case .dayHeader(_, let dayTitle, let assetIDs):
-            let selectableIDs = assetIDs.filter(isSelectableAssetID)
-            HStack {
-                Text(dayTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if isSelecting, !selectableIDs.isEmpty {
-                    let allSelected = selectableIDs.allSatisfy { selection.contains($0) }
-                    Button {
-                        if allSelected {
-                            selection.subtract(selectableIDs)
-                        } else {
-                            selection.formUnion(selectableIDs)
+        case .tiles(_, let runs):
+            ZStack(alignment: .topLeading) {
+                ForEach(runs, id: \.colStart) { run in
+                    HStack(spacing: 2) {
+                        ForEach(run.assets) { asset in
+                            tile(asset)
+                                .frame(width: side, height: side)
+                                // plain crossfade: an uploaded photo swaps its
+                                // local tile for the server twin with identical
+                                // pixels, and any scale effect would read as a
+                                // pulse.
+                                .transition(.opacity)
                         }
-                    } label: {
-                        Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(allSelected ? Color.accentColor : .secondary)
-                            .contentTransition(.symbolEffect(.replace))
-                            .animation(.snappy(duration: 0.22), value: allSelected)
                     }
+                    .padding(.leading, CGFloat(run.colStart) * (side + 2))
                 }
             }
-            .padding(.horizontal, 16)
-            .frame(height: 36)
-
-        case .tiles(_, let assets):
-            HStack(spacing: 2) {
-                ForEach(assets) { asset in
-                    tile(asset)
-                        .frame(width: side, height: side)
-                        // plain crossfade: an uploaded photo swaps its local
-                        // tile for the server twin with identical pixels, and
-                        // any scale effect would read as a pulse.
-                        .transition(.opacity)
-                }
-                if assets.count < columnCount {
-                    Spacer(minLength: 0)
-                }
-            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
             .padding(.bottom, 2)
 
         case .placeholder(_, let bucketID, let tileRows):
@@ -398,6 +381,37 @@ struct TimelineScreen<Header: View>: View {
                 // placeholder, re entering the geometry callbacks same frame.
                 .onAppear { Task { await model.loadBucket(bucketID, immediateRows: false) } }
         }
+    }
+
+    private func titleSegment(_ segment: TitleSegment, side: CGFloat) -> some View {
+        let width = CGFloat(segment.colWidth) * side + CGFloat(segment.colWidth - 1) * 2
+        let selectableIDs = segment.selectableIDs.filter(isSelectableAssetID)
+        return HStack(spacing: 4) {
+            Text(segment.title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Spacer(minLength: 0)
+            if isSelecting, !selectableIDs.isEmpty {
+                let allSelected = selectableIDs.allSatisfy { selection.contains($0) }
+                Button {
+                    if allSelected {
+                        selection.subtract(selectableIDs)
+                    } else {
+                        selection.formUnion(selectableIDs)
+                    }
+                } label: {
+                    Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(allSelected ? Color.accentColor : .secondary)
+                        .contentTransition(.symbolEffect(.replace))
+                        .animation(.snappy(duration: 0.22), value: allSelected)
+                }
+            }
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 6)
+        .padding(.bottom, 5)
+        .frame(width: width, height: 36, alignment: .bottomLeading)
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {

@@ -16,18 +16,34 @@ nonisolated struct TimelineSection: Identifiable, Hashable {
     var isLoaded: Bool { days != nil }
 }
 
+/// one day group's title inside a shared title band, pinned to the columns
+/// its tiles occupy below.
+nonisolated struct TitleSegment: Hashable {
+    let dayID: String
+    let title: String
+    let colStart: Int
+    let colWidth: Int
+    /// server assets of the day, for the select-all toggle.
+    let selectableIDs: [String]
+}
+
+/// contiguous tiles within one row band, starting at a column offset. rows
+/// shared by several days carry one run per day.
+nonisolated struct TileRun: Hashable {
+    let colStart: Int
+    let assets: [Asset]
+}
+
 /// flat list element with a deterministic height. fixed heights are what keep
 /// lazyvstack from re-measuring and jumping while scrolling backwards.
 nonisolated enum TimelineRow: Identifiable, Hashable {
-    case monthHeader(String, String)
-    case dayHeader(String, String, [String])
-    case tiles(String, [Asset])
+    case titleBand(String, [TitleSegment])
+    case tiles(String, [TileRun])
     case placeholder(String, String, Int)
 
     var id: String {
         switch self {
-        case .monthHeader(let id, _): id
-        case .dayHeader(let id, _, _): id
+        case .titleBand(let id, _): id
         case .tiles(let id, _): id
         case .placeholder(let id, _, _): id
         }
@@ -35,16 +51,10 @@ nonisolated enum TimelineRow: Identifiable, Hashable {
 
     func height(tileSide: CGFloat) -> CGFloat {
         switch self {
-        case .monthHeader: 56
-        case .dayHeader: 36
+        case .titleBand: 36
         case .tiles: tileSide + 2
         case .placeholder(_, _, let rows): CGFloat(rows) * (tileSide + 2)
         }
-    }
-
-    var monthTitle: String? {
-        if case .monthHeader(_, let title) = self { return title }
-        return nil
     }
 }
 
@@ -67,11 +77,11 @@ final class TimelineModel {
 
     /// row tallies kept in sync by rebuildRows so screens can do o(1) height
     /// math instead of summing thousands of rows.
-    private(set) var monthCount = 0
-    private(set) var dayHeaderCount = 0
+    private(set) var sectionCount = 0
+    private(set) var titleBandCount = 0
     private(set) var tileRowCount = 0
-    /// day headers and tile rows belonging to the last month only.
-    private(set) var tailDayHeaders = 0
+    /// title bands and tile rows belonging to the last month only.
+    private(set) var tailTitleBands = 0
     private(set) var tailTileRows = 0
 
     var columns: Int = 3 {
@@ -372,47 +382,64 @@ final class TimelineModel {
             flattened.reserveCapacity(sections.reduce(0) { $0 + $1.count })
         }
 
-        var months = 0
-        var dayHeaders = 0
+        var sections = 0
+        var titleBands = 0
         var tileRows = 0
-        var sectionDayHeaders = 0
+        var sectionTitleBands = 0
         var sectionTileRows = 0
 
         for section in mergedSections() {
-            let monthID = "m-\(section.id)"
-            result.append(.monthHeader(monthID, section.monthTitle))
-            monthByRowID[monthID] = section.monthTitle
-            months += 1
-            sectionDayHeaders = 0
+            sections += 1
+            sectionTitleBands = 0
             sectionTileRows = 0
 
             if let days = section.days {
-                for day in days {
-                    if rebuildAssets {
+                if rebuildAssets {
+                    for day in days {
                         for asset in day.assets {
                             flattenedIndex[asset.id] = flattened.count
                             flattened.append(asset)
                         }
                     }
+                }
 
-                    let dayID = "d-\(section.id)-\(day.id)"
-                    // select-all only targets server assets; local tiles are
-                    // outside selection until they are backed up.
-                    result.append(.dayHeader(dayID, day.title, day.assets.filter { !$0.isLocal }.map(\.id)))
-                    monthByRowID[dayID] = section.monthTitle
-                    sectionDayHeaders += 1
+                // days flow side by side when they fit; bands never cross a
+                // month boundary so bucket loads only reflow their own month.
+                for band in TimelineFlowLayout.pack(counts: days.map(\.assets.count), columns: columns) {
+                    guard let firstBlock = band.blocks.first else { continue }
+                    let firstDay = days[firstBlock.dayIndex]
+                    let bandID = "b-\(section.id)-\(firstDay.id)"
+                    let segments = band.blocks.map { block in
+                        let day = days[block.dayIndex]
+                        // select-all only targets server assets; local tiles
+                        // are outside selection until they are backed up.
+                        return TitleSegment(
+                            dayID: day.id,
+                            title: day.title,
+                            colStart: block.colStart,
+                            colWidth: block.colWidth,
+                            selectableIDs: day.assets.filter { !$0.isLocal }.map(\.id)
+                        )
+                    }
+                    result.append(.titleBand(bandID, segments))
+                    monthByRowID[bandID] = section.monthTitle
+                    sectionTitleBands += 1
 
-                    var start = 0
-                    var rowIndex = 0
-                    while start < day.assets.count {
-                        let end = min(start + columns, day.assets.count)
-                        let tileID = "t-\(section.id)-\(day.id)-\(rowIndex)"
-                        result.append(.tiles(tileID, Array(day.assets[start..<end])))
+                    for rowIndex in 0..<band.rowCount {
+                        var runs: [TileRun] = []
+                        for block in band.blocks where rowIndex < block.rowCount {
+                            let assets = days[block.dayIndex].assets
+                            let start = rowIndex * block.colWidth
+                            guard start < assets.count else { continue }
+                            let end = min(start + block.colWidth, assets.count)
+                            runs.append(TileRun(colStart: block.colStart, assets: Array(assets[start..<end])))
+                        }
+                        guard let firstRun = runs.first else { continue }
+                        let tileID = "t-\(section.id)-\(firstDay.id)-\(rowIndex)"
+                        result.append(.tiles(tileID, runs))
                         monthByRowID[tileID] = section.monthTitle
-                        firstAssetIDByRowID[tileID] = day.assets[start].id
+                        firstAssetIDByRowID[tileID] = firstRun.assets[0].id
                         sectionTileRows += 1
-                        start = end
-                        rowIndex += 1
                     }
                 }
             } else {
@@ -423,7 +450,7 @@ final class TimelineModel {
                 sectionTileRows += estimated
             }
 
-            dayHeaders += sectionDayHeaders
+            titleBands += sectionTitleBands
             tileRows += sectionTileRows
         }
 
@@ -435,10 +462,10 @@ final class TimelineModel {
                 self.flatAssets = flattened
                 self.flatAssetIndexByID = flattenedIndex
             }
-            self.monthCount = months
-            self.dayHeaderCount = dayHeaders
+            self.sectionCount = sections
+            self.titleBandCount = titleBands
             self.tileRowCount = tileRows
-            self.tailDayHeaders = sectionDayHeaders
+            self.tailTitleBands = sectionTitleBands
             self.tailTileRows = sectionTileRows
         }
         if animated, rows != result, !rows.isEmpty, let applyRowsUpdate {
@@ -461,18 +488,16 @@ final class TimelineModel {
 
     /// exact grid height thanks to deterministic row heights.
     func contentHeight(tileSide: CGFloat) -> CGFloat {
-        CGFloat(monthCount) * 56
-            + CGFloat(dayHeaderCount) * 36
+        CGFloat(titleBandCount) * 36
             + CGFloat(tileRowCount) * (tileSide + 2)
     }
 
-    /// the last month header plus everything under it. the screen pads the
-    /// scroll bottom so this tail can fill the viewport, letting the scrubber
-    /// actually land on the final month even when it holds few photos.
+    /// the last month's rows. the screen pads the scroll bottom so this tail
+    /// can fill the viewport, letting the scrubber actually land on the final
+    /// month even when it holds few photos.
     func tailHeight(tileSide: CGFloat) -> CGFloat {
-        guard monthCount > 0 else { return 0 }
-        return 56
-            + CGFloat(tailDayHeaders) * 36
+        guard sectionCount > 0 else { return 0 }
+        return CGFloat(tailTitleBands) * 36
             + CGFloat(tailTileRows) * (tileSide + 2)
     }
 
@@ -848,14 +873,25 @@ final class TimelineModel {
         var localCalendar = Calendar.current
         localCalendar.timeZone = .current
         // compare using utc calendar since local dates are shifted into utc space.
-        if calendar.isDate(date, inSameDayAs: nowShifted()) { return "Today" }
-        if let yesterday = calendar.date(byAdding: .day, value: -1, to: nowShifted()),
+        let shifted = nowShifted()
+        if calendar.isDate(date, inSameDayAs: shifted) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: shifted),
            calendar.isDate(date, inSameDayAs: yesterday) { return "Yesterday" }
+        // the rest of the past week reads as the weekday alone.
+        if let daysBack = calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: date),
+            to: calendar.startOfDay(for: shifted)
+        ).day, daysBack > 1, daysBack < 7 {
+            return date.formatted(.dateTime.weekday(.wide).utc())
+        }
         let sameYear = calendar.component(.year, from: date) == localCalendar.component(.year, from: now)
+        // other years trade the weekday for the year so the title still fits
+        // a single-column block.
         return date.formatted(
             sameYear
                 ? .dateTime.weekday(.abbreviated).month(.abbreviated).day().utc()
-                : .dateTime.weekday(.abbreviated).month(.abbreviated).day().year().utc()
+                : .dateTime.month(.abbreviated).day().year().utc()
         )
     }
 
