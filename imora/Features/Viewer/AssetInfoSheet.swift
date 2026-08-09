@@ -1,9 +1,8 @@
 import SwiftUI
 import MapKit
 
-/// Photos-style metadata panel designed to sit directly below the viewer's
-/// media inside the viewer's vertical scroll view. It deliberately owns no
-/// vertical scroll view or navigation container.
+/// Photos-style metadata content for the viewer's native information sheet.
+/// The presenting screen owns the vertical scroll view and sheet behavior.
 struct AssetInfoPanel: View {
     @Environment(SessionStore.self) private var session
 
@@ -14,10 +13,6 @@ struct AssetInfoPanel: View {
     /// The viewer owns presentation of the album picker because it knows the
     /// remote ID for local assets that have just been backed up.
     var onAddToAlbum: (() -> Void)? = nil
-    /// Keeps readable content below edge-to-edge viewer chrome while the
-    /// information surface itself still fills the entire page.
-    var topContentInset: CGFloat = 0
-    var bottomContentInset: CGFloat = 0
 
     private enum LoadState {
         case loading
@@ -69,17 +64,9 @@ struct AssetInfoPanel: View {
             }
             .padding(.horizontal, 18)
         }
-        .padding(.bottom, bottomContentInset)
+        .padding(.bottom, 24)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(Color(uiColor: .systemBackground))
-        .clipShape(UnevenRoundedRectangle(
-            topLeadingRadius: 28,
-            bottomLeadingRadius: 0,
-            bottomTrailingRadius: 0,
-            topTrailingRadius: 28,
-            style: .continuous
-        ))
-        .scrollDismissesKeyboard(.interactively)
         .accessibilityIdentifier("asset-details")
         .task(id: asset.id) { await load() }
         .onDisappear {
@@ -122,32 +109,24 @@ struct AssetInfoPanel: View {
     // MARK: - Panel header
 
     private var panelHeader: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Capsule()
-                .fill(.secondary.opacity(0.3))
-                .frame(width: 36, height: 5)
-                .frame(maxWidth: .infinity)
-                .accessibilityHidden(true)
-
-            HStack(alignment: .firstTextBaseline) {
-                Text("Information")
-                    .font(.title2.bold())
-                Spacer()
-                if isSavingCaption {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Saving")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Saving caption")
+        HStack(alignment: .firstTextBaseline) {
+            Text("Information")
+                .font(.title2.bold())
+            Spacer()
+            if isSavingCaption {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Saving")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Saving caption")
             }
         }
         .padding(.horizontal, 18)
-        .padding(.top, 10 + topContentInset)
+        .padding(.top, 18)
         .padding(.bottom, 14)
     }
 

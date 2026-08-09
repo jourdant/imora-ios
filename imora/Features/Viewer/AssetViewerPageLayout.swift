@@ -1,37 +1,36 @@
 import CoreGraphics
 
-/// The viewer is two vertically aligned destinations: the media and its
-/// information. Keeping their shared height in one value prevents one page
-/// from shrinking independently as the surrounding chrome changes.
+/// Sizes the media as the viewer moves between its immersive and information
+/// presentations. The information surface occupies 80% of the viewport, so
+/// the asset remains visible and refits the strip above it.
 nonisolated struct AssetViewerPageLayout: Equatable {
-    let mediaHeight: CGFloat
-    let informationHeight: CGFloat
-    let informationTopContentInset: CGFloat
-    let informationBottomContentInset: CGFloat
+    /// SwiftUI measures fractional sheet detents inside the maximum-detent
+    /// region rather than the whole display. 0.88 leaves roughly one fifth of
+    /// a Dynamic Island phone visible above the sheet.
+    static let informationSheetFraction: CGFloat = 0.88
+    static let informationMediaFraction: CGFloat = 0.2
 
-    init(
-        viewportHeight: CGFloat,
-        viewportWidth: CGFloat = 0,
-        topSafeAreaInset: CGFloat = 0,
-        bottomSafeAreaInset: CGFloat = 0
-    ) {
+    let mediaHeight: CGFloat
+    let informationMediaHeight: CGFloat
+    private let viewportWidth: CGFloat
+
+    init(viewportHeight: CGFloat, viewportWidth: CGFloat = 0) {
         let pageHeight = max(0, viewportHeight)
         mediaHeight = pageHeight
-        informationHeight = pageHeight
+        informationMediaHeight = pageHeight * Self.informationMediaFraction
+        self.viewportWidth = max(0, viewportWidth)
+    }
 
-        guard pageHeight > 0 else {
-            informationTopContentInset = 0
-            informationBottomContentInset = 0
-            return
+    /// Once presented, the sheet's real global frame is the source of truth
+    /// for the media region. Regular-width floating sheets leave the full
+    /// viewer in place instead of collapsing an unrelated strip behind them.
+    func mediaHeight(forInformationSheet sheetFrame: CGRect, compactWidth: Bool = true) -> CGFloat {
+        guard sheetFrame.width > 0 else {
+            return compactWidth ? informationMediaHeight : mediaHeight
         }
-
-        // The viewer deliberately extends under its floating toolbars. Keep
-        // the information surface edge-to-edge while moving only its readable
-        // content clear of those controls.
-        let portrait = viewportWidth <= 0 || viewportHeight >= viewportWidth
-        let minimumTopInset: CGFloat = portrait ? 90 : 60
-        let minimumBottomInset: CGFloat = portrait ? 104 : 76
-        informationTopContentInset = max(minimumTopInset, max(0, topSafeAreaInset) + 16)
-        informationBottomContentInset = max(minimumBottomInset, max(0, bottomSafeAreaInset) + 50)
+        guard viewportWidth <= 0 || sheetFrame.width >= viewportWidth * 0.9 else {
+            return mediaHeight
+        }
+        return min(mediaHeight, max(0, sheetFrame.minY))
     }
 }

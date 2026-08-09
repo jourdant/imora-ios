@@ -131,6 +131,10 @@ final class BackupManager {
     private let client: ImmichClient
     private let index: BackupIndex
     private var runTask: Task<Void, Never>?
+    /// whether the current or next run may upload. false makes the run a
+    /// passive reconcile - scan, hash and bulk-check only - which rebuilds
+    /// the index quietly and ends back at idle.
+    private var runAllowsUploads = true
     private var rerunRequested = false
     private var changeObserver: LibraryChangeObserver?
     /// uploads that landed in the index without a run to count them, i.e. while
@@ -175,24 +179,39 @@ final class BackupManager {
     // MARK: - triggers
 
     func start() {
-        guard !isRunning else { return }
+        // a run is already going: raise its upload gate instead of dropping
+        // the ask. a passive reconcile reads the flag again before uploading.
+        if runTask != nil {
+            runAllowsUploads = true
+            return
+        }
+        runAllowsUploads = true
         runTask = Task { await run() }
     }
 
-    /// starts a run if idle and suspends until it ends. the continued-processing
-    /// task has to outlive the whole run, so it needs something to await.
+    /// ensures a full upload run and suspends until the pipeline goes quiet.
+    /// the continued-processing task has to outlive the whole run, so it needs
+    /// something to await. escalation can chain a follow-up run, hence the loop.
     func runToCompletion() async {
-        if !isRunning { start() }
-        await runTask?.value
+        start()
+        while let task = runTask {
+            await task.value
+        }
     }
 
     func cancel() {
+        // stopping also withdraws any upload ask that raced this cancel.
+        runAllowsUploads = false
         runTask?.cancel()
     }
 
+    /// starts a full run when auto backup is on, and a passive reconcile
+    /// otherwise, so assets already on the server are recognized - after a
+    /// reinstall or an upload from another device - without sending anything.
     func startIfIdle() {
-        guard autoBackup, !isRunning, PhotoLibraryService.hasFullAccess else { return }
-        start()
+        guard runTask == nil, PhotoLibraryService.hasFullAccess else { return }
+        runAllowsUploads = autoBackup
+        runTask = Task { await run() }
     }
 
     private func enableAndStart() async {
@@ -202,7 +221,7 @@ final class BackupManager {
             return
         }
         updateChangeObserver()
-        if !isRunning { start() }
+        start()
     }
 
     /// the observer keeps the merged timeline fresh, so it registers with
@@ -225,7 +244,9 @@ final class BackupManager {
     private func libraryChanged() {
         LocalImageLoader.shared.noteLibraryChange()
         localChanged()
-        if isRunning {
+        // keyed on the task, not the phase: a change landing while the run
+        // winds down must not be lost.
+        if runTask != nil {
             rerunRequested = true
         } else {
             startIfIdle()
@@ -367,14 +388,26 @@ final class BackupManager {
     // MARK: - pipeline
 
     private func run() async {
+        var uploadsAllowed = runAllowsUploads
+        var chainFullRun = false
         summary = BackupSummary()
         lastFailure = nil
         phase = .scanning
         do {
-            guard await PhotoLibraryService.requestFullAccess() else {
-                phase = .error("full photo library access is required for backup.")
-                runTask = nil
-                return
+            if uploadsAllowed {
+                guard await PhotoLibraryService.requestFullAccess() else {
+                    phase = .error("full photo library access is required for backup.")
+                    runTask = nil
+                    return
+                }
+            } else {
+                // a passive reconcile never prompts. access was there at spawn
+                // and this only guards against it vanishing in between.
+                guard PhotoLibraryService.hasFullAccess else {
+                    phase = .idle
+                    runTask = nil
+                    return
+                }
             }
             let user = try await client.currentUser()
             userId = user.id
@@ -387,22 +420,43 @@ final class BackupManager {
             try await hashPhase(scanned)
             let pending = try await checkPhase(scanned)
             localChanged()
-            try await uploadPhase(pending)
+            // read again so a backup asked for during scan, hash or check
+            // upgrades this run instead of waiting for the next one.
+            uploadsAllowed = runAllowsUploads
+            if uploadsAllowed {
+                try await uploadPhase(pending)
+            }
 
             await index.save()
-            phase = .done(summary)
+            if uploadsAllowed {
+                phase = .done(summary)
+            } else {
+                // a passive reconcile ends where it began: no summary, no
+                // notification, just fresh pairings for the merged timeline.
+                phase = .idle
+                chainFullRun = runAllowsUploads
+            }
         } catch is CancellationError {
             await index.save()
             phase = .idle
         } catch {
             await index.save()
-            phase = .error(error.localizedDescription)
+            if runAllowsUploads {
+                phase = .error(error.localizedDescription)
+            } else {
+                // nobody asked for this run, so it fails silently.
+                backupLog.error("passive reconcile failed: \(error)")
+                phase = .idle
+            }
         }
         onRunFinished?(phase)
         uploadStates.removeAll()
         localChanged()
         runTask = nil
-        if rerunRequested {
+        if chainFullRun {
+            // the upload ask arrived after the gate: run again, in full.
+            start()
+        } else if rerunRequested {
             rerunRequested = false
             startIfIdle()
         }
