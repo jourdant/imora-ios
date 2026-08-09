@@ -57,7 +57,6 @@ struct LoginFlowView: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .background(Color(.systemBackground))
-        .task { await debugAutoLogin() }
     }
 
     private var header: some View {
@@ -68,7 +67,7 @@ struct LoginFlowView: View {
                 .frame(width: 84, height: 84)
 
             Text("Imora")
-                .font(.system(.largeTitle, design: .rounded).weight(.bold))
+                .font(.largeTitle.weight(.bold))
 
             Text(subtitle)
                 .font(.callout)
@@ -76,22 +75,6 @@ struct LoginFlowView: View {
                 .multilineTextAlignment(.center)
                 .contentTransition(.opacity)
         }
-    }
-
-    /// lets ui tests and simulator runs log in from environment variables.
-    /// with only a server set, it resolves and stops on the credentials step.
-    private func debugAutoLogin() async {
-        #if DEBUG
-        let env = ProcessInfo.processInfo.environment
-        guard let server = env["IMORA_SERVER"] else { return }
-        serverInput = server
-        await resolveServer()
-        if let mail = env["IMORA_EMAIL"], let pass = env["IMORA_PASSWORD"] {
-            email = mail
-            password = pass
-            await logIn()
-        }
-        #endif
     }
 
     private var subtitle: String {

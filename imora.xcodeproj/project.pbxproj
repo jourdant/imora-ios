@@ -19,13 +19,6 @@
 			remoteGlobalIDString = 000000000000000200000000;
 			remoteInfo = imoraShare;
 		};
-		000000000000000391000000 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 000000000000000000000000 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 000000000000000100000000;
-			remoteInfo = imora;
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -43,7 +36,6 @@
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* imora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = imora.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000121 /* imoraShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = imoraShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		000000000000000000000122 /* imoraTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = imoraTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -70,11 +62,6 @@
 			path = imoraShare;
 			sourceTree = "<group>";
 		};
-		000000000000000000000013 /* imoraTests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = imoraTests;
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,11 +76,6 @@
 			files = (
 			);
 		};
-		000000000000000330000000 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			files = (
-			);
-		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -102,7 +84,6 @@
 			children = (
 				000000000000000000000010 /* imora */,
 				000000000000000000000011 /* imoraShare */,
-				000000000000000000000013 /* imoraTests */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -112,7 +93,6 @@
 			children = (
 				000000000000000000000120 /* imora.app */,
 				000000000000000000000121 /* imoraShare.appex */,
-				000000000000000000000122 /* imoraTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -163,27 +143,6 @@
 			productReference = 000000000000000000000121 /* imoraShare.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
-		000000000000000300000000 /* imoraTests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 000000000000000310000000 /* Build configuration list for PBXNativeTarget "imoraTests" */;
-			buildPhases = (
-				000000000000000320000000 /* Sources */,
-				000000000000000330000000 /* Frameworks */,
-				000000000000000340000000 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				000000000000000390000000 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				000000000000000000000013 /* imoraTests */,
-			);
-			name = imoraTests;
-			productName = imoraTests;
-			productReference = 000000000000000000000122 /* imoraTests.xctest */;
-			productType = "com.apple.product-type.bundle.unit-test";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -199,10 +158,6 @@
 					};
 					000000000000000200000000 = {
 						CreatedOnToolsVersion = 26.3;
-					};
-					000000000000000300000000 = {
-						CreatedOnToolsVersion = 26.3;
-						TestTargetID = 000000000000000100000000;
 					};
 				};
 			};
@@ -225,7 +180,6 @@
 			targets = (
 				000000000000000100000000 /* imora */,
 				000000000000000200000000 /* imoraShare */,
-				000000000000000300000000 /* imoraTests */,
 			);
 		};
 /* End PBXProject section */
@@ -237,11 +191,6 @@
 			);
 		};
 		000000000000000240000000 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			files = (
-			);
-		};
-		000000000000000340000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);
@@ -259,11 +208,6 @@
 			files = (
 			);
 		};
-		000000000000000320000000 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			files = (
-			);
-		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -271,11 +215,6 @@
 			isa = PBXTargetDependency;
 			target = 000000000000000200000000 /* imoraShare */;
 			targetProxy = 000000000000000191000000 /* PBXContainerItemProxy */;
-		};
-		000000000000000390000000 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 000000000000000100000000 /* imora */;
-			targetProxy = 000000000000000391000000 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -556,52 +495,6 @@
 			};
 			name = Release;
 		};
-		000000000000000311000000 /* Debug configuration for PBXNativeTarget "imoraTests" */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = WLAPHT4WXV;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vexcited.imoraTests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = iphoneos;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/imora.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/imora";
-			};
-			name = Debug;
-		};
-		000000000000000312000000 /* Release configuration for PBXNativeTarget "imoraTests" */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = WLAPHT4WXV;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vexcited.imoraTests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = iphoneos;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
-				SWIFT_EMIT_LOC_STRINGS = NO;
-				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/imora.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/imora";
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -626,14 +519,6 @@
 			buildConfigurations = (
 				000000000000000211000000 /* Debug configuration for PBXNativeTarget "imoraShare" */,
 				000000000000000212000000 /* Release configuration for PBXNativeTarget "imoraShare" */,
-			);
-			defaultConfigurationName = Release;
-		};
-		000000000000000310000000 /* Build configuration list for PBXNativeTarget "imoraTests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				000000000000000311000000 /* Debug configuration for PBXNativeTarget "imoraTests" */,
-				000000000000000312000000 /* Release configuration for PBXNativeTarget "imoraTests" */,
 			);
 			defaultConfigurationName = Release;
 		};

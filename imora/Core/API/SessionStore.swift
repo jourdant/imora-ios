@@ -30,19 +30,6 @@ final class SessionStore {
     /// server confirms them in the background. an expired token only shows
     /// once the refresh comes back 401.
     init() {
-        #if DEBUG
-        // ui test runs pin the server via env; a persisted session from a
-        // different server must not win over it.
-        if let envServer = ProcessInfo.processInfo.environment["IMORA_SERVER"],
-           let envHost = URL(string: envServer)?.host(),
-           let stored = serverURL, stored.host() != envHost {
-            UserDefaults.standard.removeObject(forKey: Self.serverKey)
-            KeychainStore.delete(Self.tokenKey)
-            SessionCache.clear()
-            state = .loggedOut
-            return
-        }
-        #endif
         guard let apiURL = serverURL, let token = KeychainStore.get(Self.tokenKey) else {
             state = .loggedOut
             return
