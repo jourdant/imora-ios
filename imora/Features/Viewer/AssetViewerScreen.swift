@@ -84,6 +84,9 @@ struct AssetViewerScreen: View {
     let onRequestDismissal: (() -> Void)?
     let onSelectionChanged: (String) -> Void
     let onPageZoomChanged: (Bool) -> Void
+    /// mirrors whether the vertical scroll rests on the media page, so the
+    /// zoom transition only claims pans that should dismiss.
+    let onMediaAtTopChanged: (Bool) -> Void
     let presentationID: UUID
     let zoomNamespace: Namespace.ID?
     let isContextPreview: Bool
@@ -116,6 +119,9 @@ struct AssetViewerScreen: View {
     @State private var didNotifyDismissal = false
     @State private var prefetcher = ThumbnailPrefetcher(targetPixelSize: pagePixelSize)
     @State private var playback = VideoPlayback()
+    /// exact page height for offset-based page scrolling - id targets inside
+    /// the lazy stack are not realized until scrolled near.
+    @State private var mediaPageHeight: CGFloat = 0
 
     init(
         assets: [Asset],
@@ -127,6 +133,7 @@ struct AssetViewerScreen: View {
         onRequestDismissal: (() -> Void)? = nil,
         onSelectionChanged: @escaping (String) -> Void = { _ in },
         onPageZoomChanged: @escaping (Bool) -> Void = { _ in },
+        onMediaAtTopChanged: @escaping (Bool) -> Void = { _ in },
         onDismissed: @escaping () -> Void,
         onChange: @escaping (AssetChange) -> Void
     ) {
@@ -141,6 +148,7 @@ struct AssetViewerScreen: View {
         self.onRequestDismissal = onRequestDismissal
         self.onSelectionChanged = onSelectionChanged
         self.onPageZoomChanged = onPageZoomChanged
+        self.onMediaAtTopChanged = onMediaAtTopChanged
         self.onDismissed = onDismissed
         self.onChange = onChange
     }
@@ -203,7 +211,7 @@ struct AssetViewerScreen: View {
 
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
-                        mediaStage(pageLayout)
+                        mediaStage
                             .frame(height: pageLayout.mediaHeight)
                             .id(AssetViewerPage.media)
 
@@ -240,8 +248,26 @@ struct AssetViewerScreen: View {
                     guard isVisible != showInfo else { return }
                     showInfo = isVisible
                 }
+                .onScrollGeometryChange(for: Bool.self) { scroll in
+                    scroll.contentOffset.y <= 1
+                } action: { _, atTop in
+                    onMediaAtTopChanged(atTop)
+                }
+                .onChange(of: pageLayout.mediaHeight, initial: true) { _, height in
+                    mediaPageHeight = height
+                }
             }
             .ignoresSafeArea()
+            // stacked by the system above the bottom toolbar, so the controls
+            // never sit behind the viewer buttons.
+            .safeAreaBar(edge: .bottom) {
+                if !isContextPreview, chromeVisible, let current,
+                   current.isVideo, playback.ownerID == current.id, playback.player != nil {
+                    VideoControlsBar(playback: playback)
+                        .padding(.bottom, 4)
+                        .transition(.opacity)
+                }
+            }
             .toolbar { toolbarContent }
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .navigationBar)
             .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .bottomBar)
@@ -350,7 +376,7 @@ struct AssetViewerScreen: View {
         }
     }
 
-    private func mediaStage(_ pageLayout: AssetViewerPageLayout) -> some View {
+    private var mediaStage: some View {
         ZStack {
             Color(uiColor: chromeVisible ? .systemBackground : .black)
                 .accessibilityIdentifier("asset-viewer")
@@ -376,14 +402,6 @@ struct AssetViewerScreen: View {
             AirPlayRoutePicker(trigger: $airPlayTrigger)
                 .frame(width: 1, height: 1)
                 .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            if !isContextPreview, chromeVisible, let current,
-               current.isVideo, playback.ownerID == current.id, playback.player != nil {
-                VideoControlsBar(playback: playback)
-                    .padding(.bottom, pageLayout.videoControlsBottomInset)
-                    .transition(.opacity)
-            }
         }
     }
 
@@ -427,7 +445,7 @@ struct AssetViewerScreen: View {
     }
 
     private func scroll(to page: AssetViewerPage) {
-        viewerScrollPosition.scrollTo(id: page, anchor: .top)
+        viewerScrollPosition.scrollTo(y: page == .media ? 0 : mediaPageHeight)
     }
 
     // MARK: - chrome

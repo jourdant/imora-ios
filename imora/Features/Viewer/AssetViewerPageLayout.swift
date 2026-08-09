@@ -8,9 +8,6 @@ nonisolated struct AssetViewerPageLayout: Equatable {
     let informationHeight: CGFloat
     let informationTopContentInset: CGFloat
     let informationBottomContentInset: CGFloat
-    /// bottom padding for the floating video controls so they sit above the
-    /// bottom toolbar cluster instead of behind it.
-    let videoControlsBottomInset: CGFloat
 
     init(
         viewportHeight: CGFloat,
@@ -25,7 +22,6 @@ nonisolated struct AssetViewerPageLayout: Equatable {
         guard pageHeight > 0 else {
             informationTopContentInset = 0
             informationBottomContentInset = 0
-            videoControlsBottomInset = 0
             return
         }
 
@@ -37,6 +33,5 @@ nonisolated struct AssetViewerPageLayout: Equatable {
         let minimumBottomInset: CGFloat = portrait ? 104 : 76
         informationTopContentInset = max(minimumTopInset, max(0, topSafeAreaInset) + 16)
         informationBottomContentInset = max(minimumBottomInset, max(0, bottomSafeAreaInset) + 50)
-        videoControlsBottomInset = max(66, max(0, bottomSafeAreaInset) + 58)
     }
 }

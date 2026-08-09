@@ -51,6 +51,9 @@ final class AssetViewerDisplayState {
     var mode: Mode
     var currentAssetID: String
     var currentPageZoomed = false
+    /// whether the viewer's vertical scroll rests on the media page. while
+    /// the information page is open, pans belong to that scroll.
+    var mediaAtTop = true
 
     init(mode: Mode, currentAssetID: String) {
         self.mode = mode
@@ -132,8 +135,12 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         view.backgroundColor = .clear
 
         let options = UIViewController.Transition.ZoomOptions()
+        // vertical pans feed the media-info scroll. only a downward pull with
+        // the media page at rest hands the gesture to the dismissal, otherwise
+        // the transition's recognizer eats every swipe and the scroll is dead.
         options.interactiveDismissShouldBegin = { [weak state] context in
-            context.willBegin && state?.currentPageZoomed != true
+            guard context.willBegin, let state else { return false }
+            return !state.currentPageZoomed && state.mediaAtTop && context.velocity.dy > 0
         }
         preferredTransition = .zoom(options: options) { [weak state, weak sourceRegistry] _ in
             guard let assetID = state?.currentAssetID else { return nil }
@@ -379,6 +386,7 @@ private struct AssetViewerHostRoot: View {
             onRequestDismissal: { dismissalRelay.request() },
             onSelectionChanged: { displayState.currentAssetID = $0 },
             onPageZoomChanged: { displayState.currentPageZoomed = $0 },
+            onMediaAtTopChanged: { displayState.mediaAtTop = $0 },
             onDismissed: {}
         ) { change in
             onChange(change)
