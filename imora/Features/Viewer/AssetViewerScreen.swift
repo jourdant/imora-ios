@@ -200,82 +200,66 @@ struct AssetViewerScreen: View {
     }
 
     private var core: some View {
-        NavigationStack {
-            GeometryReader { geometry in
-                let pageLayout = AssetViewerPageLayout(
-                    viewportHeight: geometry.size.height,
-                    viewportWidth: geometry.size.width,
-                    topSafeAreaInset: geometry.safeAreaInsets.top,
-                    bottomSafeAreaInset: geometry.safeAreaInsets.bottom
-                )
+        GeometryReader { geometry in
+            let pageLayout = AssetViewerPageLayout(
+                viewportHeight: geometry.size.height,
+                viewportWidth: geometry.size.width,
+                topSafeAreaInset: geometry.safeAreaInsets.top,
+                bottomSafeAreaInset: geometry.safeAreaInsets.bottom
+            )
 
-                ScrollView(.vertical) {
-                    LazyVStack(spacing: 0) {
-                        mediaStage
-                            .frame(height: pageLayout.mediaHeight)
-                            .id(AssetViewerPage.media)
+            ScrollView(.vertical) {
+                // a plain continuous scroll: snapping behaviors re-align when
+                // the info panel grows on detail load, which read as the view
+                // resetting to the top.
+                LazyVStack(spacing: 0) {
+                    mediaStage
+                        .frame(height: pageLayout.mediaHeight)
 
-                        if let current {
-                            AssetInfoPanel(
-                                asset: current,
-                                onDateAdjusted: { fileCreatedAt, offsetHours in
-                                    guard let index = assets.firstIndex(where: { $0.id == current.id }) else { return }
-                                    assets[index].fileCreatedAt = fileCreatedAt
-                                    assets[index].localOffsetHours = offsetHours
-                                },
-                                onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
-                                topContentInset: pageLayout.informationTopContentInset,
-                                bottomContentInset: pageLayout.informationBottomContentInset
-                            )
-                            .frame(minHeight: pageLayout.informationHeight, alignment: .top)
-                            .id(AssetViewerPage.information)
-                        }
+                    if let current {
+                        AssetInfoPanel(
+                            asset: current,
+                            onDateAdjusted: { fileCreatedAt, offsetHours in
+                                guard let index = assets.firstIndex(where: { $0.id == current.id }) else { return }
+                                assets[index].fileCreatedAt = fileCreatedAt
+                                assets[index].localOffsetHours = offsetHours
+                            },
+                            onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+                            topContentInset: pageLayout.informationTopContentInset,
+                            bottomContentInset: pageLayout.informationBottomContentInset
+                        )
+                        .frame(minHeight: pageLayout.informationHeight, alignment: .top)
                     }
-                    .scrollTargetLayout()
-                }
-                .scrollPosition($viewerScrollPosition)
-                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne, anchor: .top))
-                .scrollIndicators(.hidden)
-                .scrollDisabled(currentPageZoomed)
-                // the outer scroll sits under the nav bar, so without this it
-                // paints the top edge dim behind the transparent header.
-                .scrollEdgeEffectHidden(true, for: .top)
-                .onScrollGeometryChange(for: Bool.self) { scroll in
-                    let viewportHeight = scroll.containerSize.height
-                    return viewportHeight > 0
-                        && max(0, scroll.contentOffset.y) >= viewportHeight * 0.5
-                } action: { _, isVisible in
-                    guard isVisible != showInfo else { return }
-                    showInfo = isVisible
-                }
-                .onScrollGeometryChange(for: Bool.self) { scroll in
-                    scroll.contentOffset.y <= 1
-                } action: { _, atTop in
-                    onMediaAtTopChanged(atTop)
-                }
-                .onChange(of: pageLayout.mediaHeight, initial: true) { _, height in
-                    mediaPageHeight = height
                 }
             }
-            .ignoresSafeArea()
-            // stacked by the system above the bottom toolbar, so the controls
-            // never sit behind the viewer buttons.
-            .safeAreaBar(edge: .bottom) {
-                if !isContextPreview, chromeVisible, let current,
-                   current.isVideo, playback.ownerID == current.id, playback.player != nil {
-                    VideoControlsBar(playback: playback)
-                        .padding(.bottom, 4)
-                        .transition(.opacity)
-                }
+            .scrollPosition($viewerScrollPosition)
+            .scrollIndicators(.hidden)
+            .scrollDisabled(currentPageZoomed)
+            .scrollEdgeEffectHidden(true, for: .top)
+            .onScrollGeometryChange(for: Bool.self) { scroll in
+                let viewportHeight = scroll.containerSize.height
+                return viewportHeight > 0
+                    && max(0, scroll.contentOffset.y) >= viewportHeight * 0.5
+            } action: { _, isVisible in
+                guard isVisible != showInfo else { return }
+                showInfo = isVisible
             }
-            .toolbar { toolbarContent }
-            .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .navigationBar)
-            .toolbarVisibility(!isContextPreview && chromeVisible ? .visible : .hidden, for: .bottomBar)
-            // the header stays fully transparent: no bar backdrop, no top
-            // scroll edge blur, just the floating glass controls and pill.
-            .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-            .navigationBarTitleDisplayMode(.inline)
+            .onScrollGeometryChange(for: Bool.self) { scroll in
+                scroll.contentOffset.y <= 1
+            } action: { _, atTop in
+                onMediaAtTopChanged(atTop)
+            }
+            .onChange(of: pageLayout.mediaHeight, initial: true) { _, height in
+                mediaPageHeight = height
+            }
+            .overlay(alignment: .top) {
+                viewerHeader(topInset: geometry.safeAreaInsets.top)
+            }
+            .overlay(alignment: .bottom) {
+                bottomChrome(bottomInset: geometry.safeAreaInsets.bottom)
+            }
         }
+        .ignoresSafeArea()
         .statusBarHidden(isContextPreview || !chromeVisible)
         .allowsHitTesting(!isContextPreview && !isDismissing)
         .onAppear {
@@ -450,166 +434,171 @@ struct AssetViewerScreen: View {
 
     // MARK: - chrome
 
-    @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            Button {
-                requestDismissal()
-            } label: {
-                Image(systemName: "chevron.backward")
-            }
-            .accessibilityIdentifier("viewer-close")
-        }
+    /// glass circle chrome for every floating viewer control. custom overlays
+    /// replace the native bars so hiding the chrome fades every button in
+    /// place instead of sliding bars or blurring one big rectangle.
+    private func glassIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 17, weight: .medium))
+            .frame(width: 44, height: 44)
+            .contentShape(.circle)
+            .glassEffect(.regular, in: .circle)
+    }
 
-        ToolbarItem(placement: .principal) {
-            if let current {
+    @ViewBuilder private func viewerHeader(topInset: CGFloat) -> some View {
+        if !isContextPreview, chromeVisible, let current {
+            ZStack {
                 titlePill(current)
-            }
-        }
 
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            if let current {
-                backupStatusControl(current)
-            }
-            moreMenu
-                .accessibilityIdentifier("viewer-menu")
-        }
+                HStack(spacing: 10) {
+                    Button {
+                        requestDismissal()
+                    } label: {
+                        glassIcon("chevron.backward")
+                    }
+                    .accessibilityIdentifier("viewer-close")
 
-        if let current {
-            if current.isLocal {
-                localToolbarItems(current)
-            } else if current.isTrashed {
-                trashedToolbarItems(current)
-            } else {
-                remoteToolbarItems(current)
+                    Spacer()
+
+                    backupStatusControl(current)
+
+                    moreMenu
+                        .accessibilityIdentifier("viewer-menu")
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, topInset + 6)
+            .transition(.opacity)
+        }
+    }
+
+    @ViewBuilder private func bottomChrome(bottomInset: CGFloat) -> some View {
+        if !isContextPreview, chromeVisible, let current {
+            VStack(spacing: 14) {
+                if current.isVideo, playback.ownerID == current.id, playback.player != nil {
+                    VideoControlsBar(playback: playback)
+                }
+
+                HStack(spacing: 12) {
+                    if current.isLocal {
+                        localActions(current)
+                    } else if current.isTrashed {
+                        trashedActions
+                    } else {
+                        remoteActions(current)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, bottomInset + 10)
+            .transition(.opacity)
         }
     }
 
     /// Photos-style placement: share stands alone on the left, the common
     /// nondestructive controls form the center cluster, and delete stays at the
     /// far right with explicit device/everywhere choices.
-    @ToolbarContentBuilder private func remoteToolbarItems(_ current: Asset) -> some ToolbarContent {
-        ToolbarItem(placement: .bottomBar) {
-            if let client = session.client {
-                ShareLink(
-                    item: SharedAssetFile(client: client, asset: current),
-                    preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityIdentifier("viewer-share")
+    @ViewBuilder private func remoteActions(_ current: Asset) -> some View {
+        if let client = session.client {
+            ShareLink(
+                item: SharedAssetFile(client: client, asset: current),
+                preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
+            ) {
+                glassIcon("square.and.arrow.up")
             }
+            .accessibilityIdentifier("viewer-share")
         }
 
-        ToolbarSpacer(.flexible, placement: .bottomBar)
+        Spacer()
 
         if actionAvailability?.canFavorite == true {
-            ToolbarItem(placement: .bottomBar) {
-                Button {
-                    Task { await toggleFavorite() }
-                } label: {
-                    Image(systemName: current.isFavorite ? "heart.fill" : "heart")
-                        .contentTransition(.symbolEffect(.replace))
-                        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: current.isFavorite)
-                }
-                .accessibilityIdentifier("viewer-favorite")
+            Button {
+                Task { await toggleFavorite() }
+            } label: {
+                glassIcon(current.isFavorite ? "heart.fill" : "heart")
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: current.isFavorite)
             }
-            ToolbarSpacer(.fixed, placement: .bottomBar)
+            .accessibilityIdentifier("viewer-favorite")
         }
 
-        ToolbarItem(placement: .bottomBar) {
-            Button {
-                toggleInfo()
-            } label: {
-                Image(systemName: showInfo ? "info.circle.fill" : "info.circle")
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .accessibilityIdentifier("viewer-info")
+        Button {
+            toggleInfo()
+        } label: {
+            glassIcon(showInfo ? "info.circle.fill" : "info.circle")
+                .contentTransition(.symbolEffect(.replace))
         }
+        .accessibilityIdentifier("viewer-info")
 
         if actionAvailability?.canEdit == true {
-            ToolbarSpacer(.fixed, placement: .bottomBar)
-            ToolbarItem(placement: .bottomBar) {
-                Button {
-                    showEditor = true
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                }
-                .accessibilityIdentifier("viewer-edit")
+            Button {
+                showEditor = true
+            } label: {
+                glassIcon("slider.horizontal.3")
             }
+            .accessibilityIdentifier("viewer-edit")
         }
+
+        Spacer()
 
         if actionAvailability?.canDeleteFromDevice == true
             || actionAvailability?.canTrashEverywhere == true {
-            ToolbarSpacer(.flexible, placement: .bottomBar)
-            ToolbarItem(placement: .bottomBar) {
-                deleteMenu
-            }
+            deleteMenu
         }
     }
 
     /// trashed assets offer restore and permanent delete, like the photos
     /// app's recently deleted album.
-    @ToolbarContentBuilder private func trashedToolbarItems(_ current: Asset) -> some ToolbarContent {
+    @ViewBuilder private var trashedActions: some View {
         if actionAvailability?.canRestore == true {
-            ToolbarItem(placement: .bottomBar) {
-                Button {
-                    Task { await restore() }
-                } label: {
-                    Image(systemName: "arrow.uturn.backward")
-                }
-                .accessibilityIdentifier("viewer-restore")
+            Button {
+                Task { await restore() }
+            } label: {
+                glassIcon("arrow.uturn.backward")
             }
+            .accessibilityIdentifier("viewer-restore")
         }
 
         if actionAvailability?.canRestore == true,
            actionAvailability?.canDeletePermanently == true {
-            ToolbarSpacer(.flexible, placement: .bottomBar)
+            Spacer()
         }
 
         if actionAvailability?.canDeletePermanently == true {
-            ToolbarItem(placement: .bottomBar) {
-                Button(role: .destructive) {
-                    ask(.deletePermanently, from: .toolbar)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .modifier(confirmationDialog(from: .toolbar))
+            Button(role: .destructive) {
+                ask(.deletePermanently, from: .toolbar)
+            } label: {
+                glassIcon("trash")
             }
+            .modifier(confirmationDialog(from: .toolbar))
         }
     }
 
     /// device-only assets can be shared, inspected and deleted locally;
     /// server actions come after they are backed up.
-    @ToolbarContentBuilder private func localToolbarItems(_ current: Asset) -> some ToolbarContent {
-        ToolbarItem(placement: .bottomBar) {
-            if let localId = current.localIdentifier {
-                ShareLink(
-                    item: LocalSharedAssetFile(localIdentifier: localId),
-                    preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
+    @ViewBuilder private func localActions(_ current: Asset) -> some View {
+        if let localId = current.localIdentifier {
+            ShareLink(
+                item: LocalSharedAssetFile(localIdentifier: localId),
+                preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
+            ) {
+                glassIcon("square.and.arrow.up")
             }
         }
 
-        ToolbarSpacer(.flexible, placement: .bottomBar)
+        Spacer()
 
-        ToolbarItem(placement: .bottomBar) {
-            Button {
-                toggleInfo()
-            } label: {
-                Image(systemName: showInfo ? "info.circle.fill" : "info.circle")
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .accessibilityIdentifier("viewer-info")
+        Button {
+            toggleInfo()
+        } label: {
+            glassIcon(showInfo ? "info.circle.fill" : "info.circle")
+                .contentTransition(.symbolEffect(.replace))
         }
+        .accessibilityIdentifier("viewer-info")
 
-        ToolbarSpacer(.flexible, placement: .bottomBar)
+        Spacer()
 
-        ToolbarItem(placement: .bottomBar) {
-            deleteMenu
-        }
+        deleteMenu
     }
 
     private var deleteMenu: some View {
@@ -634,7 +623,7 @@ struct AssetViewerScreen: View {
                 .accessibilityIdentifier("viewer-trash")
             }
         } label: {
-            Image(systemName: "trash")
+            glassIcon("trash")
         }
         .accessibilityLabel("Delete")
         .modifier(confirmationDialog(from: .toolbar))
@@ -759,7 +748,7 @@ struct AssetViewerScreen: View {
                 }
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            glassIcon("ellipsis")
         }
         // the dialog anchors to the menu button, not to the vanished menu item.
         .modifier(confirmationDialog(from: .menu))
@@ -772,11 +761,13 @@ struct AssetViewerScreen: View {
                 ProgressView(value: fraction)
                     .progressViewStyle(.circular)
                     .frame(width: 24, height: 24)
+                    .frame(width: 44, height: 44)
+                    .glassEffect(.regular, in: .circle)
                     .accessibilityLabel("Backing up")
                     .accessibilityValue("\(Int(fraction * 100)) percent")
             case .failed:
                 Button { Task { await backUpCurrent() } } label: {
-                    Image(systemName: "exclamationmark.icloud")
+                    glassIcon("exclamationmark.icloud")
                 }
                 .accessibilityLabel("Backup failed. Try again")
             case nil:
@@ -792,12 +783,12 @@ struct AssetViewerScreen: View {
                             }
                         }
                     } label: {
-                        Image(systemName: "checkmark.icloud")
+                        glassIcon("checkmark.icloud")
                     }
                     .accessibilityLabel("Backed up")
                 } else {
                     Button { Task { await backUpCurrent() } } label: {
-                        Image(systemName: "icloud.slash")
+                        glassIcon("icloud.slash")
                     }
                     .accessibilityLabel("Not backed up. Back up now")
                     .accessibilityIdentifier("viewer-back-up")
@@ -824,7 +815,7 @@ struct AssetViewerScreen: View {
                     }
                 }
             } label: {
-                Image(systemName: "checkmark.icloud")
+                glassIcon("checkmark.icloud")
             }
             .accessibilityLabel("Backed up")
         }
