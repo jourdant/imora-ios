@@ -8,6 +8,7 @@ struct NotificationSettingsScreen: View {
     @Bindable private var local = LocalNotifications.shared
 
     @State private var email = EmailNotificationPreferences.default
+    @State private var emailMutations = SerialOptimisticValue<EmailNotificationPreferences>()
 
     var body: some View {
         List {
@@ -18,8 +19,8 @@ struct NotificationSettingsScreen: View {
         .navigationTitle("Notifications")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            await local.refreshAuthorization()
             email = session.preferences?.email ?? .default
+            await local.refreshAuthorization()
         }
     }
 
@@ -104,25 +105,50 @@ struct NotificationSettingsScreen: View {
         Binding(
             get: { email[keyPath: keyPath] },
             set: { newValue in
-                email[keyPath: keyPath] = newValue
-                save()
+                var desired = email
+                desired[keyPath: keyPath] = newValue
+                save(desired)
             }
         )
     }
 
     /// the album flags are gated by the master switch on the way out, matching
     /// the web client - the server then stores a coherent set.
-    private func save() {
-        guard let client = session.client else { return }
-        let payload = EmailNotificationPreferences(
-            enabled: email.enabled,
-            albumInvite: email.enabled && email.albumInvite,
-            albumUpdate: email.enabled && email.albumUpdate
-        )
-        Task {
-            if let updated = try? await client.updateEmailNotifications(payload) {
-                session.preferences = updated
-            }
+    private func save(_ desired: EmailNotificationPreferences) {
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("Couldn’t update email notifications. The server is not available.")
+            return
         }
+        emailMutations.submit(
+            current: email,
+            desired: desired,
+            errorMessage: "Couldn’t update email notifications",
+            apply: { value in
+                guard session.client === client else { return }
+                email = value
+                let current = session.preferences ?? .emptyForLocalProjection
+                session.projectPreferences(
+                    current.replacingEmailNotifications(with: serverPayload(for: value)),
+                    field: "email"
+                )
+            },
+            request: { value in
+                try await client.updateEmailNotifications(serverPayload(for: value)).email
+            },
+            activityChanged: { active in
+                guard session.client === client else { return }
+                session.setPreferenceMutation("email", active: active)
+            }
+        )
+    }
+
+    private func serverPayload(
+        for value: EmailNotificationPreferences
+    ) -> EmailNotificationPreferences {
+        EmailNotificationPreferences(
+            enabled: value.enabled,
+            albumInvite: value.enabled && value.albumInvite,
+            albumUpdate: value.enabled && value.albumUpdate
+        )
     }
 }

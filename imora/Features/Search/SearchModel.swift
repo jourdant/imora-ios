@@ -1,6 +1,12 @@
 import Foundation
 import Observation
 
+nonisolated struct SearchRemoval {
+    fileprivate let generation: Int
+    fileprivate let placements: [(index: Int, asset: Asset)]
+    var isEmpty: Bool { placements.isEmpty }
+}
+
 /// paginated search state, the swift twin of the flutter
 /// PaginatedSearchNotifier: nextPage nil means exhausted, an error or an
 /// empty page stops pagination but keeps what already loaded.
@@ -16,6 +22,7 @@ final class SearchModel {
     private var searchTask: Task<Void, Never>?
     /// bumped on every apply so stale responses and their defers are ignored.
     private var generation = 0
+    private var externalRemovalRollbacks: [String: SearchRemoval] = [:]
 
     func attach(_ client: ImmichClient) {
         guard self.client == nil else { return }
@@ -31,6 +38,7 @@ final class SearchModel {
         guard newFilter != filter || searchable != hasActiveSearch else { return }
         filter = newFilter
         generation += 1
+        externalRemovalRollbacks = [:]
         searchTask?.cancel()
         assets = []
         nextPage = 1
@@ -49,6 +57,7 @@ final class SearchModel {
 
     func clear() {
         generation += 1
+        externalRemovalRollbacks = [:]
         searchTask?.cancel()
         filter = SearchFilter()
         assets = []
@@ -65,7 +74,42 @@ final class SearchModel {
     }
 
     func removeAssets(ids: Set<String>) {
+        _ = removeAssetsForOptimisticAction(ids: ids)
+    }
+
+    func beginExternalOptimisticRemoval(id: String) {
+        guard externalRemovalRollbacks[id] == nil else { return }
+        externalRemovalRollbacks[id] = removeAssetsForOptimisticAction(ids: [id])
+    }
+
+    func commitExternalOptimisticRemoval(id: String) {
+        externalRemovalRollbacks[id] = nil
+        removeAssets(ids: [id])
+    }
+
+    func rollbackExternalOptimisticRemoval(id: String) {
+        guard let removal = externalRemovalRollbacks.removeValue(forKey: id) else { return }
+        restore(removal, ids: [id])
+    }
+
+    func removeAssetsForOptimisticAction(ids: Set<String>) -> SearchRemoval {
+        let placements = assets.enumerated().compactMap { index, asset in
+            ids.contains(asset.id) ? (index, asset) : nil
+        }
         assets.removeAll { ids.contains($0.id) }
+        return SearchRemoval(generation: generation, placements: placements)
+    }
+
+    /// A token from an old query must never inject assets into a new result.
+    func restore(_ removal: SearchRemoval, ids: Set<String>? = nil) {
+        guard removal.generation == generation else { return }
+        let wanted = ids
+        for placement in removal.placements
+            .filter({ wanted?.contains($0.asset.id) ?? true })
+            .sorted(by: { $0.index < $1.index })
+        where !assets.contains(where: { $0.id == placement.asset.id }) {
+            assets.insert(placement.asset, at: min(placement.index, assets.count))
+        }
     }
 
     private func loadNextPage(_ requested: Int) async {

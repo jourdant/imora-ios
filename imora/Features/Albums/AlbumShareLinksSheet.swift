@@ -51,6 +51,11 @@ nonisolated enum ShareLinkTarget {
     case assets([String])
 }
 
+private enum SharedLinkProjection {
+    case upsert(SharedLink, replacingID: String)
+    case remove(String)
+}
+
 /// lists the target's public links and hosts the create and edit form.
 struct ShareLinksSheet: View {
     @Environment(SessionStore.self) private var session
@@ -65,6 +70,13 @@ struct ShareLinksSheet: View {
     @State private var createdURL: URL?
     @State private var linkToDelete: SharedLink?
     @State private var error: String?
+    @State private var deletingLinkIDs = Set<String>()
+    @State private var savingLinkIDs = Set<String>()
+    @State private var linkLoadGate = LatestAlbumLoadGate()
+
+    private var hasMutationInFlight: Bool {
+        !deletingLinkIDs.isEmpty || !savingLinkIDs.isEmpty
+    }
 
     private var title: String {
         switch target {
@@ -94,12 +106,17 @@ struct ShareLinksSheet: View {
 
                 Section {
                     NavigationLink {
-                        SharedLinkForm(target: target, existing: nil) { link in
-                            await handleCreated(link)
-                        }
+                        SharedLinkForm(
+                            target: target,
+                            existing: nil,
+                            project: project,
+                            setSaving: setSaving,
+                            onSaved: handleCreated
+                        )
                     } label: {
                         Label("New Shared Link", systemImage: "plus")
                     }
+                    .disabled(isLoading)
                     .accessibilityIdentifier("album-share-new")
                 }
 
@@ -129,17 +146,23 @@ struct ShareLinksSheet: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                        .disabled(hasMutationInFlight)
                 }
             }
             .task { await load() }
+            .interactiveDismissDisabled(hasMutationInFlight)
         }
     }
 
     @ViewBuilder private func linkRow(_ link: SharedLink) -> some View {
         NavigationLink {
-            SharedLinkForm(target: target, existing: link) { _ in
-                await reload()
-            }
+            SharedLinkForm(
+                target: target,
+                existing: link,
+                project: project,
+                setSaving: setSaving,
+                onSaved: { _ in await onChanged() }
+            )
         } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Text(linkTitle(link))
@@ -150,12 +173,14 @@ struct ShareLinksSheet: View {
                     .foregroundStyle(link.isExpired ? .red : .secondary)
             }
         }
+        .disabled(deletingLinkIDs.contains(link.id) || savingLinkIDs.contains(link.id))
         .swipeActions {
             Button(role: .destructive) {
                 linkToDelete = link
             } label: {
                 Label("Delete", systemImage: "trash")
             }
+            .disabled(savingLinkIDs.contains(link.id))
         }
         .contextMenu {
             if let url = shareURL(for: link) {
@@ -173,6 +198,7 @@ struct ShareLinksSheet: View {
             } label: {
                 Label("Delete Link", systemImage: "trash")
             }
+            .disabled(savingLinkIDs.contains(link.id))
         }
         // ios 26 morphs the dialog out of its source control, so it belongs on
         // the row that was swiped - on the list root it floats detached.
@@ -222,36 +248,39 @@ struct ShareLinksSheet: View {
     // MARK: - actions
 
     private func load() async {
-        guard let client = session.client else { return }
-        webBase = await client.serverWebURL()
-        await reload()
-        isLoading = false
-    }
-
-    private func reload() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !hasMutationInFlight else { return }
+        let ticket = linkLoadGate.begin()
+        isLoading = true
+        let base = await client.serverWebURL()
+        guard linkLoadGate.accepts(ticket) else { return }
         do {
+            let fetched: [SharedLink]
             switch target {
             case .album(let album):
-                links = try await client.sharedLinks(albumID: album.id)
+                fetched = try await client.sharedLinks(albumID: album.id)
             case .assets(let ids):
                 // the api has no asset filter; keep individual links whose
                 // asset set contains every requested id.
                 let wanted = Set(ids)
-                links = try await client.sharedLinks().filter { link in
+                fetched = try await client.sharedLinks().filter { link in
                     guard link.type == "INDIVIDUAL" else { return false }
                     let contained = Set((link.assets ?? []).map(\.id))
                     return wanted.isSubset(of: contained)
                 }
             }
+            guard linkLoadGate.accepts(ticket) else { return }
+            webBase = base
+            links = fetched
             error = nil
         } catch {
+            guard linkLoadGate.accepts(ticket) else { return }
+            webBase = base
             self.error = error.localizedDescription
         }
+        isLoading = false
     }
 
     private func handleCreated(_ link: SharedLink) async {
-        await reload()
         await onChanged()
         if let url = shareURL(for: link) {
             UIPasteboard.general.string = url.absoluteString
@@ -260,15 +289,64 @@ struct ShareLinksSheet: View {
     }
 
     private func delete(_ link: SharedLink) async {
-        guard let client = session.client else { return }
-        do {
-            try await client.deleteSharedLink(id: link.id)
-            if shareURL(for: link) == createdURL { createdURL = nil }
-            await reload()
-            await onChanged()
-        } catch {
-            self.error = error.localizedDescription
+        guard let client = session.client,
+              !savingLinkIDs.contains(link.id),
+              deletingLinkIDs.insert(link.id).inserted else { return }
+        let originalIndex = links.firstIndex(where: { $0.id == link.id }) ?? links.endIndex
+        let previousID = originalIndex > links.startIndex ? links[originalIndex - 1].id : nil
+        let nextID = originalIndex < links.index(before: links.endIndex) ? links[originalIndex + 1].id : nil
+        let originalCreatedURL = createdURL
+        defer { deletingLinkIDs.remove(link.id) }
+        let deleted: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t delete the shared link.",
+            apply: {
+                project(.remove(link.id))
+                if shareURL(for: link) == createdURL { createdURL = nil }
+            },
+            rollback: {
+                links.removeAll { $0.id == link.id }
+                let index: Int
+                if let nextID, let nextIndex = links.firstIndex(where: { $0.id == nextID }) {
+                    index = nextIndex
+                } else if let previousID,
+                          let previousIndex = links.firstIndex(where: { $0.id == previousID }) {
+                    index = previousIndex + 1
+                } else {
+                    index = min(originalIndex, links.endIndex)
+                }
+                links.insert(link, at: index)
+                createdURL = originalCreatedURL
+            },
+            request: { try await client.deleteSharedLink(id: link.id) }
+        )
+        if deleted != nil { await onChanged() }
+    }
+
+    private func project(_ projection: SharedLinkProjection) {
+        invalidateLinkLoads()
+        switch projection {
+        case .remove(let id):
+            links.removeAll { $0.id == id }
+        case .upsert(let link, let replacingID):
+            let index = links.firstIndex { $0.id == replacingID || $0.id == link.id }
+                ?? links.startIndex
+            links.removeAll { $0.id == replacingID || $0.id == link.id }
+            links.insert(link, at: min(index, links.endIndex))
         }
+    }
+
+    private func setSaving(_ linkID: String, _ saving: Bool) {
+        if saving {
+            invalidateLinkLoads()
+            savingLinkIDs.insert(linkID)
+        } else {
+            savingLinkIDs.remove(linkID)
+        }
+    }
+
+    private func invalidateLinkLoads() {
+        linkLoadGate.invalidate()
+        isLoading = false
     }
 }
 
@@ -281,16 +359,25 @@ private struct SharedLinkForm: View {
 
     let target: ShareLinkTarget
     let existing: SharedLink?
+    let project: (SharedLinkProjection) -> Void
+    let setSaving: (String, Bool) -> Void
     let onSaved: (SharedLink) async -> Void
 
     @State private var options: SharedLinkOptions
     @State private var expiry: LinkExpiry
     @State private var isSaving = false
-    @State private var error: String?
 
-    init(target: ShareLinkTarget, existing: SharedLink?, onSaved: @escaping (SharedLink) async -> Void) {
+    init(
+        target: ShareLinkTarget,
+        existing: SharedLink?,
+        project: @escaping (SharedLinkProjection) -> Void,
+        setSaving: @escaping (String, Bool) -> Void,
+        onSaved: @escaping (SharedLink) async -> Void
+    ) {
         self.target = target
         self.existing = existing
+        self.project = project
+        self.setSaving = setSaving
         self.onSaved = onSaved
         _options = State(initialValue: existing.map(SharedLinkOptions.init(from:)) ?? SharedLinkOptions())
         _expiry = State(initialValue: existing == nil ? .never : .keep)
@@ -333,14 +420,6 @@ private struct SharedLinkForm: View {
                 .accessibilityIdentifier("share-link-expiry")
             }
         }
-        .alert("Couldn't save the link", isPresented: .init(
-            get: { error != nil },
-            set: { if !$0 { error = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(error ?? "")
-        }
         .navigationTitle(existing == nil ? "New Link" : "Edit Link")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -360,9 +439,9 @@ private struct SharedLinkForm: View {
     }
 
     private func save() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isSaving else { return }
         isSaving = true
-        error = nil
+        defer { isSaving = false }
 
         var resolved = options
         switch expiry {
@@ -374,23 +453,45 @@ private struct SharedLinkForm: View {
             resolved.expiresAt = expiry.interval.map { Date().addingTimeInterval($0) }
         }
 
-        do {
-            let saved: SharedLink
-            if let existing {
-                saved = try await client.updateSharedLink(id: existing.id, options: resolved)
-            } else {
+        let optimistic = existing?.applying(resolved)
+            ?? SharedLink.pending(options: resolved, type: target.linkType)
+        setSaving(optimistic.id, true)
+        defer { setSaving(optimistic.id, false) }
+        let saved = await OptimisticAction.perform(
+            errorMessage: "Couldn’t save the shared link.",
+            apply: {
+                project(.upsert(optimistic, replacingID: existing?.id ?? optimistic.id))
+                dismiss()
+            },
+            rollback: {
+                if let existing {
+                    project(.upsert(existing, replacingID: optimistic.id))
+                } else {
+                    project(.remove(optimistic.id))
+                }
+            },
+            request: {
+                if let existing {
+                    return try await client.updateSharedLink(id: existing.id, options: resolved)
+                }
                 switch target {
                 case .album(let album):
-                    saved = try await client.createSharedLink(albumID: album.id, options: resolved)
+                    return try await client.createSharedLink(albumID: album.id, options: resolved)
                 case .assets(let ids):
-                    saved = try await client.createSharedLink(assetIDs: ids, options: resolved)
+                    return try await client.createSharedLink(assetIDs: ids, options: resolved)
                 }
-            }
-            dismiss()
-            await onSaved(saved)
-        } catch {
-            self.error = error.localizedDescription
-            isSaving = false
+            },
+            commit: { project(.upsert($0, replacingID: optimistic.id)) }
+        )
+        if let saved { await onSaved(saved) }
+    }
+}
+
+private extension ShareLinkTarget {
+    var linkType: String {
+        switch self {
+        case .album: "ALBUM"
+        case .assets: "INDIVIDUAL"
         }
     }
 }

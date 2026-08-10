@@ -8,8 +8,14 @@ struct UserAvatar: View {
 
     var body: some View {
         Group {
-            if user.profileImagePath?.isEmpty == false, let client = session.client {
-                RemoteImage(url: client.profileImageURL(userID: user.id), targetPixelSize: 120)
+            if user.id == session.user?.id,
+               let data = session.optimisticProfileImageData,
+               let image = UIImage(data: data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if user.profileImagePath?.isEmpty == false, let client = session.client {
+                RemoteImage(url: profileImageURL(client: client), targetPixelSize: 120)
             } else {
                 Circle()
                     .fill(fallbackColor.gradient)
@@ -43,5 +49,13 @@ struct UserAvatar: View {
         case "gray": .gray
         default: .indigo
         }
+    }
+
+    private func profileImageURL(client: ImmichClient) -> URL {
+        guard user.id == session.user?.id, let key = session.profileImageCacheKey else {
+            return client.profileImageURL(userID: user.id)
+        }
+        return client.profileImageURL(userID: user.id)
+            .appending(queryItems: [URLQueryItem(name: "c", value: key)])
     }
 }

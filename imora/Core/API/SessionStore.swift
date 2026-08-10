@@ -1,6 +1,12 @@
 import Foundation
 import Observation
 
+nonisolated struct ProfileImageMutationToken {
+    fileprivate let id: UUID
+    fileprivate let previousData: Data?
+    fileprivate let previousCacheKey: String?
+}
+
 /// holds the login state for the whole app.
 @Observable
 final class SessionStore {
@@ -16,10 +22,20 @@ final class SessionStore {
     private(set) var backup: BackupManager?
     private(set) var realtime: RealtimeHub?
     private(set) var notifications: NotificationInbox?
-    var preferences: UserPreferences?
+    private(set) var preferences: UserPreferences?
+    /// Keeps a newly selected avatar visible while the server accepts and
+    /// re-caches the same bytes. A rejected upload restores the prior value.
+    var optimisticProfileImageData: Data?
+    var profileImageCacheKey: String?
+    private(set) var isProfileImageMutationInFlight = false
+    @ObservationIgnored private var profileImageMutationID: UUID?
+    @ObservationIgnored private var preferenceProjectionRevisions: [String: Int] = [:]
+    @ObservationIgnored private var pendingPreferenceMutationCounts: [String: Int] = [:]
+    @ObservationIgnored private var refreshUserRevision = 0
 
     private static let serverKey = "imora.serverURL"
     private static let tokenKey = "accessToken"
+    private static let profileImageCacheKeyDefaultsKey = "imora.profileImageCacheKey"
 
     var serverURL: URL? {
         UserDefaults.standard.url(forKey: Self.serverKey)
@@ -30,6 +46,9 @@ final class SessionStore {
     /// server confirms them in the background. an expired token only shows
     /// once the refresh comes back 401.
     init() {
+        profileImageCacheKey = UserDefaults.standard.string(
+            forKey: Self.profileImageCacheKeyDefaultsKey
+        )
         guard let apiURL = serverURL, let token = KeychainStore.get(Self.tokenKey) else {
             state = .loggedOut
             return
@@ -54,10 +73,9 @@ final class SessionStore {
         adopt(client: client, user: user)
     }
 
-    func logOut() async {
-        if let client {
-            await client.logout()
-        }
+    func logOut(reportRemoteFailure: Bool = true) async {
+        let signingOutClient = client
+        refreshUserRevision &+= 1
         KeychainStore.delete(Self.tokenKey)
         SessionCache.clear()
         realtime?.shutdown()
@@ -72,30 +90,70 @@ final class SessionStore {
         client = nil
         user = nil
         features = nil
+        preferences = nil
+        preferenceProjectionRevisions = [:]
+        pendingPreferenceMutationCounts = [:]
+        optimisticProfileImageData = nil
+        profileImageCacheKey = nil
+        isProfileImageMutationInFlight = false
+        profileImageMutationID = nil
         state = .loggedOut
+
+        guard let signingOutClient else { return }
+        do {
+            try await signingOutClient.logout()
+        } catch where reportRemoteFailure {
+            ErrorToastCenter.shared.show(
+                "Signed out on this device, but couldn’t close the server session",
+                error: error
+            )
+        } catch {
+            // An already rejected session is locally complete; no rollback is
+            // safe or useful for a best-effort remote logout.
+        }
     }
 
     func refreshUser() async {
         guard let client else { return }
+        refreshUserRevision &+= 1
+        let revision = refreshUserRevision
         // the user call doubles as the token check the launch no longer waits
         // for: a rejected token ends the session here instead of leaving the
         // app pointed at a server that will refuse everything.
         do {
             let user = try await client.currentUser()
+            guard revision == refreshUserRevision, self.client === client else { return }
             self.user = user
             SessionCache.noteUserId(user.id)
             backup?.userId = user.id
             await backup?.primeLocalState()
         } catch ImmichError.http(401, _) {
-            await logOut()
+            guard revision == refreshUserRevision, self.client === client else { return }
+            await logOut(reportRemoteFailure: false)
             return
         } catch {
             // offline or transient: keep the cached account details.
         }
+        guard revision == refreshUserRevision, self.client === client else { return }
+        let preferenceRevisionsAtRequest = preferenceProjectionRevisions
+        let pendingPreferenceFieldsAtRequest = Set(
+            pendingPreferenceMutationCounts.lazy.filter { $0.value > 0 }.map(\.key)
+        )
         async let featuresTask = try? client.serverFeatures()
         async let preferencesTask = try? client.preferences()
-        if let features = await featuresTask { self.features = features }
-        if let preferences = await preferencesTask { self.preferences = preferences }
+        if let features = await featuresTask,
+           revision == refreshUserRevision,
+           self.client === client {
+            self.features = features
+        }
+        if let fetched = await preferencesTask {
+            guard revision == refreshUserRevision, self.client === client else { return }
+            preferences = mergedPreferences(
+                fetched,
+                preservingChangesSince: preferenceRevisionsAtRequest,
+                pendingAtRequest: pendingPreferenceFieldsAtRequest
+            )
+        }
         cacheSnapshot()
     }
 
@@ -104,6 +162,83 @@ final class SessionStore {
     func adoptPhotoAccess() async {
         await backup?.primeLocalState()
         backup?.startIfIdle()
+    }
+
+    func beginProfileImageMutation(data: Data) -> ProfileImageMutationToken? {
+        guard !isProfileImageMutationInFlight else { return nil }
+        let token = ProfileImageMutationToken(
+            id: UUID(),
+            previousData: optimisticProfileImageData,
+            previousCacheKey: profileImageCacheKey
+        )
+        profileImageMutationID = token.id
+        isProfileImageMutationInFlight = true
+        optimisticProfileImageData = data
+        return token
+    }
+
+    func projectPreferences(_ projection: UserPreferences, field: String) {
+        preferenceProjectionRevisions[field, default: 0] &+= 1
+        preferences = projection
+    }
+
+    func setPreferenceMutation(_ field: String, active: Bool) {
+        if active {
+            pendingPreferenceMutationCounts[field, default: 0] += 1
+        } else {
+            let remaining = max(0, pendingPreferenceMutationCounts[field, default: 0] - 1)
+            if remaining == 0 {
+                pendingPreferenceMutationCounts[field] = nil
+            } else {
+                pendingPreferenceMutationCounts[field] = remaining
+            }
+        }
+    }
+
+    /// Installs a cache-busting URL only for the still-current upload.
+    func acceptProfileImageMutation(
+        _ token: ProfileImageMutationToken,
+        cacheKey: String
+    ) -> Bool {
+        guard profileImageMutationID == token.id else { return false }
+        profileImageCacheKey = cacheKey
+        UserDefaults.standard.set(cacheKey, forKey: Self.profileImageCacheKeyDefaultsKey)
+        return true
+    }
+
+    func finishProfileImageMutation(
+        _ token: ProfileImageMutationToken,
+        canonicalImageIsCached: Bool
+    ) {
+        guard profileImageMutationID == token.id else { return }
+        if canonicalImageIsCached { optimisticProfileImageData = nil }
+        profileImageMutationID = nil
+        isProfileImageMutationInFlight = false
+    }
+
+    func rollbackProfileImageMutation(_ token: ProfileImageMutationToken) {
+        guard profileImageMutationID == token.id else { return }
+        optimisticProfileImageData = token.previousData
+        profileImageCacheKey = token.previousCacheKey
+        profileImageMutationID = nil
+        isProfileImageMutationInFlight = false
+    }
+
+    private func mergedPreferences(
+        _ fetched: UserPreferences,
+        preservingChangesSince snapshot: [String: Int],
+        pendingAtRequest: Set<String>
+    ) -> UserPreferences {
+        guard let current = preferences else { return fetched }
+        let changed: (String) -> Bool = { key in
+            self.preferenceProjectionRevisions[key, default: 0] != snapshot[key, default: 0]
+        }
+        var fields = pendingAtRequest
+        fields.formUnion(["memories", "people", "email"].filter(changed))
+        return fetched.preservingProjectedFields(
+            from: current,
+            fields: fields
+        )
     }
 
     /// the share extension uploads with this session, and the app group is
@@ -122,6 +257,11 @@ final class SessionStore {
     }
 
     private func adopt(client: ImmichClient, user: CurrentUser?) {
+        if profileImageCacheKey == nil {
+            profileImageCacheKey = UserDefaults.standard.string(
+                forKey: Self.profileImageCacheKeyDefaultsKey
+            )
+        }
         self.client = client
         self.user = user
         ImageLoader.shared.configure(headers: client.authHeaders)
@@ -148,5 +288,24 @@ final class SessionStore {
         Task { await inbox.load() }
         backup.startIfIdle()
         hub.setActive(true)
+    }
+}
+
+nonisolated extension UserPreferences {
+    func preservingProjectedFields(
+        from projected: UserPreferences,
+        fields: Set<String>
+    ) -> UserPreferences {
+        UserPreferences(
+            memories: fields.contains("memories") ? projected.memories : memories,
+            people: fields.contains("people") ? projected.people : people,
+            folders: folders,
+            ratings: ratings,
+            tags: tags,
+            sharedLinks: sharedLinks,
+            emailNotifications: fields.contains("email")
+                ? projected.emailNotifications
+                : emailNotifications
+        )
     }
 }

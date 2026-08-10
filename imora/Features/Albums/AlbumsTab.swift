@@ -13,9 +13,13 @@ struct AlbumsTab: View {
     @State private var filter: Filter = .all
     @State private var searchText = ""
     @State private var isLoading = false
+    @State private var isCreating = false
     @State private var showCreate = false
     @State private var newAlbumName = ""
     @State private var path = NavigationPath()
+    @State private var pendingRemovalIDs = Set<String>()
+    @State private var albumLoadGate = LatestAlbumLoadGate()
+    @State private var pendingAlbumLoadGate = LatestAlbumLoadGate()
     private var router: NotificationRouter { .shared }
 
     private var visibleAlbums: [Album] {
@@ -43,6 +47,7 @@ struct AlbumsTab: View {
                                 AlbumCard(album: album)
                             }
                             .buttonStyle(PressableCardStyle())
+                            .disabled(album.isPending)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -50,7 +55,13 @@ struct AlbumsTab: View {
             }
             .navigationTitle("Albums")
             .navigationDestination(for: Album.self) { album in
-                AlbumDetailScreen(album: album)
+                AlbumDetailScreen(
+                    album: album,
+                    onAlbumChanged: upsertAlbum,
+                    onAlbumRemoved: removeAlbum,
+                    onAlbumRestored: restoreAlbum,
+                    onAlbumRemovalCommitted: commitAlbumRemoval
+                )
             }
             .searchable(text: $searchText, prompt: "Album name")
             .toolbar {
@@ -60,6 +71,7 @@ struct AlbumsTab: View {
                     } label: {
                         Image(systemName: "plus")
                     }
+                    .disabled(isCreating)
                     .accessibilityIdentifier("albums-create")
                 }
             }
@@ -90,6 +102,7 @@ struct AlbumsTab: View {
                 Button("Create") {
                     Task { await createAlbum() }
                 }
+                .disabled(isCreating)
                 Button("Cancel", role: .cancel) { newAlbumName = "" }
             }
         }
@@ -122,18 +135,35 @@ struct AlbumsTab: View {
 
     private func load() async {
         guard let client = session.client else { return }
+        let ticket = albumLoadGate.begin()
         isLoading = true
         let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
         // a fresh tab paints the last known list first, and keeps it when the
         // server is unreachable.
         if albums.isEmpty, let account,
            let cached: [Album] = OfflineCache.value(key: "albums", account: account) {
-            albums = cached
+            // Pending rows are session projections. Persisting one could leave
+            // a ghost album after the app is terminated mid-request.
+            albums = cached.filter { !$0.isPending }
         }
-        if let fetched = try? await client.albums() {
-            albums = fetched.sorted { $0.updatedAt > $1.updatedAt }
+        let fetched = try? await client.albums()
+        guard albumLoadGate.accepts(ticket) else { return }
+        if let fetched {
+            let pending = albums.filter(\.isPending)
+            let currentByID = Dictionary(
+                albums.lazy.filter { !$0.isPending }.map { ($0.id, $0) },
+                uniquingKeysWith: { current, _ in current }
+            )
+            let reconciled = fetched
+                .filter { !pendingRemovalIDs.contains($0.id) }
+                .filter { fetched in !pending.contains { $0.id == fetched.id } }
+                .map { fetched in
+                    currentByID[fetched.id]?.reconcilingServerVersion(fetched) ?? fetched
+                }
+                .sorted { $0.updatedAt > $1.updatedAt }
+            albums = pending + reconciled
             if let account {
-                let snapshot = albums
+                let snapshot = albums.filter { !$0.isPending }
                 Task.detached(priority: .utility) {
                     OfflineCache.store(snapshot, key: "albums", account: account)
                 }
@@ -143,16 +173,84 @@ struct AlbumsTab: View {
     }
 
     private func createAlbum() async {
-        guard let client = session.client, !newAlbumName.isEmpty else { return }
-        _ = try? await client.createAlbum(name: newAlbumName)
-        newAlbumName = ""
-        await load()
+        let name = newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client = session.client, !name.isEmpty, !isCreating else { return }
+        let pending = Album.pending(name: name, owner: session.user)
+        isCreating = true
+        defer { isCreating = false }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t create the album.",
+            apply: {
+                newAlbumName = ""
+                upsertAlbum(pending)
+            },
+            rollback: {
+                removeProjectedAlbum(id: pending.id)
+                newAlbumName = name
+            },
+            request: { try await client.createAlbum(name: name) },
+            commit: { replaceAlbum(id: pending.id, with: $0) }
+        )
+    }
+
+    private func upsertAlbum(_ album: Album) {
+        invalidateAlbumLoads()
+        if let index = albums.firstIndex(where: { $0.id == album.id }) {
+            albums[index] = album
+        } else {
+            albums.insert(album, at: 0)
+        }
+    }
+
+    private func replaceAlbum(id: String, with album: Album) {
+        invalidateAlbumLoads()
+        albums.removeAll { $0.id == id || $0.id == album.id }
+        albums.insert(album, at: 0)
+    }
+
+    private func removeAlbum(_ album: Album) {
+        invalidateAlbumLoads()
+        pendingRemovalIDs.insert(album.id)
+        albums.removeAll { $0.id == album.id }
+    }
+
+    private func restoreAlbum(_ album: Album) {
+        pendingRemovalIDs.remove(album.id)
+        upsertAlbum(album)
+        // Reopen only when the user stayed on the albums root. If they already
+        // navigated elsewhere while the request failed, restoring the list row
+        // is the least surprising precise rollback.
+        if path.isEmpty { path.append(album) }
+    }
+
+    private func commitAlbumRemoval(_ albumID: String) {
+        invalidateAlbumLoads()
+        pendingRemovalIDs.remove(albumID)
+    }
+
+    private func removeProjectedAlbum(id: String) {
+        invalidateAlbumLoads()
+        albums.removeAll { $0.id == id }
+    }
+
+    private func invalidateAlbumLoads() {
+        albumLoadGate.invalidate()
+        isLoading = false
     }
 
     private func openPendingAlbum() async {
         guard let id = router.pendingAlbumID else { return }
-        defer { router.pendingAlbumID = nil }
-        guard let album = try? await session.client?.album(id: id) else { return }
+        guard let client = session.client else {
+            // Preserve the previous one-shot notification behavior when no
+            // authenticated client is available to resolve the destination.
+            router.pendingAlbumID = nil
+            return
+        }
+        let ticket = pendingAlbumLoadGate.begin()
+        let album = try? await client.album(id: id)
+        guard pendingAlbumLoadGate.accepts(ticket), router.pendingAlbumID == id else { return }
+        router.pendingAlbumID = nil
+        guard let album, !Task.isCancelled else { return }
         path = NavigationPath()
         path.append(album)
     }
@@ -205,11 +303,14 @@ struct AlbumPickerSheet: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.dismiss) private var dismiss
     let assetIDs: [String]
-    let onDone: () -> Void
+    let onApplied: () -> Void
+    let onRollback: (Set<String>) -> Void
 
     @State private var albums: [Album] = []
     @State private var newAlbumName = ""
     @State private var showCreate = false
+    @State private var isWorking = false
+    @State private var isLoading = true
 
     var body: some View {
         NavigationStack {
@@ -220,11 +321,12 @@ struct AlbumPickerSheet: View {
                     } label: {
                         Label("New Album", systemImage: "plus")
                     }
+                    .disabled(isWorking || isLoading)
                 }
                 Section {
                     ForEach(albums) { album in
                         Button {
-                            Task { await add(to: album.id) }
+                            Task { await add(to: album) }
                         } label: {
                             HStack(spacing: 12) {
                                 if let thumbID = album.albumThumbnailAssetId, let client = session.client {
@@ -245,6 +347,7 @@ struct AlbumPickerSheet: View {
                                 }
                             }
                         }
+                        .disabled(isWorking || isLoading)
                     }
                 }
             }
@@ -256,6 +359,7 @@ struct AlbumPickerSheet: View {
                 }
             }
             .task {
+                defer { isLoading = false }
                 if let fetched = try? await session.client?.albums(isOwned: true) {
                     albums = fetched.sorted { $0.updatedAt > $1.updatedAt }
                 }
@@ -265,22 +369,80 @@ struct AlbumPickerSheet: View {
                 Button("Create & Add") {
                     Task { await createAndAdd() }
                 }
+                .disabled(
+                    isWorking
+                        || newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
                 Button("Cancel", role: .cancel) { newAlbumName = "" }
             }
+            .interactiveDismissDisabled(isWorking)
         }
     }
 
-    private func add(to albumID: String) async {
-        _ = try? await session.client?.addAssets(albumID: albumID, ids: assetIDs)
-        dismiss()
-        onDone()
+    private func add(to album: Album) async {
+        guard let client = session.client, !isWorking else { return }
+        let requested = Set(assetIDs)
+        let optimistic = album.withAssetCountDelta(requested.count)
+        isWorking = true
+        defer { isWorking = false }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t add the selected items to the album.",
+            apply: {
+                replaceAlbum(id: album.id, with: optimistic)
+                dismiss()
+                onApplied()
+            },
+            rollback: {
+                replaceAlbum(id: album.id, with: album)
+                onRollback(requested)
+            },
+            request: { try await client.addAssets(albumID: album.id, ids: Array(requested)) },
+            commit: { results in
+                let outcome = BulkMutationOutcome(requestedIDs: requested, results: results)
+                replaceAlbum(
+                    id: album.id,
+                    with: album.withAssetCountDelta(outcome.successfulIDs.count)
+                )
+                reportBulkFailures(outcome)
+                if !outcome.failedIDs.isEmpty { onRollback(outcome.failedIDs) }
+            }
+        )
     }
 
     private func createAndAdd() async {
-        guard let client = session.client, !newAlbumName.isEmpty else { return }
-        _ = try? await client.createAlbum(name: newAlbumName, assetIds: assetIDs)
-        newAlbumName = ""
-        dismiss()
-        onDone()
+        let name = newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client = session.client, !name.isEmpty, !isWorking else { return }
+        let requested = Set(assetIDs)
+        let pending = Album.pending(name: name, assetCount: requested.count)
+        isWorking = true
+        defer { isWorking = false }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t create the album.",
+            apply: {
+                newAlbumName = ""
+                albums.insert(pending, at: 0)
+                dismiss()
+                onApplied()
+            },
+            rollback: {
+                albums.removeAll { $0.id == pending.id }
+                newAlbumName = name
+                onRollback(requested)
+            },
+            request: { try await client.createAlbum(name: name, assetIds: assetIDs) },
+            commit: { replaceAlbum(id: pending.id, with: $0) }
+        )
+    }
+
+    private func replaceAlbum(id: String, with replacement: Album) {
+        guard let index = albums.firstIndex(where: { $0.id == id }) else { return }
+        albums[index] = replacement
+    }
+
+    private func reportBulkFailures(_ outcome: BulkMutationOutcome) {
+        guard !outcome.failedIDs.isEmpty else { return }
+        ErrorToastCenter.shared.show(
+            "Couldn’t add \(outcome.failedIDs.count) selected item\(outcome.failedIDs.count == 1 ? "" : "s") to the album."
+        )
     }
 }

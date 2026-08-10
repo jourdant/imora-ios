@@ -9,7 +9,9 @@ struct AlbumInviteSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let album: Album
-    let onInvited: (Int) async -> Void
+    @Binding var isAlbumMutationInFlight: Bool
+    let onAlbumChanged: (Album) -> Void
+    let onInvited: (Int) -> Void
 
     @State private var candidates: [User] = []
     @State private var selection = Set<String>()
@@ -56,11 +58,11 @@ struct AlbumInviteSheet: View {
                     Button(selection.isEmpty ? "Add" : "Add (\(selection.count))") {
                         Task { await invite() }
                     }
-                    .disabled(selection.isEmpty || isInviting)
+                    .disabled(selection.isEmpty || isInviting || isAlbumMutationInFlight)
                     .accessibilityIdentifier("album-invite-add")
                 }
             }
-            .interactiveDismissDisabled(isInviting)
+            .interactiveDismissDisabled(isInviting || isAlbumMutationInFlight)
             .task { await load() }
         }
     }
@@ -107,17 +109,35 @@ struct AlbumInviteSheet: View {
     }
 
     private func invite() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isInviting, !isAlbumMutationInFlight else { return }
+        let invited = candidates.filter { selection.contains($0.id) }
+        guard !invited.isEmpty else { return }
+        let optimistic = album.addingSharedUsers(invited)
         isInviting = true
-        do {
-            try await client.addAlbumUsers(albumID: album.id, userIDs: Array(selection))
-            let count = selection.count
-            dismiss()
-            await onInvited(count)
-        } catch {
-            self.error = error.localizedDescription
+        isAlbumMutationInFlight = true
+        defer {
             isInviting = false
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t invite the selected people.",
+            apply: {
+                candidates.removeAll { selection.contains($0.id) }
+                onAlbumChanged(optimistic)
+                dismiss()
+            },
+            rollback: {
+                candidates.append(contentsOf: invited)
+                onAlbumChanged(album)
+            },
+            request: {
+                try await client.addAlbumUsers(
+                    albumID: album.id,
+                    userIDs: invited.map(\.id)
+                )
+            },
+            commit: { _ in onInvited(invited.count) }
+        )
     }
 }
 
@@ -129,20 +149,35 @@ struct AlbumOptionsSheet: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.dismiss) private var dismiss
 
-    let album: Album
-    let onChanged: () async -> Void
+    @State private var album: Album
+    @Binding var isAlbumMutationInFlight: Bool
+    let onAlbumChanged: (Album) -> Void
     let onLeft: () -> Void
+    let onLeaveRolledBack: (Album) -> Void
+    let onLeaveCommitted: (String) -> Void
 
     @State private var activityEnabled: Bool
     @State private var showInvite = false
     @State private var userToRemove: User?
     @State private var showLeaveConfirm = false
-    @State private var error: String?
+    @State private var isActivitySaving = false
+    @State private var removingUserIDs = Set<String>()
+    @State private var isLeaving = false
 
-    init(album: Album, onChanged: @escaping () async -> Void, onLeft: @escaping () -> Void) {
-        self.album = album
-        self.onChanged = onChanged
+    init(
+        album: Album,
+        isAlbumMutationInFlight: Binding<Bool>,
+        onAlbumChanged: @escaping (Album) -> Void,
+        onLeft: @escaping () -> Void,
+        onLeaveRolledBack: @escaping (Album) -> Void,
+        onLeaveCommitted: @escaping (String) -> Void
+    ) {
+        _album = State(initialValue: album)
+        _isAlbumMutationInFlight = isAlbumMutationInFlight
+        self.onAlbumChanged = onAlbumChanged
         self.onLeft = onLeft
+        self.onLeaveRolledBack = onLeaveRolledBack
+        self.onLeaveCommitted = onLeaveCommitted
         _activityEnabled = State(initialValue: album.isActivityEnabled ?? true)
     }
 
@@ -153,7 +188,10 @@ struct AlbumOptionsSheet: View {
             List {
                 if isOwner {
                     Section {
-                        Toggle(isOn: $activityEnabled) {
+                        Toggle(isOn: Binding(
+                            get: { activityEnabled },
+                            set: { value in Task { await setActivity(value) } }
+                        )) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Comments and Likes")
                                 Text("Let others respond in shared albums")
@@ -162,9 +200,7 @@ struct AlbumOptionsSheet: View {
                             }
                         }
                         .accessibilityIdentifier("album-activity-toggle")
-                        .onChange(of: activityEnabled) { _, value in
-                            Task { await setActivity(value) }
-                        }
+                        .disabled(isActivitySaving || isAlbumMutationInFlight)
                     }
                 }
 
@@ -175,6 +211,7 @@ struct AlbumOptionsSheet: View {
                         } label: {
                             Label("Invite People", systemImage: "person.badge.plus")
                         }
+                        .disabled(isAlbumMutationInFlight)
                         .accessibilityIdentifier("album-options-invite")
                     }
 
@@ -186,13 +223,6 @@ struct AlbumOptionsSheet: View {
                     }
                 }
 
-                if let error {
-                    Section {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-                }
             }
             .navigationTitle("Options")
             .navigationBarTitleDisplayMode(.inline)
@@ -202,11 +232,15 @@ struct AlbumOptionsSheet: View {
                 }
             }
             .sheet(isPresented: $showInvite) {
-                AlbumInviteSheet(album: album) { _ in
-                    await onChanged()
+                AlbumInviteSheet(
+                    album: album,
+                    isAlbumMutationInFlight: $isAlbumMutationInFlight,
+                    onAlbumChanged: projectAlbum
+                ) { _ in
                     dismiss()
                 }
             }
+            .interactiveDismissDisabled(isAlbumMutationInFlight)
         }
     }
 
@@ -230,6 +264,7 @@ struct AlbumOptionsSheet: View {
                 .foregroundStyle(.secondary)
         }
         .contentShape(.rect)
+        .disabled(isAlbumMutationInFlight || removingUserIDs.contains(user.id))
         .contextMenu {
             if removable {
                 Button(role: .destructive) {
@@ -246,6 +281,7 @@ struct AlbumOptionsSheet: View {
             }
         }
         .onTapGesture {
+            guard !isAlbumMutationInFlight else { return }
             if removable {
                 userToRemove = user
             } else if canLeave {
@@ -287,35 +323,91 @@ struct AlbumOptionsSheet: View {
     // MARK: - actions
 
     private func setActivity(_ value: Bool) async {
-        guard let client = session.client else { return }
-        do {
-            try await client.updateAlbum(id: album.id, isActivityEnabled: value)
-            await onChanged()
-        } catch {
-            activityEnabled = !value
-            self.error = error.localizedDescription
+        guard let client = session.client,
+              !isActivitySaving,
+              !isAlbumMutationInFlight else { return }
+        let original = album
+        let optimistic = original.withActivityEnabled(value)
+        isActivitySaving = true
+        isAlbumMutationInFlight = true
+        defer {
+            isActivitySaving = false
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t update album activity.",
+            apply: {
+                activityEnabled = value
+                projectAlbum(optimistic)
+            },
+            rollback: {
+                activityEnabled = original.isActivityEnabled ?? true
+                projectAlbum(original)
+            },
+            request: {
+                try await client.updateAlbum(id: original.id, isActivityEnabled: value)
+            }
+        )
     }
 
     private func remove(_ user: User) async {
-        guard let client = session.client else { return }
-        do {
-            try await client.removeAlbumUser(albumID: album.id, userID: user.id)
-            await onChanged()
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
+        guard let client = session.client,
+              !isAlbumMutationInFlight,
+              removingUserIDs.insert(user.id).inserted else { return }
+        let original = album
+        let optimistic = original.removingUser(user.id)
+        isAlbumMutationInFlight = true
+        defer {
+            removingUserIDs.remove(user.id)
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t remove \(user.name) from the album.",
+            apply: {
+                userToRemove = nil
+                projectAlbum(optimistic)
+            },
+            rollback: { projectAlbum(original) },
+            request: {
+                try await client.removeAlbumUser(albumID: original.id, userID: user.id)
+            },
+            commit: { _ in dismiss() }
+        )
     }
 
     private func leave() async {
-        guard let client = session.client, let userID = session.user?.id else { return }
-        do {
-            try await client.removeAlbumUser(albumID: album.id, userID: userID)
-            dismiss()
-            onLeft()
-        } catch {
-            self.error = error.localizedDescription
+        guard let client = session.client,
+              let userID = session.user?.id,
+              !isLeaving,
+              !isAlbumMutationInFlight else { return }
+        let original = album
+        let optimistic = original.removingUser(userID)
+        isLeaving = true
+        isAlbumMutationInFlight = true
+        defer {
+            isLeaving = false
+            isAlbumMutationInFlight = false
         }
+        let left: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t leave the album.",
+            apply: {
+                projectAlbum(optimistic)
+                dismiss()
+                onLeft()
+            },
+            rollback: {
+                projectAlbum(original)
+                onLeaveRolledBack(original)
+            },
+            request: {
+                try await client.removeAlbumUser(albumID: original.id, userID: userID)
+            }
+        )
+        if left != nil { onLeaveCommitted(original.id) }
+    }
+
+    private func projectAlbum(_ replacement: Album) {
+        album = replacement
+        onAlbumChanged(replacement)
     }
 }

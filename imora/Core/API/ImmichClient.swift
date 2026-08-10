@@ -104,8 +104,8 @@ nonisolated final class ImmichClient: Sendable {
         return try JSONDecoder().decode(LoginResponse.self, from: data)
     }
 
-    func logout() async {
-        _ = try? await send(path: "auth/logout", method: "POST") as Data
+    func logout() async throws {
+        _ = try await send(path: "auth/logout", method: "POST") as Data
     }
 
     // MARK: - oauth
@@ -181,7 +181,7 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - core requests
 
-    private static func serverMessage(from data: Data) -> String {
+    static func serverMessage(from data: Data) -> String {
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let message = object["message"] as? String { return message }
             if let messages = object["message"] as? [String] { return messages.joined(separator: "\n") }

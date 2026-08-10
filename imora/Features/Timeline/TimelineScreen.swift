@@ -37,6 +37,11 @@ private final class ScrubberState {
     }
 }
 
+nonisolated enum TimelineServerCommand: Equatable {
+    case restoreAllTrash
+    case emptyTrash
+}
+
 /// reusable bucketed photo grid, the workhorse behind most screens.
 struct TimelineScreen<Header: View>: View {
     @Environment(SessionStore.self) private var session
@@ -57,6 +62,10 @@ struct TimelineScreen<Header: View>: View {
     /// album grids pass their owner so the viewer can offer removal to the
     /// people the server accepts it from. the id itself comes from the filter.
     var albumOwnerID: String?
+    /// Keeps AlbumDetail's metadata header in lockstep with direct grid
+    /// removals without coupling this reusable screen to album state.
+    var onAlbumAssetCountDelta: ((Int) -> Void)?
+    @Binding private var serverCommand: TimelineServerCommand?
     let header: Header
 
     @State private var model: TimelineModel
@@ -76,14 +85,18 @@ struct TimelineScreen<Header: View>: View {
     @State private var preparedShare: PreparedAssetShare?
     @State private var sharingAssetIDs = Set<String>()
     @State private var downloadingAssetIDs = Set<String>()
+    /// Serializes mutations per asset while still allowing unrelated photos
+    /// to update concurrently. The set also disables bulk actions that overlap
+    /// an in-flight context-menu command.
+    @State private var mutatingAssetIDs = Set<String>()
     /// Downloads update the persisted pairing asynchronously. Keeping the new
     /// identifier here makes a reopened context menu correct immediately.
     @State private var downloadedLocalIdentifiers: [String: String] = [:]
-    @State private var actionError: String?
     @State private var columnCount = 3
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
     @State private var tileRegistry = AssetTileRegistry()
+    @State private var isRunningServerCommand = false
 
     init(
         title: String,
@@ -94,6 +107,8 @@ struct TimelineScreen<Header: View>: View {
         mergesLocalPhotos: Bool = false,
         resyncTrigger: Int = 0,
         albumOwnerID: String? = nil,
+        onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
+        serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
         self.title = title
@@ -104,6 +119,8 @@ struct TimelineScreen<Header: View>: View {
         self.mergesLocalPhotos = mergesLocalPhotos
         self.resyncTrigger = resyncTrigger
         self.albumOwnerID = albumOwnerID
+        self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
+        _serverCommand = serverCommand
         self.header = header()
         _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
@@ -226,6 +243,7 @@ struct TimelineScreen<Header: View>: View {
             if isSelecting {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { exitSelection() }
+                        .disabled(isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs))
                 }
             }
         }
@@ -235,6 +253,7 @@ struct TimelineScreen<Header: View>: View {
                 SelectionActionBar(
                     count: selection.count,
                     filter: filter,
+                    isWorking: isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs),
                     onFavorite: { await applyFavorite() },
                     onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
                     onTrash: { await applyTrash() },
@@ -267,13 +286,23 @@ struct TimelineScreen<Header: View>: View {
         .onChange(of: resyncTrigger) {
             model.requestResync()
         }
+        .onChange(of: serverCommand) { _, command in
+            guard let command else { return }
+            serverCommand = nil
+            Task { await run(command) }
+        }
         // the pipeline outlives the screen, so a window left open would keep
         // downloading tiles for a grid nobody is looking at.
         .onDisappear { prefetcher.cancel() }
         .sheet(item: $pendingAlbumAssets) { ids in
-            AlbumPickerSheet(assetIDs: ids) {
-                exitSelection()
-            }
+            AlbumPickerSheet(
+                assetIDs: ids,
+                onApplied: exitSelection,
+                onRollback: { failedIDs in
+                    selection.formUnion(failedIDs)
+                    isSelecting = !selection.isEmpty
+                }
+            )
         }
         .sheet(item: $preparedShare) { share in
             TimelineShareSheet(url: share.url)
@@ -288,17 +317,6 @@ struct TimelineScreen<Header: View>: View {
                 // the edited server asset, even when refreshing its detail fails.
                 session.backup?.noteRemoteEdits([asset.id])
             }
-        }
-        .alert(
-            "Action Failed",
-            isPresented: Binding(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(actionError ?? "")
         }
     }
 
@@ -469,17 +487,25 @@ struct TimelineScreen<Header: View>: View {
             localRemoteIdentifier: asset.isLocal ? serverID : nil,
             pairedLocalIdentifier: pairedLocalID
         )
+        let mutationAttributes: UIMenuElement.Attributes = isRunningServerCommand || mutatingAssetIDs.contains(asset.id)
+            ? .disabled
+            : []
 
         var primary: [UIMenuElement] = []
         if availability.canRestore, let serverID {
-            primary.append(UIAction(title: "Restore", image: UIImage(systemName: "arrow.uturn.backward")) { _ in
+            primary.append(UIAction(
+                title: "Restore",
+                image: UIImage(systemName: "arrow.uturn.backward"),
+                attributes: mutationAttributes
+            ) { _ in
                 Task { _ = await restore(ids: [serverID]) }
             })
         }
         if availability.canFavorite, let serverID {
             primary.append(UIAction(
                 title: asset.isFavorite ? "Unfavorite" : "Favorite",
-                image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart")
+                image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart"),
+                attributes: mutationAttributes
             ) { _ in
                 Task { _ = await favorite(ids: [serverID], value: !asset.isFavorite) }
             })
@@ -495,7 +521,11 @@ struct TimelineScreen<Header: View>: View {
             })
         }
         if canRemoveFromAlbum(asset), let serverID {
-            primary.append(UIAction(title: "Remove from Album", image: UIImage(systemName: "rectangle.stack.badge.minus")) { _ in
+            primary.append(UIAction(
+                title: "Remove from Album",
+                image: UIImage(systemName: "rectangle.stack.badge.minus"),
+                attributes: mutationAttributes
+            ) { _ in
                 Task { _ = await removeFromAlbum(ids: [serverID]) }
             })
         }
@@ -503,7 +533,8 @@ struct TimelineScreen<Header: View>: View {
             let isArchived = asset.visibility == .archive
             primary.append(UIAction(
                 title: isArchived ? "Unarchive" : "Archive",
-                image: UIImage(systemName: isArchived ? "tray.and.arrow.up" : "archivebox")
+                image: UIImage(systemName: isArchived ? "tray.and.arrow.up" : "archivebox"),
+                attributes: mutationAttributes
             ) { _ in
                 Task { _ = await setVisibility(ids: [serverID], isArchived ? .timeline : .archive) }
             })
@@ -563,7 +594,7 @@ struct TimelineScreen<Header: View>: View {
             destructive.append(UIAction(
                 title: pairedLocalID == nil ? "Move to Trash" : "Move to Trash Everywhere",
                 image: UIImage(systemName: "trash"),
-                attributes: .destructive
+                attributes: [.destructive, mutationAttributes]
             ) { _ in
                 Task { _ = await deleteAssets([asset], force: false) }
             })
@@ -572,7 +603,7 @@ struct TimelineScreen<Header: View>: View {
             destructive.append(UIAction(
                 title: "Delete Permanently",
                 image: UIImage(systemName: "trash.slash"),
-                attributes: .destructive
+                attributes: [.destructive, mutationAttributes]
             ) { _ in
                 Task { _ = await deleteAssets([asset], force: true) }
             })
@@ -787,7 +818,34 @@ struct TimelineScreen<Header: View>: View {
     private func handleViewerChange(_ change: AssetChange) {
         switch change {
         case .favorite(let id, let value):
-            model.updateAssets(ids: [id]) { $0.isFavorite = value }
+            if let requiredValue = filter.isFavorite {
+                if value == requiredValue {
+                    model.rollbackExternalOptimisticRemoval(id: id)
+                    model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                } else {
+                    model.beginExternalOptimisticRemoval(id: id)
+                }
+            } else {
+                model.beginExternalOptimisticFavorite(id: id, value: value)
+            }
+        case .favoriteCommitted(let id, let value):
+            if let requiredValue = filter.isFavorite, value != requiredValue {
+                model.commitExternalOptimisticRemoval(id: id)
+            } else if filter.isFavorite == nil {
+                model.commitExternalOptimisticFavorite(id: id)
+            }
+        case .optimisticRemoval(let id):
+            model.beginExternalOptimisticRemoval(id: id)
+        case .removalCommitted(let id):
+            model.commitExternalOptimisticRemoval(id: id)
+        case .removalReverted(let id):
+            model.rollbackExternalOptimisticRemoval(id: id)
+        case .albumMembershipProjected:
+            onAlbumAssetCountDelta?(-1)
+        case .albumMembershipCommitted:
+            break
+        case .albumMembershipReverted:
+            onAlbumAssetCountDelta?(1)
         case .removed(let id):
             model.removeAssets(ids: [id])
         case .localDeleted:
@@ -800,40 +858,101 @@ struct TimelineScreen<Header: View>: View {
         }
     }
 
+    private func run(_ command: TimelineServerCommand) async {
+        guard !isRunningServerCommand else {
+            ErrorToastCenter.shared.show("A trash action is already in progress.")
+            return
+        }
+        let action = command == .restoreAllTrash
+            ? "Couldn’t restore the trash"
+            : "Couldn’t empty the trash"
+        guard mutatingAssetIDs.isEmpty else {
+            ErrorToastCenter.shared.show("Wait for the current photo action to finish.")
+            return
+        }
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("\(action). The server is not available.")
+            return
+        }
+        isRunningServerCommand = true
+        let snapshot = model.clearForOptimisticAction()
+        exitSelection()
+        defer { isRunningServerCommand = false }
+        do {
+            switch command {
+            case .restoreAllTrash:
+                try await client.restoreTrash()
+            case .emptyTrash:
+                try await client.emptyTrash()
+            }
+            model.commit(snapshot)
+        } catch {
+            model.restore(snapshot)
+            ErrorToastCenter.shared.show(action, error: error)
+        }
+    }
+
     // MARK: - asset actions
 
     @discardableResult
     private func favorite(ids: [String], value: Bool) async -> Bool {
+        let requestedIDs = Set(ids)
+        guard beginServerMutation(ids: requestedIDs) else { return false }
+        defer { finishServerMutation(ids: requestedIDs) }
         guard let client = session.client else {
-            actionError = "The server is not available."
+            ErrorToastCenter.shared.show("Couldn’t update favorites. The server is not available.")
             return false
         }
-        do {
-            try await client.setFavorite(ids: ids, value)
-            model.updateAssets(ids: Set(ids)) { $0.isFavorite = value }
-            return true
-        } catch {
-            actionError = "Could not update favorites: \(error.localizedDescription)"
-            return false
-        }
+
+        let leavesCurrentFilter = filter.isFavorite.map { $0 != value } ?? false
+        var favorite: TimelineFavoriteMutation?
+        var removal: TimelineRemoval?
+        let result: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t update favorites",
+            apply: {
+                if leavesCurrentFilter {
+                    removal = model.removeAssetsForOptimisticAction(ids: requestedIDs)
+                } else {
+                    favorite = model.setFavoriteForOptimisticAction(ids: requestedIDs, value: value)
+                }
+            },
+            rollback: {
+                if let removal {
+                    model.restore(removal)
+                } else if let favorite {
+                    model.restore(favorite)
+                }
+            },
+            request: { try await client.setFavorite(ids: ids, value) },
+            commit: { _ in
+                if let removal {
+                    model.commit(removal)
+                } else if let favorite {
+                    model.commit(favorite)
+                }
+            }
+        )
+        return result != nil
     }
 
     @discardableResult
     private func setVisibility(ids: [String], _ value: AssetVisibility) async -> Bool {
+        let requestedIDs = Set(ids)
+        guard beginServerMutation(ids: requestedIDs) else { return false }
+        defer { finishServerMutation(ids: requestedIDs) }
         guard let client = session.client else {
-            actionError = "The server is not available."
+            ErrorToastCenter.shared.show("The server is not available.")
             return false
         }
-        do {
-            try await client.setVisibility(ids: ids, value)
-            model.removeAssets(ids: Set(ids))
-            return true
-        } catch {
-            actionError = value == .archive
-                ? "Could not archive: \(error.localizedDescription)"
-                : "Could not unarchive: \(error.localizedDescription)"
-            return false
-        }
+        var removal: TimelineRemoval?
+        let result: Void? = await OptimisticAction.perform(
+            errorMessage: value == .archive ? "Couldn’t archive" : "Couldn’t unarchive",
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: requestedIDs) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: { try await client.setVisibility(ids: ids, value) },
+            commit: { _ in if let removal { model.commit(removal) } }
+        )
+        return result != nil
     }
 
     private func share(_ asset: Asset) async {
@@ -846,31 +965,31 @@ struct TimelineScreen<Header: View>: View {
             } else if let client = session.client {
                 url = try await SharedAssetFile(client: client, asset: asset).exportedURL()
             } else {
-                actionError = "Sharing is not available while signed out."
+                ErrorToastCenter.shared.show("Sharing is not available while signed out.")
                 return
             }
             preparedShare = PreparedAssetShare(url: url)
         } catch {
-            actionError = "Could not prepare this item for sharing: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t prepare this item for sharing", error: error)
         }
     }
 
     private func backUp(localID: String) async {
         guard let backup = session.backup else {
-            actionError = "Backup is not available."
+            ErrorToastCenter.shared.show("Backup is not available.")
             return
         }
         do {
             _ = try await backup.backUp(localIdentifier: localID)
             await model.refreshLocalItems()
         } catch {
-            actionError = "Could not back up: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t back up", error: error)
         }
     }
 
     private func download(_ asset: Asset) async {
         guard let backup = session.backup else {
-            actionError = "Download is not available."
+            ErrorToastCenter.shared.show("Download is not available.")
             return
         }
         guard downloadingAssetIDs.insert(asset.id).inserted else { return }
@@ -878,13 +997,13 @@ struct TimelineScreen<Header: View>: View {
         do {
             downloadedLocalIdentifiers[asset.id] = try await backup.download(asset: asset)
         } catch {
-            actionError = "Could not download: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t download", error: error)
         }
     }
 
     private func openInBrowser(serverID: String) async {
         guard let client = session.client else {
-            actionError = "The server is not available."
+            ErrorToastCenter.shared.show("The server is not available.")
             return
         }
         let base = await client.serverWebURL()
@@ -896,7 +1015,7 @@ struct TimelineScreen<Header: View>: View {
             try await PhotoLibraryService.delete(localIdentifiers: [localID])
         } catch {
             if !PhotoLibraryService.isUserCancelled(error) {
-                actionError = "Could not delete from this device: \(error.localizedDescription)"
+                ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
             }
             return
         }
@@ -905,21 +1024,25 @@ struct TimelineScreen<Header: View>: View {
     }
 
     /// Device deletion happens first so cancelling the system prompt leaves the
-    /// server untouched. If the later server call fails, the remote grid item is
-    /// preserved and the partial result is reported instead of hidden.
+    /// server untouched. Once that irreversible step succeeds, the remote
+    /// projection disappears immediately and is restored if the server rejects
+    /// its half of the operation.
     @discardableResult
     private func deleteAssets(_ assets: [Asset], force: Bool) async -> Bool {
         guard let client = session.client else {
-            actionError = "The server is not available."
+            ErrorToastCenter.shared.show("The server is not available.")
             return false
         }
         let targets = assets.compactMap { asset -> (sourceID: String, serverID: String)? in
             serverIdentifier(for: asset).map { (asset.id, $0) }
         }
         guard targets.count == assets.count, !targets.isEmpty else {
-            actionError = "This item does not have a server copy yet."
+            ErrorToastCenter.shared.show("This item does not have a server copy yet.")
             return false
         }
+        let sourceIDs = Set(targets.map(\.sourceID))
+        guard beginServerMutation(ids: sourceIDs) else { return false }
+        defer { finishServerMutation(ids: sourceIDs) }
 
         var localIDs = Set<String>()
         for (asset, target) in zip(assets, targets) {
@@ -935,7 +1058,7 @@ struct TimelineScreen<Header: View>: View {
                 try await PhotoLibraryService.delete(localIdentifiers: Array(localIDs))
             } catch {
                 if !PhotoLibraryService.isUserCancelled(error) {
-                    actionError = "Could not delete from this device: \(error.localizedDescription)"
+                    ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
                 }
                 return false
             }
@@ -943,54 +1066,104 @@ struct TimelineScreen<Header: View>: View {
             for target in targets { downloadedLocalIdentifiers[target.serverID] = nil }
         }
 
-        do {
-            try await client.trashAssets(ids: targets.map { $0.serverID }, force: force)
-        } catch {
-            let operation = force ? "delete permanently" : "move to trash"
-            actionError = localIDs.isEmpty
-                ? "Could not \(operation): \(error.localizedDescription)"
-                : "Deleted from this device, but the server copy could not be deleted: \(error.localizedDescription)"
-            return false
+        let errorMessage: String
+        if localIDs.isEmpty {
+            errorMessage = force ? "Couldn’t delete permanently" : "Couldn’t move to trash"
+        } else if force {
+            errorMessage = "Deleted from this device, but couldn’t permanently delete the server copy"
+        } else {
+            errorMessage = "Deleted from this device, but couldn’t move the server copy to trash"
         }
-        model.removeAssets(ids: Set(targets.map { $0.sourceID }))
-        return true
+        var removal: TimelineRemoval?
+        let result: Void? = await OptimisticAction.perform(
+            errorMessage: errorMessage,
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: sourceIDs) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: {
+                try await client.trashAssets(ids: targets.map(\.serverID), force: force)
+            },
+            commit: { _ in if let removal { model.commit(removal) } }
+        )
+        return result != nil
     }
 
     @discardableResult
     private func restore(ids: [String]) async -> Bool {
+        let requestedIDs = Set(ids)
+        guard beginServerMutation(ids: requestedIDs) else { return false }
+        defer { finishServerMutation(ids: requestedIDs) }
         guard let client = session.client else {
-            actionError = "The server is not available."
+            ErrorToastCenter.shared.show("The server is not available.")
             return false
         }
-        do {
-            try await client.restoreAssets(ids: ids)
-            model.removeAssets(ids: Set(ids))
-            return true
-        } catch {
-            actionError = "Could not restore: \(error.localizedDescription)"
-            return false
-        }
+        var removal: TimelineRemoval?
+        let result: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t restore",
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: requestedIDs) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: { try await client.restoreAssets(ids: ids) },
+            commit: { _ in if let removal { model.commit(removal) } }
+        )
+        return result != nil
     }
 
     /// Returns only the ids the server actually removed. Immich can accept a
     /// bulk request while rejecting individual assets for permission reasons.
     private func removeFromAlbum(ids: [String]) async -> Set<String> {
+        let requestedIDs = Set(ids)
+        guard beginServerMutation(ids: requestedIDs) else { return [] }
+        defer { finishServerMutation(ids: requestedIDs) }
         guard let client = session.client, let albumID = filter.albumId else {
-            actionError = "The album is not available."
+            ErrorToastCenter.shared.show("The album is not available.")
             return []
         }
-        do {
-            let results = try await client.removeAssets(albumID: albumID, ids: ids)
-            let removed = Set(results.filter(\.success).map(\.id))
-            model.removeAssets(ids: removed)
-            if removed.count != Set(ids).count {
-                actionError = "Some items could not be removed from the album."
-            }
-            return removed
-        } catch {
-            actionError = "Could not remove from the album: \(error.localizedDescription)"
-            return []
+        var removal: TimelineRemoval?
+        let results: [BulkIdResult]? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t remove from the album",
+            apply: {
+                removal = model.removeAssetsForOptimisticAction(ids: requestedIDs)
+                onAlbumAssetCountDelta?(-requestedIDs.count)
+            },
+            rollback: {
+                if let removal { model.restore(removal) }
+                onAlbumAssetCountDelta?(requestedIDs.count)
+            },
+            request: { try await client.removeAssets(albumID: albumID, ids: ids) }
+        )
+        guard let results else { return [] }
+
+        let succeeded = Set(results.lazy.filter(\.success).map(\.id))
+            .intersection(requestedIDs)
+        let failed = requestedIDs.subtracting(succeeded)
+        if let removal { model.commit(removal, ids: succeeded) }
+        if !failed.isEmpty {
+            if let removal { model.restore(removal, ids: failed) }
+            onAlbumAssetCountDelta?(failed.count)
+            ErrorToastCenter.shared.show(albumRemovalFailureMessage(results, failedCount: failed.count))
         }
+        return succeeded
+    }
+
+    private func beginServerMutation(ids: Set<String>) -> Bool {
+        guard !isRunningServerCommand,
+              !ids.isEmpty,
+              mutatingAssetIDs.isDisjoint(with: ids)
+        else { return false }
+        mutatingAssetIDs.formUnion(ids)
+        return true
+    }
+
+    private func finishServerMutation(ids: Set<String>) {
+        mutatingAssetIDs.subtract(ids)
+    }
+
+    private func albumRemovalFailureMessage(_ results: [BulkIdResult], failedCount: Int) -> String {
+        let base = failedCount == 1
+            ? "Couldn’t remove this item from the album."
+            : "Couldn’t remove \(failedCount) items from the album."
+        guard let reason = results.first(where: { !$0.success })?.error else { return base }
+        let readable = reason.replacingOccurrences(of: "_", with: " ")
+        return "\(base) Server response: \(readable)."
     }
 
     // MARK: - bulk actions
@@ -1253,6 +1426,7 @@ private struct InteractiveAssetTile: UIViewRepresentable {
 private struct SelectionActionBar: View {
     let count: Int
     let filter: TimelineFilter
+    let isWorking: Bool
     let onFavorite: () async -> Void
     let onArchive: () async -> Void
     let onTrash: () async -> Void
@@ -1296,6 +1470,7 @@ private struct SelectionActionBar: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 8)
+        .disabled(isWorking || count == 0)
     }
 
     private func barButton(_ icon: String, _ label: String, role: ButtonRole? = nil, action: @escaping () -> Void) -> some View {

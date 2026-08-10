@@ -3,11 +3,23 @@ import AVKit
 
 nonisolated enum AssetChange {
     case favorite(String, Bool)
+    case favoriteCommitted(String, Bool)
+    case optimisticRemoval(String)
+    case removalCommitted(String)
+    case removalReverted(String)
+    case albumMembershipProjected(String)
+    case albumMembershipCommitted(String)
+    case albumMembershipReverted(String)
     case removed(String)
     /// deleted from the device only - the server copy remains, so grids keep it.
     case localDeleted(String)
     /// pixels changed server side; the new thumbhash cache-busts stale thumbs.
     case edited(String, thumbhash: String?)
+}
+
+private struct ViewerRemoval {
+    let asset: Asset
+    let index: Int
 }
 
 /// the album a grid belongs to, when it belongs to one. carries the owner so
@@ -41,6 +53,14 @@ private enum ViewerConfirmationSource {
     case menu
 }
 
+/// Destinations selected from information are pushed by the viewer after the
+/// sheet has fully dismissed, so they use the full screen and native back
+/// navigation instead of replacing the sheet's contents.
+private enum AssetInformationDestination: Hashable {
+    case person(Person)
+    case album(Album)
+}
+
 /// shared body for the viewer's per-source confirmation attachments.
 private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
     @Binding var isPresented: Bool
@@ -69,25 +89,31 @@ private struct AssetInformationSheet: View {
 
     let asset: Asset
     let serverAssetID: String?
-    let onDateAdjusted: (Date, Double) -> Void
+    let onDateAdjusted: (String, Date, Double) -> Void
     let onAlbumAdded: (String) -> Void
+    let onOpenPerson: (Person) -> Void
+    let onOpenAlbum: (Album) -> Void
     @Binding var presentationFrame: CGRect
 
     @State private var showAddToAlbum = false
+    @State private var albumMembershipUpdate: AlbumMembershipUpdate?
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                AssetInfoPanel(
-                    asset: asset,
-                    onDateAdjusted: onDateAdjusted,
-                    onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true }
-                )
-            }
-            .scrollDismissesKeyboard(.interactively)
+        ScrollView {
+            AssetInfoPanel(
+                asset: asset,
+                onDateAdjusted: onDateAdjusted,
+                onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+                onOpenPerson: onOpenPerson,
+                onOpenAlbum: onOpenAlbum,
+                albumMembershipUpdate: albumMembershipUpdate
+            )
         }
+        .scrollDismissesKeyboard(.interactively)
+        .background(Color(uiColor: .systemBackground))
         .presentationDetents([Self.detent])
         .presentationDragIndicator(.visible)
+        .presentationBackground(Color(uiColor: .systemBackground))
         .presentationBackgroundInteraction(.enabled(upThrough: Self.detent))
         .tint(.accentColor)
         .onGeometryChange(for: CGRect.self) { geometry in
@@ -100,7 +126,17 @@ private struct AssetInformationSheet: View {
         }
         .sheet(isPresented: $showAddToAlbum) {
             if let serverAssetID {
-                AddToAlbumSheet(assetIDs: [serverAssetID], onDone: onAlbumAdded)
+                AddToAlbumSheet(
+                    assetIDs: [serverAssetID],
+                    onMembershipUpdate: { update in
+                        albumMembershipUpdate = AlbumMembershipUpdate(
+                            operationID: update.operationID,
+                            assetID: asset.id,
+                            change: update.change
+                        )
+                    },
+                    onDone: onAlbumAdded
+                )
             }
         }
     }
@@ -142,6 +178,8 @@ struct AssetViewerScreen: View {
     @State private var chromeVisible = true
     @State private var showInfo = false
     @State private var informationSheetFrame = CGRect.zero
+    @State private var informationNavigationPath: [AssetInformationDestination] = []
+    @State private var pendingInformationDestination: AssetInformationDestination?
     @State private var showAddToAlbum = false
     @State private var showShareLinks = false
     @State private var showSimilar = false
@@ -156,7 +194,10 @@ struct AssetViewerScreen: View {
     /// server copy of a still-open local asset after it has been backed up.
     @State private var backedUpRemoteID: String?
     @State private var downloading = false
-    @State private var actionError: String?
+    @State private var mutatingAssetIDs: Set<String> = []
+    @State private var optimisticRemovals: [String: ViewerRemoval] = [:]
+    @State private var optimisticEdits: [String: AssetEditProjection] = [:]
+    @State private var editCacheKeys: [String: String] = [:]
     @State private var toast: String?
     @State private var isDismissing = false
     @State private var didNotifyDismissal = false
@@ -240,7 +281,7 @@ struct AssetViewerScreen: View {
     }
 
     private var core: some View {
-        NavigationStack {
+        NavigationStack(path: $informationNavigationPath) {
             GeometryReader { geometry in
                 let pageLayout = AssetViewerPageLayout(
                     viewportHeight: geometry.size.height,
@@ -285,9 +326,21 @@ struct AssetViewerScreen: View {
             .toolbarColorScheme(.dark, for: .navigationBar, .bottomBar)
             .navigationBarTitleDisplayMode(.inline)
             .tint(.white)
+            .navigationDestination(for: AssetInformationDestination.self) { destination in
+                informationDestinationView(destination)
+                    .tint(.accentColor)
+                    .toolbarBackgroundVisibility(.automatic, for: .navigationBar)
+                    .toolbarColorScheme(nil, for: .navigationBar)
+            }
             .onChange(of: showInfo, initial: true) { _, isVisible in
                 if !isVisible { informationSheetFrame = .zero }
-                onMediaAtTopChanged(!isVisible)
+                reportMediaAtTop()
+            }
+            .onChange(of: informationNavigationPath) {
+                reportMediaAtTop()
+            }
+            .onChange(of: pendingInformationDestination) {
+                reportMediaAtTop()
             }
         }
         .statusBarHidden(isContextPreview || !chromeVisible)
@@ -310,17 +363,19 @@ struct AssetViewerScreen: View {
             onPageZoomChanged(false)
             onDismissed()
         }
-        .sheet(isPresented: $showInfo) {
+        .sheet(isPresented: $showInfo, onDismiss: openPendingInformationDestination) {
             if let current {
                 AssetInformationSheet(
                     asset: current,
                     serverAssetID: serverAssetID,
-                    onDateAdjusted: { fileCreatedAt, offsetHours in
-                        guard let index = assets.firstIndex(where: { $0.id == current.id }) else { return }
+                    onDateAdjusted: { assetID, fileCreatedAt, offsetHours in
+                        guard let index = assets.firstIndex(where: { $0.id == assetID }) else { return }
                         assets[index].fileCreatedAt = fileCreatedAt
                         assets[index].localOffsetHours = offsetHours
                     },
                     onAlbumAdded: { toast = $0 },
+                    onOpenPerson: { queueInformationDestination(.person($0)) },
+                    onOpenAlbum: { queueInformationDestination(.album($0)) },
                     presentationFrame: $informationSheetFrame
                 )
             }
@@ -356,14 +411,15 @@ struct AssetViewerScreen: View {
         .fullScreenCover(isPresented: $showEditor) {
             if let current {
                 let editedID = current.id
-                AssetEditScreen(asset: current) { outcome in
-                    guard case .saved(let detail) = outcome else { return }
-                    // a saved edit whose refresh failed still repainted the
-                    // server side, so always confirm it; the thumbhash only
-                    // decides whether cached renders can be busted now.
-                    apply(.edited(editedID, thumbhash: detail?.thumbhash))
-                    toast = "Edits saved"
-                }
+                AssetEditScreen(
+                    asset: current,
+                    onProjected: projectEdit,
+                    onReverted: { revertEdit(assetID: editedID, operationID: $0) },
+                    onCommitted: { operationID, detail in
+                        commitEdit(assetID: editedID, operationID: operationID, detail: detail)
+                    },
+                    onFinished: { _ in }
+                )
             }
         }
         .fullScreenCover(isPresented: $showProfileCrop) {
@@ -389,15 +445,6 @@ struct AssetViewerScreen: View {
             guard !Task.isCancelled, current?.id == asset.id else { return }
             localIdentifier = identifier
         }
-        .alert(
-            actionError ?? "",
-            isPresented: Binding(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) {}
-        }
         .overlay(alignment: .top) {
             if let toast {
                 ToastBanner(text: toast) { self.toast = nil }
@@ -415,7 +462,10 @@ struct AssetViewerScreen: View {
                 assets: assets,
                 selection: $selectedAssetID,
                 mutesVideo: isContextPreview,
-                playback: playback
+                playback: playback,
+                mediaLayoutMode: AssetViewerMediaLayoutMode(informationPresented: showInfo),
+                optimisticEdits: optimisticEdits,
+                editCacheKeys: editCacheKeys
             ) { id, isZoomed in
                 guard id == selectedAssetID else { return }
                 currentPageZoomed = isZoomed
@@ -467,6 +517,55 @@ struct AssetViewerScreen: View {
         guard showInfo != visible else { return }
         guard !visible || !currentPageZoomed else { return }
         showInfo = visible
+    }
+
+    private func queueInformationDestination(_ destination: AssetInformationDestination) {
+        pendingInformationDestination = destination
+        chromeVisible = true
+        onMediaAtTopChanged(false)
+        showInfo = false
+    }
+
+    private func openPendingInformationDestination() {
+        guard let destination = pendingInformationDestination else { return }
+        informationNavigationPath.append(destination)
+        pendingInformationDestination = nil
+        reportMediaAtTop()
+    }
+
+    private func reportMediaAtTop() {
+        onMediaAtTopChanged(
+            !showInfo
+                && pendingInformationDestination == nil
+                && informationNavigationPath.isEmpty
+        )
+    }
+
+    @ViewBuilder private func informationDestinationView(
+        _ destination: AssetInformationDestination
+    ) -> some View {
+        switch destination {
+        case .person(let person):
+            PersonScreen(person: person)
+        case .album(let album):
+            AlbumDetailScreen(
+                album: album,
+                onAlbumRestored: restoreInformationAlbum
+            )
+        }
+    }
+
+    private func restoreInformationAlbum(_ album: Album) {
+        Task { @MainActor in
+            // Let AlbumDetail's optimistic pop finish before replaying the
+            // failed command's destination into this viewer-owned stack.
+            await Task.yield()
+            guard !informationNavigationPath.contains(where: { destination in
+                guard case .album(let current) = destination else { return false }
+                return current.id == album.id
+            }) else { return }
+            informationNavigationPath.append(.album(album))
+        }
     }
 
     /// Photos-style upward swipe reveals the native information surface while
@@ -550,6 +649,7 @@ struct AssetViewerScreen: View {
                         .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: current.isFavorite)
                 }
                 .accessibilityIdentifier("viewer-favorite")
+                .disabled(mutatingAssetIDs.contains(current.id))
             }
             ToolbarSpacer(.fixed, placement: .bottomBar)
         }
@@ -573,6 +673,7 @@ struct AssetViewerScreen: View {
                     Image(systemName: "slider.horizontal.3")
                 }
                 .accessibilityIdentifier("viewer-edit")
+                .disabled(optimisticEdits[current.id] != nil)
             }
         }
 
@@ -689,6 +790,7 @@ struct AssetViewerScreen: View {
                             Label("Edit", systemImage: "slider.horizontal.3")
                         }
                         .accessibilityIdentifier("viewer-edit")
+                        .disabled(optimisticEdits[current.id] != nil)
                     }
                     if actionAvailability?.canAddToAlbum == true {
                         Button { showAddToAlbum = true } label: {
@@ -731,6 +833,7 @@ struct AssetViewerScreen: View {
                             Button { showProfileCrop = true } label: {
                                 Label("Set as Profile Picture", systemImage: "person.crop.circle")
                             }
+                            .disabled(session.isProfileImageMutationInFlight)
                         }
                         if actionAvailability?.canDownload == true {
                             if downloading {
@@ -1014,7 +1117,11 @@ struct AssetViewerScreen: View {
             if let index = assets.firstIndex(where: { $0.id == id }) {
                 assets[index].isFavorite = value
             }
-        case .removed(let id):
+        case .favoriteCommitted:
+            break
+        case .albumMembershipProjected, .albumMembershipCommitted, .albumMembershipReverted:
+            break
+        case .optimisticRemoval(let id), .removed(let id):
             if let index = assets.firstIndex(where: { $0.id == id }) {
                 assets.remove(at: index)
                 if assets.isEmpty {
@@ -1024,6 +1131,8 @@ struct AssetViewerScreen: View {
                     selectedAssetID = assets[currentIndex].id
                 }
             }
+        case .removalCommitted, .removalReverted:
+            break
         case .localDeleted:
             break
         case .edited(let id, let thumbhash):
@@ -1037,26 +1146,50 @@ struct AssetViewerScreen: View {
         onChange(change)
     }
 
+    private func projectEdit(_ projection: AssetEditProjection) {
+        optimisticEdits[projection.assetID] = projection
+    }
+
+    private func revertEdit(assetID: String, operationID: UUID) {
+        guard optimisticEdits[assetID]?.operationID == operationID else { return }
+        optimisticEdits.removeValue(forKey: assetID)
+    }
+
+    private func commitEdit(assetID: String, operationID: UUID, detail: AssetDetail?) {
+        guard optimisticEdits[assetID]?.operationID == operationID else { return }
+        editCacheKeys[assetID] = detail?.thumbhash ?? operationID.uuidString
+        optimisticEdits.removeValue(forKey: assetID)
+        apply(.edited(assetID, thumbhash: detail?.thumbhash))
+        toast = "Edits saved"
+    }
+
     private func toggleFavorite() async {
         guard let client = session.client, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
         let newValue = !asset.isFavorite
+        apply(.favorite(asset.id, newValue))
         do {
             try await client.setFavorite(ids: [asset.id], newValue)
-            apply(.favorite(asset.id, newValue))
+            apply(.favoriteCommitted(asset.id, newValue))
         } catch {
-            actionError = "Could not update the favorite: \(error.localizedDescription)"
+            apply(.favorite(asset.id, asset.isFavorite))
+            ErrorToastCenter.shared.show("Couldn’t update the favorite", error: error)
         }
     }
 
     private func toggleArchive() async {
         guard let client = session.client, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
         let visibility: AssetVisibility = asset.visibility == .archive ? .timeline : .archive
+        beginOptimisticRemoval(asset)
         do {
             try await client.setVisibility(ids: [asset.id], visibility)
-            onChange(.removed(asset.id))
-            removeCurrent()
+            commitOptimisticRemoval(asset.id)
         } catch {
-            actionError = "Could not update the archive: \(error.localizedDescription)"
+            rollbackOptimisticRemoval(asset.id)
+            ErrorToastCenter.shared.show("Couldn’t update the archive", error: error)
         }
     }
 
@@ -1064,24 +1197,39 @@ struct AssetViewerScreen: View {
     /// is why this needs no confirmation, matching the official mobile client.
     private func removeFromAlbum() async {
         guard let client = session.client, let album, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        onChange(.albumMembershipProjected(asset.id))
+        beginOptimisticRemoval(asset)
         do {
-            try await client.removeAssets(albumID: album.id, ids: [asset.id])
-            onChange(.removed(asset.id))
-            removeCurrent()
+            let results = try await client.removeAssets(albumID: album.id, ids: [asset.id])
+            guard results.first(where: { $0.id == asset.id })?.success == true else {
+                rollbackOptimisticRemoval(asset.id)
+                onChange(.albumMembershipReverted(asset.id))
+                ErrorToastCenter.shared.show("Couldn’t remove this photo from the album. The change was undone.")
+                return
+            }
+            commitOptimisticRemoval(asset.id)
+            onChange(.albumMembershipCommitted(asset.id))
             toast = "Removed from the album"
         } catch {
-            actionError = "Could not remove from the album: \(error.localizedDescription)"
+            rollbackOptimisticRemoval(asset.id)
+            onChange(.albumMembershipReverted(asset.id))
+            ErrorToastCenter.shared.show("Couldn’t remove this photo from the album", error: error)
         }
     }
 
     private func restore() async {
         guard let client = session.client, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        beginOptimisticRemoval(asset)
         do {
             try await client.restoreAssets(ids: [asset.id])
-            onChange(.removed(asset.id))
-            removeCurrent()
+            commitOptimisticRemoval(asset.id)
         } catch {
-            actionError = "Could not restore: \(error.localizedDescription)"
+            rollbackOptimisticRemoval(asset.id)
+            ErrorToastCenter.shared.show("Couldn’t restore this photo", error: error)
         }
     }
 
@@ -1092,6 +1240,8 @@ struct AssetViewerScreen: View {
             return
         }
         guard let client = session.client else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
         if let localID = await resolveLocalIdentifier() {
             await deleteEverywhere(
                 serverID: serverAssetID,
@@ -1101,17 +1251,20 @@ struct AssetViewerScreen: View {
             )
             return
         }
+        beginOptimisticRemoval(asset)
         do {
             try await client.trashAssets(ids: [serverAssetID])
-            onChange(.removed(asset.id))
-            removeCurrent()
+            commitOptimisticRemoval(asset.id)
         } catch {
-            actionError = "Could not move to trash: \(error.localizedDescription)"
+            rollbackOptimisticRemoval(asset.id)
+            ErrorToastCenter.shared.show("Couldn’t move this photo to trash", error: error)
         }
     }
 
     private func deletePermanently() async {
         guard let client = session.client, let asset = current, let serverAssetID else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
         if let localID = await resolveLocalIdentifier() {
             await deleteEverywhere(
                 serverID: serverAssetID,
@@ -1121,12 +1274,13 @@ struct AssetViewerScreen: View {
             )
             return
         }
+        beginOptimisticRemoval(asset)
         do {
             try await client.trashAssets(ids: [serverAssetID], force: true)
-            onChange(.removed(asset.id))
-            removeCurrent()
+            commitOptimisticRemoval(asset.id)
         } catch {
-            actionError = "Could not delete: \(error.localizedDescription)"
+            rollbackOptimisticRemoval(asset.id)
+            ErrorToastCenter.shared.show("Couldn’t delete this photo", error: error)
         }
     }
 
@@ -1154,21 +1308,30 @@ struct AssetViewerScreen: View {
         localIdentifier: String,
         force: Bool
     ) async {
-        guard let client = session.client else { return }
+        guard let client = session.client,
+              let removedAsset = assets.first(where: { $0.id == sourceAssetID })
+        else { return }
         do {
             try await PhotoLibraryService.delete(localIdentifiers: [localIdentifier])
         } catch {
+            if !PhotoLibraryService.isUserCancelled(error) {
+                ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
+            }
             return
         }
         session.backup?.noteLocalDeletion([localIdentifier])
         self.localIdentifier = nil
+        beginOptimisticRemoval(removedAsset)
         do {
             try await client.trashAssets(ids: [serverID], force: force)
-            onChange(.removed(sourceAssetID))
-            removeCurrent()
+            commitOptimisticRemoval(sourceAssetID)
         } catch {
+            rollbackOptimisticRemoval(sourceAssetID)
             onChange(.localDeleted(sourceAssetID))
-            actionError = "Deleted from this device, but the server copy could not be deleted."
+            ErrorToastCenter.shared.show(
+                "Deleted from this device, but couldn’t delete the server copy",
+                error: error
+            )
         }
     }
 
@@ -1178,6 +1341,9 @@ struct AssetViewerScreen: View {
         do {
             try await PhotoLibraryService.delete(localIdentifiers: [localId])
         } catch {
+            if !PhotoLibraryService.isUserCancelled(error) {
+                ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
+            }
             return
         }
         session.backup?.noteLocalDeletion([localId])
@@ -1196,7 +1362,7 @@ struct AssetViewerScreen: View {
             if current?.id == asset.id { localIdentifier = localId }
             toast = "Saved to your photo library"
         } catch {
-            actionError = "Could not download: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t download this photo", error: error)
         }
     }
 
@@ -1212,7 +1378,7 @@ struct AssetViewerScreen: View {
             assets[currentIndex].isLocalBackedUp = true
             toast = "Backed up"
         } catch {
-            actionError = "Could not back up: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t back up this photo", error: error)
         }
     }
 
@@ -1221,6 +1387,9 @@ struct AssetViewerScreen: View {
         do {
             try await PhotoLibraryService.delete(localIdentifiers: [localId])
         } catch {
+            if !PhotoLibraryService.isUserCancelled(error) {
+                ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
+            }
             return
         }
         session.backup?.noteLocalDeletion([localId])
@@ -1241,6 +1410,31 @@ struct AssetViewerScreen: View {
         guard let client = session.client, let serverAssetID else { return }
         let base = await client.serverWebURL()
         openURL(base.appending(path: "photos/\(serverAssetID)"))
+    }
+
+    private func beginOptimisticRemoval(_ asset: Asset) {
+        guard optimisticRemovals[asset.id] == nil,
+              let index = assets.firstIndex(where: { $0.id == asset.id })
+        else { return }
+        optimisticRemovals[asset.id] = ViewerRemoval(asset: asset, index: index)
+        apply(.optimisticRemoval(asset.id))
+    }
+
+    private func commitOptimisticRemoval(_ id: String) {
+        optimisticRemovals[id] = nil
+        onChange(.removalCommitted(id))
+    }
+
+    private func rollbackOptimisticRemoval(_ id: String) {
+        guard let removal = optimisticRemovals.removeValue(forKey: id) else { return }
+        if !assets.contains(where: { $0.id == id }) {
+            assets.insert(removal.asset, at: min(removal.index, assets.count))
+            if selectedAssetID == nil || assets.count == 1 {
+                currentIndex = min(removal.index, assets.count - 1)
+                selectedAssetID = id
+            }
+        }
+        onChange(.removalReverted(id))
     }
 
     private func removeCurrent() {
@@ -1318,6 +1512,9 @@ private struct AssetPager: View {
     @Binding var selection: String?
     let mutesVideo: Bool
     let playback: VideoPlayback
+    let mediaLayoutMode: AssetViewerMediaLayoutMode
+    let optimisticEdits: [String: AssetEditProjection]
+    let editCacheKeys: [String: String]
     let onZoomChanged: (String, Bool) -> Void
 
     var body: some View {
@@ -1328,11 +1525,15 @@ private struct AssetPager: View {
                         asset: asset,
                         isActive: asset.id == selection,
                         mutesVideo: mutesVideo,
-                        playback: playback
+                        playback: playback,
+                        mediaLayoutMode: mediaLayoutMode,
+                        optimisticEdit: optimisticEdits[asset.id],
+                        editCacheKey: editCacheKeys[asset.id]
                     ) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
                     .containerRelativeFrame([.horizontal, .vertical])
+                    .clipped()
                 }
             }
             .scrollTargetLayout()
@@ -1351,6 +1552,9 @@ private struct AssetPage: View {
     let isActive: Bool
     let mutesVideo: Bool
     let playback: VideoPlayback
+    let mediaLayoutMode: AssetViewerMediaLayoutMode
+    let optimisticEdit: AssetEditProjection?
+    let editCacheKey: String?
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -1377,37 +1581,63 @@ private struct AssetPage: View {
     }
 
     @ViewBuilder private var pageContent: some View {
-        if asset.isVideo {
+        if let optimisticEdit, let image = UIImage(data: optimisticEdit.imageData) {
+            ZoomableScrollView(
+                contentID: "\(asset.id)#edit-\(optimisticEdit.operationID)#\(mediaLayoutMode.rawValue)",
+                onZoomChanged: onZoomChanged
+            ) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: mediaLayoutMode.swiftUIContentMode)
+            }
+        } else if asset.isVideo {
             VideoPlayerPage(
                 asset: asset,
                 deviceIdentifier: deviceIdentifier,
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
+                mediaLayoutMode: mediaLayoutMode,
                 onZoomChanged: onZoomChanged
             )
         } else if let localId = deviceIdentifier {
-            ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
+            ZoomableScrollView(
+                contentID: "\(asset.id)#\(mediaLayoutMode.rawValue)",
+                onZoomChanged: onZoomChanged
+            ) {
                 LocalPhotoImage(
                     localIdentifier: localId,
                     targetPixelSize: pagePixelSize,
                     fallbackTargetPixelSize: 640,
-                    contentMode: .fit,
+                    contentMode: mediaLayoutMode.swiftUIContentMode,
                     onUnavailable: { localUnavailable = true }
                 )
             }
         } else if let client = session.client {
             // the thumbhash cache key re-renders the page when edits land.
-            ZoomableScrollView(contentID: "\(asset.id)#\(asset.thumbhash ?? "")", onZoomChanged: onZoomChanged) {
+            let cacheKey = editCacheKey ?? asset.thumbhash
+            ZoomableScrollView(
+                contentID: "\(asset.id)#\(cacheKey ?? "")#\(mediaLayoutMode.rawValue)",
+                onZoomChanged: onZoomChanged
+            ) {
                 RemoteImage(
-                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash),
+                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: cacheKey),
                     targetPixelSize: pagePixelSize,
                     thumbhash: asset.thumbhash,
-                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
+                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
                     fallbackTargetPixelSize: 640,
-                    contentMode: .fit
+                    contentMode: mediaLayoutMode.swiftUIContentMode
                 )
             }
+        }
+    }
+}
+
+extension AssetViewerMediaLayoutMode {
+    var swiftUIContentMode: ContentMode {
+        switch self {
+        case .fit: .fit
+        case .fill: .fill
         }
     }
 }
@@ -1538,9 +1768,12 @@ nonisolated struct SharedAssetFile: Transferable {
             request.setValue(value, forHTTPHeaderField: key)
         }
         let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ImmichError.http(http.statusCode, ImmichClient.serverMessage(from: data))
+        }
         var filename = "photo"
-        if let http = response as? HTTPURLResponse,
-           let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
+        if let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
            let range = disposition.range(of: "filename=\"") {
             filename = String(disposition[range.upperBound...].prefix(while: { $0 != "\"" }))
         } else if asset.isVideo {

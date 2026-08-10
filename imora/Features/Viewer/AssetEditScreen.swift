@@ -167,6 +167,65 @@ nonisolated enum AssetEditOutcome {
     case saved(AssetDetail?)
 }
 
+/// A local render that lets the viewer show the accepted edit intent while
+/// the server replaces its derivative files.
+nonisolated struct AssetEditProjection: Equatable, Sendable {
+    let operationID: UUID
+    let assetID: String
+    let imageData: Data
+}
+
+enum AssetEditPreviewRenderer {
+    static func render(_ image: UIImage, state: EditTransform.State) -> Data? {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let uprightSize = CGSize(
+            width: max(image.size.width * image.scale, 1),
+            height: max(image.size.height * image.scale, 1)
+        )
+        let upright = UIGraphicsImageRenderer(size: uprightSize, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: uprightSize))
+        }
+        guard let source = upright.cgImage else { return nil }
+
+        let crop = state.crop.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        let pixelCrop = CGRect(
+            x: crop.minX * CGFloat(source.width),
+            y: crop.minY * CGFloat(source.height),
+            width: crop.width * CGFloat(source.width),
+            height: crop.height * CGFloat(source.height)
+        ).integral
+        guard pixelCrop.width > 0, pixelCrop.height > 0,
+              let cropped = source.cropping(to: pixelCrop)
+        else { return nil }
+
+        let input = UIImage(cgImage: cropped)
+        let radians = CGFloat(state.normalizedRotation * .pi / 180)
+        let rawCosine = abs(cos(radians))
+        let rawSine = abs(sin(radians))
+        let cosine: CGFloat = rawCosine < 0.000_001 ? 0 : rawCosine
+        let sine: CGFloat = rawSine < 0.000_001 ? 0 : rawSine
+        let outputSize = CGSize(
+            width: max(input.size.width * cosine + input.size.height * sine, 1),
+            height: max(input.size.width * sine + input.size.height * cosine, 1)
+        )
+        let rendered = UIGraphicsImageRenderer(size: outputSize, format: format).image { context in
+            let cg = context.cgContext
+            cg.translateBy(x: outputSize.width / 2, y: outputSize.height / 2)
+            cg.rotate(by: radians)
+            cg.scaleBy(x: state.flipH ? -1 : 1, y: state.flipV ? -1 : 1)
+            input.draw(in: CGRect(
+                x: -input.size.width / 2,
+                y: -input.size.height / 2,
+                width: input.size.width,
+                height: input.size.height
+            ))
+        }
+        return rendered.pngData()
+    }
+}
+
 /// native crop, rotate and mirror editor over the server-side edit list. the
 /// picture itself is never re-encoded on device: the server re-renders.
 struct AssetEditScreen: View {
@@ -174,7 +233,24 @@ struct AssetEditScreen: View {
     @Environment(SessionStore.self) private var session
 
     let asset: Asset
+    let onProjected: (AssetEditProjection) -> Void
+    let onReverted: (UUID) -> Void
+    let onCommitted: (UUID, AssetDetail?) -> Void
     let onFinished: (AssetEditOutcome) -> Void
+
+    init(
+        asset: Asset,
+        onProjected: @escaping (AssetEditProjection) -> Void = { _ in },
+        onReverted: @escaping (UUID) -> Void = { _ in },
+        onCommitted: @escaping (UUID, AssetDetail?) -> Void = { _, _ in },
+        onFinished: @escaping (AssetEditOutcome) -> Void
+    ) {
+        self.asset = asset
+        self.onProjected = onProjected
+        self.onReverted = onReverted
+        self.onCommitted = onCommitted
+        self.onFinished = onFinished
+    }
 
     private enum LoadState {
         case loading
@@ -191,7 +267,6 @@ struct AssetEditScreen: View {
     @State private var hadServerEdits = false
     @State private var aspect = EditAspect.free
     @State private var isSaving = false
-    @State private var saveError: String?
     @State private var showDiscard = false
 
     private var hasChanges: Bool { state != initialState }
@@ -226,12 +301,14 @@ struct AssetEditScreen: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
+                        guard !isSaving else { return }
                         if hasChanges {
                             showDiscard = true
                         } else {
                             finish(.cancelled)
                         }
                     }
+                    .disabled(isSaving)
                     .accessibilityIdentifier("edit-cancel")
                     // ios 26 morphs the dialog out of its source control, so it
                     // belongs on Cancel - from the screen root it anchors to the
@@ -241,7 +318,10 @@ struct AssetEditScreen: View {
                         isPresented: $showDiscard,
                         titleVisibility: .visible
                     ) {
-                        Button("Discard Changes", role: .destructive) { finish(.cancelled) }
+                        Button("Discard Changes", role: .destructive) {
+                            guard !isSaving else { return }
+                            finish(.cancelled)
+                        }
                         Button("Keep Editing", role: .cancel) {}
                     }
                 }
@@ -250,18 +330,12 @@ struct AssetEditScreen: View {
                         ProgressView()
                             .tint(.white)
                     } else {
-                        Button("Done") { Task { await save() } }
+                        Button("Done") { beginSave() }
                             .fontWeight(.semibold)
                             .disabled(!hasChanges)
                             .accessibilityIdentifier("edit-done")
                     }
                 }
-            }
-            .alert(saveError ?? "", isPresented: Binding(
-                get: { saveError != nil },
-                set: { if !$0 { saveError = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
             }
         }
         // scoped to this subtree: preferredColorScheme is a window preference
@@ -290,7 +364,7 @@ struct AssetEditScreen: View {
                     image: image,
                     crop: $state.crop,
                     lockedAspect: canvasAspectRatio,
-                    isEnabled: canCrop
+                    isEnabled: canCrop && !isSaving
                 )
                 .frame(width: canvasSize.width, height: canvasSize.height)
                 .scaleEffect(x: state.flipH ? -1 : 1, y: state.flipV ? -1 : 1)
@@ -300,6 +374,7 @@ struct AssetEditScreen: View {
 
             controls
         }
+        .allowsHitTesting(!isSaving)
     }
 
     /// aspect the crop must keep in canvas space: the visual pick, inverted
@@ -514,18 +589,57 @@ struct AssetEditScreen: View {
     /// cropping needs the true pixel size to express the rect in.
     private var canCrop: Bool { originalWidth > 0 && originalHeight > 0 }
 
-    private func save() async {
-        guard let client = session.client else { return }
+    private func beginSave() {
+        guard !isSaving, hasChanges,
+              let client = session.client,
+              let image
+        else { return }
         isSaving = true
-        defer { isSaving = false }
+        showDiscard = false
+        let savedState = state
+        let edits = EditTransform.edits(
+            from: savedState,
+            originalWidth: originalWidth,
+            originalHeight: originalHeight
+        )
+        if edits.isEmpty, !hadServerEdits {
+            isSaving = false
+            finish(.cancelled)
+            return
+        }
+        guard let preview = AssetEditPreviewRenderer.render(image, state: savedState) else {
+            isSaving = false
+            ErrorToastCenter.shared.show("Couldn’t prepare the edited preview.")
+            return
+        }
 
-        let edits = EditTransform.edits(from: state, originalWidth: originalWidth, originalHeight: originalHeight)
+        let operationID = UUID()
+        let projection = AssetEditProjection(
+            operationID: operationID,
+            assetID: asset.id,
+            imageData: preview
+        )
+        let realtime = session.realtime
+        onProjected(projection)
+        dismiss()
+        Task {
+            await persist(
+                edits: edits,
+                operationID: operationID,
+                client: client,
+                realtime: realtime
+            )
+        }
+    }
+
+    private func persist(
+        edits: [AssetEdit],
+        operationID: UUID,
+        client: ImmichClient,
+        realtime: RealtimeHub?
+    ) async {
         do {
             if edits.isEmpty {
-                guard hadServerEdits else {
-                    finish(.cancelled)
-                    return
-                }
                 try await client.clearEdits(id: asset.id)
             } else {
                 try await client.applyEdits(id: asset.id, edits: edits)
@@ -533,8 +647,8 @@ struct AssetEditScreen: View {
 
             // hold until the server re-rendered derivatives, like the
             // official client; falls through after ten seconds regardless.
-            if let hub = session.realtime {
-                _ = await hub.waitForAssetEvent(
+            if let realtime {
+                _ = await realtime.waitForAssetEvent(
                     named: ["AssetEditReadyV2", "AssetEditReadyV1"],
                     assetID: asset.id,
                     timeout: .seconds(10)
@@ -543,9 +657,12 @@ struct AssetEditScreen: View {
 
             // the write already succeeded, so a failed refresh only costs the
             // new thumbhash - it must not read as a cancelled edit.
-            finish(.saved(try? await client.assetDetail(id: asset.id)))
+            let detail = try? await client.assetDetail(id: asset.id)
+            onCommitted(operationID, detail)
+            onFinished(.saved(detail))
         } catch {
-            saveError = "Could not save the edits: \(error.localizedDescription)"
+            onReverted(operationID)
+            ErrorToastCenter.shared.show("Couldn’t save the edits. The change was undone", error: error)
         }
     }
 
@@ -914,7 +1031,7 @@ struct ProfilePictureCropScreen: View {
                     } else {
                         Button("Save") { Task { await save() } }
                             .fontWeight(.semibold)
-                            .disabled(image == nil)
+                            .disabled(image == nil || session.isProfileImageMutationInFlight)
                             .accessibilityIdentifier("profile-crop-save")
                     }
                 }
@@ -971,17 +1088,34 @@ struct ProfilePictureCropScreen: View {
         ).integral) ?? cgImage
 
         guard let data = UIImage(cgImage: cropped).pngData() else {
-            error = "Could not prepare the picture."
+            ErrorToastCenter.shared.show("Couldn’t prepare the profile picture.")
             return
         }
 
+        guard let projection = session.beginProfileImageMutation(data: data) else { return }
+        dismiss()
         do {
             try await client.setProfileImage(data: data, filename: "profile-picture.png", mimeType: "image/png")
             await session.refreshUser()
+            let cacheKey = UUID().uuidString
+            guard session.acceptProfileImageMutation(projection, cacheKey: cacheKey) else { return }
+            var canonicalImageIsCached = false
+            if let user = session.user {
+                let url = client.profileImageURL(userID: user.id)
+                    .appending(queryItems: [URLQueryItem(name: "c", value: cacheKey)])
+                canonicalImageIsCached = (try? await ImageLoader.shared.image(
+                    for: url,
+                    targetPixelSize: 120
+                )) != nil
+            }
+            session.finishProfileImageMutation(
+                projection,
+                canonicalImageIsCached: canonicalImageIsCached
+            )
             onDone("Profile picture updated")
-            dismiss()
         } catch {
-            self.error = "Could not set the profile picture: \(error.localizedDescription)"
+            session.rollbackProfileImageMutation(projection)
+            ErrorToastCenter.shared.show("Couldn’t set the profile picture", error: error)
         }
     }
 }

@@ -16,6 +16,199 @@ nonisolated struct TimelineSection: Identifiable, Hashable {
     var isLoaded: Bool { days != nil }
 }
 
+/// Exact positions removed by one optimistic command. Rollback replays only
+/// these assets, so unrelated realtime changes are never overwritten.
+nonisolated struct TimelineRemoval {
+    fileprivate struct Placement {
+        let section: TimelineSection
+        let sectionIndex: Int
+        let day: DayGroup
+        let dayIndex: Int
+        let asset: Asset
+        let assetIndex: Int
+    }
+
+    fileprivate let operationID: UUID?
+    fileprivate let placements: [Placement]
+    var isEmpty: Bool { placements.isEmpty }
+}
+
+nonisolated struct TimelineClear {
+    fileprivate let operationID: UUID
+    fileprivate let sections: [TimelineSection]
+}
+
+nonisolated struct TimelineFavoriteMutation {
+    fileprivate let operationID: UUID
+    fileprivate let value: Bool
+    fileprivate let previousValues: [String: Bool]
+
+    fileprivate var ids: Set<String> { Set(previousValues.keys) }
+}
+
+/// The asset snapshot and bucket identity needed to keep one removal projected
+/// while an older bucket request is still in flight.
+nonisolated struct TimelineProjectionSource {
+    let bucketID: String
+    let asset: Asset
+}
+
+nonisolated struct TimelineBucketFetch {
+    fileprivate let bucketID: String
+    fileprivate let sequence: UInt64
+}
+
+nonisolated struct TimelineBucketResolution {
+    let assets: [Asset]
+    /// False when a local mutation had to be replayed over an older response.
+    /// Those bytes must not replace the authoritative offline cache.
+    let isAuthoritative: Bool
+}
+
+/// Operation-scoped projections layered over bucket responses. Resolution of
+/// an operation advances that bucket's acceptance floor, so every request that
+/// started before commit or rollback is ignored without touching current UI.
+nonisolated struct TimelineMutationOverlay {
+    private struct FavoriteProjection {
+        let operationID: UUID
+        let value: Bool
+        let bucketID: String
+    }
+
+    private struct RemovalProjection {
+        let operationID: UUID
+        var source: TimelineProjectionSource
+    }
+
+    private var nextFetchSequence: UInt64 = 0
+    private var latestAppliedFetchByBucket: [String: UInt64] = [:]
+    private var favoritesByAssetID: [String: FavoriteProjection] = [:]
+    private var removalsByAssetID: [String: RemovalProjection] = [:]
+
+    mutating func beginFetch(bucketID: String) -> TimelineBucketFetch {
+        nextFetchSequence &+= 1
+        return TimelineBucketFetch(bucketID: bucketID, sequence: nextFetchSequence)
+    }
+
+    mutating func rejectFetchesStartedBeforeNextRequest(bucketIDs: Set<String>) {
+        let nextAcceptedSequence = nextFetchSequence &+ 1
+        for bucketID in bucketIDs {
+            latestAppliedFetchByBucket[bucketID] = max(
+                latestAppliedFetchByBucket[bucketID] ?? 0,
+                nextAcceptedSequence
+            )
+        }
+    }
+
+    mutating func beginFavorite(
+        operationID: UUID,
+        value: Bool,
+        bucketIDsByAssetID: [String: String]
+    ) {
+        for (assetID, bucketID) in bucketIDsByAssetID {
+            favoritesByAssetID[assetID] = FavoriteProjection(
+                operationID: operationID,
+                value: value,
+                bucketID: bucketID
+            )
+        }
+    }
+
+    mutating func commitFavorite(operationID: UUID, ids: Set<String>) {
+        var bucketIDs = Set<String>()
+        for id in ids where favoritesByAssetID[id]?.operationID == operationID {
+            if let bucketID = favoritesByAssetID[id]?.bucketID {
+                bucketIDs.insert(bucketID)
+            }
+            favoritesByAssetID[id] = nil
+        }
+        rejectFetchesStartedBeforeNextRequest(bucketIDs: bucketIDs)
+    }
+
+    mutating func rollbackFavorite(operationID: UUID, ids: Set<String>) -> Set<String> {
+        var rolledBack = Set<String>()
+        for id in ids where favoritesByAssetID[id]?.operationID == operationID {
+            favoritesByAssetID[id] = nil
+            rolledBack.insert(id)
+        }
+        return rolledBack
+    }
+
+    func favoriteValue(for id: String) -> Bool? {
+        favoritesByAssetID[id]?.value
+    }
+
+    mutating func beginRemoval(
+        operationID: UUID,
+        sourcesByAssetID: [String: TimelineProjectionSource]
+    ) {
+        for (assetID, source) in sourcesByAssetID {
+            removalsByAssetID[assetID] = RemovalProjection(
+                operationID: operationID,
+                source: source
+            )
+        }
+    }
+
+    mutating func commitRemoval(operationID: UUID, ids: Set<String>) {
+        var bucketIDs = Set<String>()
+        for id in ids where removalsByAssetID[id]?.operationID == operationID {
+            if let bucketID = removalsByAssetID[id]?.source.bucketID {
+                bucketIDs.insert(bucketID)
+            }
+            removalsByAssetID[id] = nil
+        }
+        rejectFetchesStartedBeforeNextRequest(bucketIDs: bucketIDs)
+    }
+
+    mutating func rollbackRemoval(operationID: UUID, ids: Set<String>) -> [String: Asset] {
+        var restored: [String: Asset] = [:]
+        for id in ids where removalsByAssetID[id]?.operationID == operationID {
+            restored[id] = removalsByAssetID[id]?.source.asset
+            removalsByAssetID[id] = nil
+        }
+        return restored
+    }
+
+    mutating func resolve(
+        _ fetchedAssets: [Asset],
+        for fetch: TimelineBucketFetch
+    ) -> TimelineBucketResolution? {
+        let latest = latestAppliedFetchByBucket[fetch.bucketID] ?? 0
+        guard fetch.sequence >= latest else { return nil }
+        latestAppliedFetchByBucket[fetch.bucketID] = fetch.sequence
+
+        var assets = fetchedAssets
+        var projected = favoritesByAssetID.values.contains { $0.bucketID == fetch.bucketID }
+        for asset in assets {
+            guard var removal = removalsByAssetID[asset.id],
+                  removal.source.bucketID == fetch.bucketID
+            else { continue }
+            removal.source = TimelineProjectionSource(bucketID: fetch.bucketID, asset: asset)
+            removalsByAssetID[asset.id] = removal
+        }
+        for index in assets.indices {
+            let id = assets[index].id
+            guard let favorite = favoritesByAssetID[id],
+                  favorite.bucketID == fetch.bucketID
+            else { continue }
+            assets[index].isFavorite = favorite.value
+            projected = true
+        }
+
+        let removals: Set<String> = Set(removalsByAssetID.compactMap { id, projection -> String? in
+            guard projection.source.bucketID == fetch.bucketID else { return nil }
+            return id
+        })
+        if !removals.isEmpty {
+            assets.removeAll { removals.contains($0.id) }
+            projected = true
+        }
+
+        return TimelineBucketResolution(assets: assets, isAuthoritative: !projected)
+    }
+}
+
 /// one day group's title inside a shared title band, pinned to the columns
 /// its tiles occupy below.
 nonisolated struct TitleSegment: Hashable {
@@ -115,6 +308,9 @@ final class TimelineModel {
     private var resyncTask: Task<Void, Never>?
     private var resyncAgain = false
     private var resyncPending = false
+    private var mutationOverlay = TimelineMutationOverlay()
+    private var externalFavoriteRollbacks: [String: TimelineFavoriteMutation] = [:]
+    private var externalRemovalRollbacks: [String: TimelineRemoval] = [:]
 
     init(filter: TimelineFilter, mergesLocal: Bool = false) {
         self.filter = filter
@@ -268,15 +464,22 @@ final class TimelineModel {
         else { return }
         inflightBuckets.insert(id)
         defer { inflightBuckets.remove(id) }
+        let fetch = mutationOverlay.beginFetch(bucketID: id)
         do {
             let assets = try await client.timeBucket(id, filter: filter)
             try Task.checkCancellation()
             guard !isViewerSuspended,
                   let current = sections.firstIndex(where: { $0.id == id })
             else { return }
+            guard let resolution = mutationOverlay.resolve(assets, for: fetch) else { return }
             staleBucketIDs.remove(id)
-            sections[current].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
-            cacheBucket(id, assets: assets)
+            sections[current].days = Self.groupByDay(
+                resolution.assets,
+                byUploadDate: filter.groupsByUploadDate
+            )
+            if resolution.isAuthoritative {
+                cacheBucket(id, assets: resolution.assets)
+            }
             if immediateRows {
                 rebuildRows(rebuildAssets: true)
             } else {
@@ -625,11 +828,18 @@ final class TimelineModel {
                     resyncPending = true
                     break
                 }
+                let fetch = mutationOverlay.beginFetch(bucketID: id)
                 if let assets = try? await client.timeBucket(id, filter: filter),
+                   let resolution = mutationOverlay.resolve(assets, for: fetch),
                    let index = sections.firstIndex(where: { $0.id == id }) {
                     staleBucketIDs.remove(id)
-                    sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
-                    cacheBucket(id, assets: assets)
+                    sections[index].days = Self.groupByDay(
+                        resolution.assets,
+                        byUploadDate: filter.groupsByUploadDate
+                    )
+                    if resolution.isAuthoritative {
+                        cacheBucket(id, assets: resolution.assets)
+                    }
                 }
             }
             rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
@@ -780,6 +990,9 @@ final class TimelineModel {
 
     /// applies an in-place mutation, used after favorite actions.
     func updateAssets(ids: Set<String>, _ transform: (inout Asset) -> Void) {
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
+            bucketIDs: bucketIDs(containing: ids)
+        )
         for s in sections.indices {
             guard var days = sections[s].days else { continue }
             for d in days.indices {
@@ -798,8 +1011,188 @@ final class TimelineModel {
         rebuildRows(rebuildAssets: true)
     }
 
-    /// drops assets from the grid, used after trash, archive or delete.
+    func setFavoriteForOptimisticAction(
+        ids: Set<String>,
+        value: Bool
+    ) -> TimelineFavoriteMutation {
+        let operationID = UUID()
+        var previousValues: [String: Bool] = [:]
+        var bucketsByAssetID: [String: String] = [:]
+        for section in sections {
+            for day in section.days ?? [] {
+                for asset in day.assets where ids.contains(asset.id) {
+                    previousValues[asset.id] = asset.isFavorite
+                    bucketsByAssetID[asset.id] = section.id
+                }
+            }
+        }
+        mutationOverlay.beginFavorite(
+            operationID: operationID,
+            value: value,
+            bucketIDsByAssetID: bucketsByAssetID
+        )
+        updateAssets(ids: ids) { $0.isFavorite = value }
+        return TimelineFavoriteMutation(
+            operationID: operationID,
+            value: value,
+            previousValues: previousValues
+        )
+    }
+
+    func commit(_ favorite: TimelineFavoriteMutation) {
+        mutationOverlay.commitFavorite(operationID: favorite.operationID, ids: favorite.ids)
+    }
+
+    func restore(_ favorite: TimelineFavoriteMutation) {
+        let ids = mutationOverlay.rollbackFavorite(
+            operationID: favorite.operationID,
+            ids: favorite.ids
+        )
+        guard !ids.isEmpty else { return }
+        updateAssets(ids: ids) { asset in
+            guard asset.isFavorite == favorite.value,
+                  let previous = favorite.previousValues[asset.id]
+            else { return }
+            asset.isFavorite = previous
+        }
+    }
+
+    func beginExternalOptimisticFavorite(id: String, value: Bool) {
+        guard externalFavoriteRollbacks[id] == nil else {
+            guard externalFavoriteRollbacks[id]?.value != value,
+                  let favorite = externalFavoriteRollbacks.removeValue(forKey: id)
+            else { return }
+            restore(favorite)
+            return
+        }
+        externalFavoriteRollbacks[id] = setFavoriteForOptimisticAction(ids: [id], value: value)
+    }
+
+    func commitExternalOptimisticFavorite(id: String) {
+        guard let favorite = externalFavoriteRollbacks.removeValue(forKey: id) else { return }
+        commit(favorite)
+    }
+
+    /// drops assets from the grid for authoritative realtime/legacy events.
     func removeAssets(ids: Set<String>) {
+        _ = removeAssetsNow(ids: ids, operationID: nil)
+    }
+
+    func beginExternalOptimisticRemoval(id: String) {
+        guard externalRemovalRollbacks[id] == nil else { return }
+        externalRemovalRollbacks[id] = removeAssetsForOptimisticAction(ids: [id])
+    }
+
+    func commitExternalOptimisticRemoval(id: String) {
+        guard let removal = externalRemovalRollbacks.removeValue(forKey: id) else { return }
+        commit(removal, ids: [id])
+    }
+
+    func rollbackExternalOptimisticRemoval(id: String) {
+        guard let removal = externalRemovalRollbacks.removeValue(forKey: id) else { return }
+        restore(removal, ids: [id])
+    }
+
+    func clearForOptimisticAction() -> TimelineClear {
+        let operationID = UUID()
+        let snapshot = TimelineClear(operationID: operationID, sections: sections)
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
+            bucketIDs: Set(sections.map(\.id))
+        )
+        mutationOverlay.beginRemoval(
+            operationID: operationID,
+            sourcesByAssetID: projectionSources(in: sections)
+        )
+        sections = []
+        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+        return snapshot
+    }
+
+    func commit(_ clear: TimelineClear) {
+        mutationOverlay.commitRemoval(
+            operationID: clear.operationID,
+            ids: assetIDs(in: clear.sections)
+        )
+    }
+
+    func restore(_ clear: TimelineClear) {
+        let ids = assetIDs(in: clear.sections)
+        let restored = mutationOverlay.rollbackRemoval(operationID: clear.operationID, ids: ids)
+        guard !clear.sections.isEmpty else { return }
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
+            bucketIDs: Set(clear.sections.map(\.id))
+        )
+        for (sectionIndex, original) in clear.sections.enumerated() {
+            var snapshot = original
+            if let originalDays = original.days {
+                snapshot.days = originalDays.compactMap { day in
+                    let assets = day.assets.compactMap { restored[$0.id] }
+                    guard !assets.isEmpty else { return nil }
+                    return DayGroup(id: day.id, title: day.title, assets: assets)
+                }
+            }
+            guard original.days == nil || snapshot.days?.isEmpty == false else { continue }
+            guard let existingIndex = sections.firstIndex(where: { $0.id == snapshot.id }) else {
+                sections.insert(snapshot, at: min(sectionIndex, sections.count))
+                continue
+            }
+            guard let snapshotDays = snapshot.days else { continue }
+            guard var currentDays = sections[existingIndex].days else {
+                sections[existingIndex].days = snapshotDays
+                continue
+            }
+            for (dayIndex, snapshotDay) in snapshotDays.enumerated() {
+                guard let currentDayIndex = currentDays.firstIndex(where: { $0.id == snapshotDay.id }) else {
+                    currentDays.insert(snapshotDay, at: min(dayIndex, currentDays.count))
+                    continue
+                }
+                var currentAssets = currentDays[currentDayIndex].assets
+                for (assetIndex, asset) in snapshotDay.assets.enumerated()
+                where !currentAssets.contains(where: { $0.id == asset.id }) {
+                    currentAssets.insert(asset, at: min(assetIndex, currentAssets.count))
+                }
+                currentDays[currentDayIndex] = DayGroup(
+                    id: currentDays[currentDayIndex].id,
+                    title: currentDays[currentDayIndex].title,
+                    assets: currentAssets
+                )
+            }
+            sections[existingIndex].days = currentDays
+        }
+        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+    }
+
+    /// Removes now and returns a narrow, position-preserving undo token.
+    func removeAssetsForOptimisticAction(ids: Set<String>) -> TimelineRemoval {
+        removeAssetsNow(ids: ids, operationID: UUID())
+    }
+
+    private func removeAssetsNow(ids: Set<String>, operationID: UUID?) -> TimelineRemoval {
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
+            bucketIDs: bucketIDs(containing: ids)
+        )
+        var placements: [TimelineRemoval.Placement] = []
+        for (sectionIndex, section) in sections.enumerated() {
+            guard let days = section.days else { continue }
+            for (dayIndex, day) in days.enumerated() {
+                for (assetIndex, asset) in day.assets.enumerated() where ids.contains(asset.id) {
+                    placements.append(.init(
+                        section: section,
+                        sectionIndex: sectionIndex,
+                        day: day,
+                        dayIndex: dayIndex,
+                        asset: asset,
+                        assetIndex: assetIndex
+                    ))
+                }
+            }
+        }
+        if let operationID {
+            let sources = Dictionary(uniqueKeysWithValues: placements.map {
+                ($0.asset.id, TimelineProjectionSource(bucketID: $0.section.id, asset: $0.asset))
+            })
+            mutationOverlay.beginRemoval(operationID: operationID, sourcesByAssetID: sources)
+        }
         for s in sections.indices {
             guard let days = sections[s].days else { continue }
             let filtered = days.compactMap { day -> DayGroup? in
@@ -810,6 +1203,113 @@ final class TimelineModel {
         }
         sections.removeAll { $0.isLoaded && ($0.days?.isEmpty ?? false) }
         rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+        return TimelineRemoval(operationID: operationID, placements: placements)
+    }
+
+    func commit(_ removal: TimelineRemoval, ids: Set<String>? = nil) {
+        guard let operationID = removal.operationID else { return }
+        mutationOverlay.commitRemoval(
+            operationID: operationID,
+            ids: ids ?? Set(removal.placements.map(\.asset.id))
+        )
+    }
+
+    /// Replays only a failed command's removals, leaving later mutations and
+    /// realtime additions intact.
+    func restore(_ removal: TimelineRemoval, ids: Set<String>? = nil) {
+        let requested = ids ?? Set(removal.placements.map(\.asset.id))
+        let restoredAssets: [String: Asset]
+        if let operationID = removal.operationID {
+            restoredAssets = mutationOverlay.rollbackRemoval(
+                operationID: operationID,
+                ids: requested
+            )
+        } else {
+            restoredAssets = [:]
+        }
+        let wanted = removal.operationID == nil ? requested : Set(restoredAssets.keys)
+        let placements = removal.placements
+            .filter { wanted.contains($0.asset.id) }
+            .sorted {
+                ($0.sectionIndex, $0.dayIndex, $0.assetIndex)
+                    < ($1.sectionIndex, $1.dayIndex, $1.assetIndex)
+            }
+        guard !placements.isEmpty else { return }
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
+            bucketIDs: Set(placements.map(\.section.id))
+        )
+
+        for placement in placements where !containsAsset(placement.asset.id) {
+            let sectionIndex = restoreSection(for: placement)
+            var days = sections[sectionIndex].days ?? []
+            let dayIndex: Int
+            if let existing = days.firstIndex(where: { $0.id == placement.day.id }) {
+                dayIndex = existing
+            } else {
+                dayIndex = min(placement.dayIndex, days.count)
+                days.insert(
+                    DayGroup(id: placement.day.id, title: placement.day.title, assets: []),
+                    at: dayIndex
+                )
+            }
+            var assets = days[dayIndex].assets
+            let asset = restoredAssets[placement.asset.id] ?? placement.asset
+            assets.insert(asset, at: min(placement.assetIndex, assets.count))
+            days[dayIndex] = DayGroup(
+                id: days[dayIndex].id,
+                title: days[dayIndex].title,
+                assets: assets
+            )
+            sections[sectionIndex].days = days
+        }
+        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+    }
+
+    private func projectionSources(in sections: [TimelineSection]) -> [String: TimelineProjectionSource] {
+        var sources: [String: TimelineProjectionSource] = [:]
+        for section in sections {
+            for day in section.days ?? [] {
+                for asset in day.assets {
+                    sources[asset.id] = TimelineProjectionSource(bucketID: section.id, asset: asset)
+                }
+            }
+        }
+        return sources
+    }
+
+    private func assetIDs(in sections: [TimelineSection]) -> Set<String> {
+        Set(sections.lazy.flatMap { section in
+            (section.days ?? []).lazy.flatMap(\.assets).map(\.id)
+        })
+    }
+
+    private func bucketIDs(containing assetIDs: Set<String>) -> Set<String> {
+        Set(sections.compactMap { section in
+            let containsAsset = section.days?.contains { day in
+                day.assets.contains { assetIDs.contains($0.id) }
+            } ?? false
+            return containsAsset ? section.id : nil
+        })
+    }
+
+    private func containsAsset(_ id: String) -> Bool {
+        sections.contains { section in
+            section.days?.contains { day in day.assets.contains { $0.id == id } } ?? false
+        }
+    }
+
+    private func restoreSection(for placement: TimelineRemoval.Placement) -> Int {
+        if let existing = sections.firstIndex(where: { $0.id == placement.section.id }) {
+            return existing
+        }
+        let index = min(placement.sectionIndex, sections.count)
+        sections.insert(TimelineSection(
+            id: placement.section.id,
+            monthTitle: placement.section.monthTitle,
+            count: placement.section.count,
+            days: []
+        ), at: index)
+        return index
     }
 
     // MARK: - grouping helpers
@@ -911,8 +1411,9 @@ extension TimelineModel: RealtimeListener {
     func realtimeAssetUpdated(_ detail: AssetDetail) {
         guard flatAssetIndex(for: detail.id) != nil else { return }
         let fresh = detail.asAsset()
+        let projectedFavorite = mutationOverlay.favoriteValue(for: detail.id)
         updateAssets(ids: [detail.id]) { asset in
-            asset.isFavorite = fresh.isFavorite
+            asset.isFavorite = projectedFavorite ?? fresh.isFavorite
             asset.isTrashed = fresh.isTrashed
             asset.visibility = fresh.visibility
         }

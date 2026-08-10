@@ -239,8 +239,8 @@ private struct PlacesMapHeader: View {
 }
 
 struct TrashScreen: View {
-    @Environment(SessionStore.self) private var session
     @State private var confirmEmpty = false
+    @State private var serverCommand: TimelineServerCommand?
 
     var body: some View {
         TimelineScreen(
@@ -248,13 +248,14 @@ struct TrashScreen: View {
             filter: TimelineFilter(visibility: nil, isTrashed: true),
             emptyIcon: "trash",
             emptyMessage: "Trash is empty",
-            showsLargeTitle: false
+            showsLargeTitle: false,
+            serverCommand: $serverCommand
         )
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
-                        Task { try? await session.client?.restoreTrash() }
+                        serverCommand = .restoreAllTrash
                     } label: {
                         Label("Restore All", systemImage: "arrow.uturn.backward")
                     }
@@ -270,7 +271,7 @@ struct TrashScreen: View {
                 // on the menu button - on the screen root it floats detached.
                 .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
                     Button("Empty Trash", role: .destructive) {
-                        Task { try? await session.client?.emptyTrash() }
+                        serverCommand = .emptyTrash
                     }
                 }
             }

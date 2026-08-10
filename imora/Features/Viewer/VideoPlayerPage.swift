@@ -229,17 +229,22 @@ struct VideoPlayerPage: View {
     let isActive: Bool
     let forcesMute: Bool
     let playback: VideoPlayback
+    let mediaLayoutMode: AssetViewerMediaLayoutMode
     let onZoomChanged: (Bool) -> Void
 
     var body: some View {
-        ZoomableScrollView(contentID: asset.id, onZoomChanged: onZoomChanged) {
+        ZoomableScrollView(
+            contentID: "\(asset.id)#\(mediaLayoutMode.rawValue)",
+            onZoomChanged: onZoomChanged
+        ) {
             VideoSurfaceStack(
                 assetID: asset.id,
                 posterLocalIdentifier: deviceIdentifier,
                 posterURL: posterURL,
                 posterFallbackURL: posterFallbackURL,
                 thumbhash: asset.thumbhash,
-                playback: playback
+                playback: playback,
+                mediaLayoutMode: mediaLayoutMode
             )
         }
         .task(id: "\(asset.id):\(isActive):\(forcesMute)") {
@@ -298,6 +303,7 @@ private struct VideoSurfaceStack: View {
     let posterFallbackURL: URL?
     let thumbhash: String?
     let playback: VideoPlayback
+    let mediaLayoutMode: AssetViewerMediaLayoutMode
 
     var body: some View {
         ZStack {
@@ -306,7 +312,7 @@ private struct VideoSurfaceStack: View {
                     localIdentifier: posterLocalIdentifier,
                     targetPixelSize: pagePixelSize,
                     fallbackTargetPixelSize: 640,
-                    contentMode: .fit
+                    contentMode: mediaLayoutMode.swiftUIContentMode
                 )
             } else if let posterURL {
                 RemoteImage(
@@ -315,13 +321,15 @@ private struct VideoSurfaceStack: View {
                     thumbhash: thumbhash,
                     fallbackURL: posterFallbackURL,
                     fallbackTargetPixelSize: 640,
-                    contentMode: .fit
+                    contentMode: mediaLayoutMode.swiftUIContentMode
                 )
             }
             if playback.ownerID == assetID, let player = playback.player {
-                VideoPlayerSurface(player: player)
+                VideoPlayerSurface(player: player, mediaLayoutMode: mediaLayoutMode)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
     }
 }
 
@@ -329,6 +337,7 @@ private struct VideoSurfaceStack: View {
 /// ready, then fades over the poster rather than popping in mid-render.
 private struct VideoPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
+    let mediaLayoutMode: AssetViewerMediaLayoutMode
 
     final class LayerView: UIView {
         override static var layerClass: AnyClass { AVPlayerLayer.self }
@@ -356,13 +365,24 @@ private struct VideoPlayerSurface: UIViewRepresentable {
         view.backgroundColor = .clear
         let layer = view.layer as? AVPlayerLayer
         layer?.player = player
-        layer?.videoGravity = .resizeAspect
+        layer?.videoGravity = mediaLayoutMode.videoGravity
         view.fadeInOnFirstFrame()
         return view
     }
 
     func updateUIView(_ uiView: LayerView, context: Context) {
-        (uiView.layer as? AVPlayerLayer)?.player = player
+        let layer = uiView.layer as? AVPlayerLayer
+        layer?.player = player
+        layer?.videoGravity = mediaLayoutMode.videoGravity
+    }
+}
+
+private extension AssetViewerMediaLayoutMode {
+    var videoGravity: AVLayerVideoGravity {
+        switch self {
+        case .fit: .resizeAspect
+        case .fill: .resizeAspectFill
+        }
     }
 }
 

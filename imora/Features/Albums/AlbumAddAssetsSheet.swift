@@ -7,12 +7,15 @@ struct AlbumAddAssetsSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let album: Album
-    let onAdded: (Int) async -> Void
+    @Binding var isAlbumMutationInFlight: Bool
+    let onAlbumChanged: (Album) -> Void
+    /// The count always drives a grid resync. The flag suppresses success UI
+    /// when the same bulk response already needs to present an error toast.
+    let onAdded: (_ count: Int, _ showSuccessFeedback: Bool) -> Void
 
     @State private var model = SearchModel()
     @State private var selection = Set<String>()
     @State private var isAdding = false
-    @State private var error: String?
     /// what the album already holds. both official clients show these in the
     /// picker as already ticked and locked, so the grid reads as the album's
     /// contents plus whatever else you are adding.
@@ -65,19 +68,11 @@ struct AlbumAddAssetsSheet: View {
                     Button(selection.isEmpty ? "Add" : "Add (\(selection.count))") {
                         Task { await add() }
                     }
-                    .disabled(selection.isEmpty || isAdding)
+                    .disabled(selection.isEmpty || isAdding || isAlbumMutationInFlight)
                     .accessibilityIdentifier("album-picker-add")
                 }
             }
             .interactiveDismissDisabled(isAdding)
-            .alert("Couldn't add photos", isPresented: .init(
-                get: { error != nil },
-                set: { if !$0 { error = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(error ?? "")
-            }
             .task {
                 guard let client = session.client else { return }
                 model.attach(client)
@@ -131,17 +126,38 @@ struct AlbumAddAssetsSheet: View {
     }
 
     private func add() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isAdding, !isAlbumMutationInFlight else { return }
+        let requested = selection
+        let optimistic = album.withAssetCountDelta(requested.count)
         isAdding = true
-        do {
-            let results = try await client.addAssets(albumID: album.id, ids: Array(selection))
-            // duplicates come back as failures; only real additions count.
-            let added = results.count(where: \.success)
-            dismiss()
-            await onAdded(added)
-        } catch {
-            self.error = error.localizedDescription
+        isAlbumMutationInFlight = true
+        defer {
             isAdding = false
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t add the selected photos.",
+            apply: {
+                onAlbumChanged(optimistic)
+                dismiss()
+            },
+            rollback: { onAlbumChanged(album) },
+            request: { try await client.addAssets(albumID: album.id, ids: Array(requested)) },
+            commit: { results in
+                let outcome = BulkMutationOutcome(requestedIDs: requested, results: results)
+                onAlbumChanged(album.withAssetCountDelta(outcome.successfulIDs.count))
+                if !outcome.successfulIDs.isEmpty {
+                    onAdded(outcome.successfulIDs.count, outcome.failedIDs.isEmpty)
+                }
+                reportFailures(outcome.failedIDs.count)
+            }
+        )
+    }
+
+    private func reportFailures(_ count: Int) {
+        guard count > 0 else { return }
+        ErrorToastCenter.shared.show(
+            "Couldn’t add \(count) selected photo\(count == 1 ? "" : "s")."
+        )
     }
 }

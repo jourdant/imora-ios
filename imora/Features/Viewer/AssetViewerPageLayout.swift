@@ -1,5 +1,18 @@
 import CoreGraphics
 
+/// The media's resting treatment for each viewer presentation. Immersive
+/// viewing preserves every pixel; the compact region above information crops
+/// like an aspect-fill image so the reserved viewport never shows letterbox
+/// gaps.
+nonisolated enum AssetViewerMediaLayoutMode: String, Equatable {
+    case fit
+    case fill
+
+    init(informationPresented: Bool) {
+        self = informationPresented ? .fill : .fit
+    }
+}
+
 /// Sizes the media as the viewer moves between its immersive and information
 /// presentations. The information surface occupies 80% of the viewport, so
 /// the asset remains visible and refits the strip above it.

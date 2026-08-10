@@ -79,10 +79,29 @@ struct SearchTab: View {
                     onDismissed: { viewer.complete(route.id) }
                 ) { change in
                     switch change {
+                    case .favorite(let id, let value):
+                        if model.filter.isFavorite, !value {
+                            model.beginExternalOptimisticRemoval(id: id)
+                        } else {
+                            if model.filter.isFavorite {
+                                model.rollbackExternalOptimisticRemoval(id: id)
+                            }
+                            model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                        }
+                    case .favoriteCommitted(let id, let value):
+                        if model.filter.isFavorite, !value {
+                            model.commitExternalOptimisticRemoval(id: id)
+                        }
+                    case .optimisticRemoval(let id):
+                        model.beginExternalOptimisticRemoval(id: id)
+                    case .removalCommitted(let id):
+                        model.commitExternalOptimisticRemoval(id: id)
+                    case .removalReverted(let id):
+                        model.rollbackExternalOptimisticRemoval(id: id)
+                    case .albumMembershipProjected, .albumMembershipCommitted, .albumMembershipReverted:
+                        break
                     case .removed(let id):
                         model.removeAssets(ids: [id])
-                    case .favorite(let id, let value):
-                        model.updateAssets(ids: [id]) { $0.isFavorite = value }
                     case .localDeleted:
                         break
                     case .edited(let id, let thumbhash):
@@ -260,7 +279,6 @@ struct SearchResultsGrid: View {
     @State private var albumAsset: Asset?
     @State private var editingAsset: Asset?
     @State private var workingAssetIDs: Set<String> = []
-    @State private var actionError: String?
     @State private var toast: String?
 
     private let columns = [GridItem(.adaptive(minimum: 110, maximum: 200), spacing: 2)]
@@ -281,14 +299,6 @@ struct SearchResultsGrid: View {
                     session.backup?.noteRemoteEdits([asset.id])
                     toast = "Edits saved"
                 }
-            }
-            .alert("Action Failed", isPresented: Binding(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(actionError ?? "")
             }
             .overlay(alignment: .top) {
                 if let toast {
@@ -472,34 +482,52 @@ struct SearchResultsGrid: View {
         guard beginAction(for: asset) else { return }
         defer { finishAction(for: asset) }
         guard let client = session.client else {
-            reportUnavailableAction()
+            ErrorToastCenter.shared.show("Couldn’t update the favorite. The server is not available.")
             return
         }
 
         let newValue = !asset.isFavorite
-        do {
-            try await client.setFavorite(ids: [asset.id], newValue)
-            model.updateAssets(ids: [asset.id]) { $0.isFavorite = newValue }
-        } catch {
-            actionError = "Could not update the favorite: \(error.localizedDescription)"
-        }
+        let leavesFavoriteFilter = model.filter.isFavorite && !newValue
+        var removal: SearchRemoval?
+        let _: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t update the favorite",
+            apply: {
+                if leavesFavoriteFilter {
+                    removal = model.removeAssetsForOptimisticAction(ids: [asset.id])
+                } else {
+                    model.updateAssets(ids: [asset.id]) { $0.isFavorite = newValue }
+                }
+            },
+            rollback: {
+                if let removal {
+                    model.restore(removal)
+                } else {
+                    model.updateAssets(ids: [asset.id]) { current in
+                        guard current.isFavorite == newValue else { return }
+                        current.isFavorite = asset.isFavorite
+                    }
+                }
+            },
+            request: { try await client.setFavorite(ids: [asset.id], newValue) }
+        )
     }
 
     private func toggleArchive(_ asset: Asset) async {
         guard beginAction(for: asset) else { return }
         defer { finishAction(for: asset) }
         guard let client = session.client else {
-            reportUnavailableAction()
+            ErrorToastCenter.shared.show("The server is not available.")
             return
         }
 
         let visibility: AssetVisibility = asset.visibility == .archive ? .timeline : .archive
-        do {
-            try await client.setVisibility(ids: [asset.id], visibility)
-            model.removeAssets(ids: [asset.id])
-        } catch {
-            actionError = "Could not update the archive: \(error.localizedDescription)"
-        }
+        var removal: SearchRemoval?
+        let _: Void? = await OptimisticAction.perform(
+            errorMessage: visibility == .archive ? "Couldn’t archive" : "Couldn’t unarchive",
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: [asset.id]) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: { try await client.setVisibility(ids: [asset.id], visibility) }
+        )
     }
 
     private func download(_ asset: Asset) async {
@@ -514,7 +542,7 @@ struct SearchResultsGrid: View {
             _ = try await backup.download(asset: asset)
             toast = "Saved to your photo library"
         } catch {
-            actionError = "Could not download: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t download", error: error)
         }
     }
 
@@ -534,7 +562,7 @@ struct SearchResultsGrid: View {
             toast = "Deleted from this device"
         } catch {
             guard !PhotoLibraryService.isUserCancelled(error) else { return }
-            actionError = "Could not delete from this device: \(error.localizedDescription)"
+            ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
         }
     }
 
@@ -542,7 +570,7 @@ struct SearchResultsGrid: View {
         guard beginAction(for: asset) else { return }
         defer { finishAction(for: asset) }
         guard let client = session.client else {
-            reportUnavailableAction()
+            ErrorToastCenter.shared.show("The server is not available.")
             return
         }
 
@@ -553,19 +581,21 @@ struct SearchResultsGrid: View {
                 session.backup?.noteLocalDeletion([localIdentifier])
             } catch {
                 guard !PhotoLibraryService.isUserCancelled(error) else { return }
-                actionError = "Could not delete from this device: \(error.localizedDescription)"
+                ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
                 return
             }
         }
 
-        do {
-            try await client.trashAssets(ids: [asset.id])
-            model.removeAssets(ids: [asset.id])
-        } catch {
-            actionError = localIdentifier == nil
-                ? "Could not move to trash: \(error.localizedDescription)"
-                : "Deleted from this device, but the server copy could not be moved to trash."
-        }
+        let errorMessage = localIdentifier == nil
+            ? "Couldn’t move to trash"
+            : "Deleted from this device, but couldn’t move the server copy to trash"
+        var removal: SearchRemoval?
+        let _: Void? = await OptimisticAction.perform(
+            errorMessage: errorMessage,
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: [asset.id]) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: { try await client.trashAssets(ids: [asset.id]) }
+        )
     }
 
     private func openInBrowser(_ asset: Asset) async {
@@ -586,7 +616,7 @@ struct SearchResultsGrid: View {
     }
 
     private func reportUnavailableAction() {
-        actionError = "This action is no longer available."
+        ErrorToastCenter.shared.show("This action is no longer available.")
     }
 }
 
@@ -626,10 +656,29 @@ struct SearchResultsScreen: View {
                 onDismissed: { viewer.complete(route.id) }
             ) { change in
                 switch change {
+                case .favorite(let id, let value):
+                    if model.filter.isFavorite, !value {
+                        model.beginExternalOptimisticRemoval(id: id)
+                    } else {
+                        if model.filter.isFavorite {
+                            model.rollbackExternalOptimisticRemoval(id: id)
+                        }
+                        model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                    }
+                case .favoriteCommitted(let id, let value):
+                    if model.filter.isFavorite, !value {
+                        model.commitExternalOptimisticRemoval(id: id)
+                    }
+                case .optimisticRemoval(let id):
+                    model.beginExternalOptimisticRemoval(id: id)
+                case .removalCommitted(let id):
+                    model.commitExternalOptimisticRemoval(id: id)
+                case .removalReverted(let id):
+                    model.rollbackExternalOptimisticRemoval(id: id)
+                case .albumMembershipProjected, .albumMembershipCommitted, .albumMembershipReverted:
+                    break
                 case .removed(let id):
                     model.removeAssets(ids: [id])
-                case .favorite(let id, let value):
-                    model.updateAssets(ids: [id]) { $0.isFavorite = value }
                 case .localDeleted:
                     break
                 case .edited(let id, let thumbhash):
@@ -650,6 +699,7 @@ struct PersonScreen: View {
     @State private var name: String
     @State private var showRename = false
     @State private var draftName = ""
+    @State private var renameInFlight = false
 
     init(person: Person) {
         self.person = person
@@ -673,6 +723,7 @@ struct PersonScreen: View {
                     } label: {
                         Label(name.isEmpty ? "Add Name" : "Rename", systemImage: "pencil")
                     }
+                    .disabled(renameInFlight)
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -681,13 +732,29 @@ struct PersonScreen: View {
         .alert("Name", isPresented: $showRename) {
             TextField("Name", text: $draftName)
             Button("Save") {
-                Task {
-                    try? await session.client?.updatePerson(id: person.id, name: draftName)
-                    name = draftName
-                }
+                let requestedName = draftName
+                Task { await rename(to: requestedName) }
             }
+            .disabled(renameInFlight)
             Button("Cancel", role: .cancel) {}
         }
+    }
+
+    private func rename(to requestedName: String) async {
+        guard !renameInFlight else { return }
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("Couldn’t rename this person. The server is not available.")
+            return
+        }
+        renameInFlight = true
+        defer { renameInFlight = false }
+        let previousName = name
+        let _: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t rename this person",
+            apply: { name = requestedName },
+            rollback: { if name == requestedName { name = previousName } },
+            request: { try await client.updatePerson(id: person.id, name: requestedName) }
+        )
     }
 }
 
@@ -743,8 +810,27 @@ struct PlaceScreen: View {
                 zoomNamespace: zoomNamespace,
                 onDismissed: { viewer.complete(route.id) }
             ) { change in
-                if case .removed(let id) = change {
+                switch change {
+                case .favorite(let id, let value):
+                    model.updateAssets(ids: [id]) { $0.isFavorite = value }
+                case .favoriteCommitted:
+                    break
+                case .optimisticRemoval(let id):
+                    model.beginExternalOptimisticRemoval(id: id)
+                case .removalCommitted(let id):
+                    model.commitExternalOptimisticRemoval(id: id)
+                case .removalReverted(let id):
+                    model.rollbackExternalOptimisticRemoval(id: id)
+                case .albumMembershipProjected, .albumMembershipCommitted, .albumMembershipReverted:
+                    break
+                case .removed(let id):
                     model.removeAssets(ids: [id])
+                case .localDeleted:
+                    break
+                case .edited(let id, let thumbhash):
+                    model.updateAssets(ids: [id]) { asset in
+                        if let thumbhash { asset.thumbhash = thumbhash }
+                    }
                 }
             }
         }

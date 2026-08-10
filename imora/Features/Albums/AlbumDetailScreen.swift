@@ -6,6 +6,10 @@ struct AlbumDetailScreen: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var album: Album
+    private let onAlbumChanged: (Album) -> Void
+    private let onAlbumRemoved: (Album) -> Void
+    private let onAlbumRestored: (Album) -> Void
+    private let onAlbumRemovalCommitted: (String) -> Void
     /// bumping recreates the timeline; only the order toggle needs it since
     /// the filter is captured at init. content changes resync in place.
     @State private var timelineGeneration = 0
@@ -15,9 +19,23 @@ struct AlbumDetailScreen: View {
     @State private var showLeaveConfirm = false
     @State private var feedback: String?
     @State private var feedbackTask: Task<Void, Never>?
+    @State private var isChangingOrder = false
+    @State private var isRemovingAlbum = false
+    @State private var isAlbumMutationInFlight = false
+    @State private var albumLoadGate = LatestAlbumLoadGate()
 
-    init(album: Album) {
+    init(
+        album: Album,
+        onAlbumChanged: @escaping (Album) -> Void = { _ in },
+        onAlbumRemoved: @escaping (Album) -> Void = { _ in },
+        onAlbumRestored: @escaping (Album) -> Void = { _ in },
+        onAlbumRemovalCommitted: @escaping (String) -> Void = { _ in }
+    ) {
         _album = State(initialValue: album)
+        self.onAlbumChanged = onAlbumChanged
+        self.onAlbumRemoved = onAlbumRemoved
+        self.onAlbumRestored = onAlbumRestored
+        self.onAlbumRemovalCommitted = onAlbumRemovalCommitted
     }
 
     private enum AlbumSheet: String, Identifiable {
@@ -38,9 +56,15 @@ struct AlbumDetailScreen: View {
             emptyMessage: "This album is empty",
             showsLargeTitle: false,
             resyncTrigger: resyncTrigger,
-            albumOwnerID: album.owner?.id
+            albumOwnerID: album.owner?.id,
+            onAlbumAssetCountDelta: { delta in
+                setAlbum(album.withAssetCountDelta(delta))
+            }
         ) {
-            AlbumHeader(album: album) { activeSheet = .options }
+            AlbumHeader(album: album) {
+                guard !isAlbumMutationInFlight else { return }
+                activeSheet = .options
+            }
         }
         .id(timelineGeneration)
         .toolbar {
@@ -70,27 +94,48 @@ struct AlbumDetailScreen: View {
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .edit:
-                AlbumEditSheet(album: album) { await refreshAlbum() }
+                AlbumEditSheet(
+                    album: album,
+                    isAlbumMutationInFlight: $isAlbumMutationInFlight,
+                    onAlbumChanged: setAlbum
+                )
             case .addPhotos:
-                AlbumAddAssetsSheet(album: album) { added in
-                    await refreshAlbum()
+                AlbumAddAssetsSheet(
+                    album: album,
+                    isAlbumMutationInFlight: $isAlbumMutationInFlight,
+                    onAlbumChanged: setAlbum
+                ) { added, showSuccessFeedback in
                     if added > 0 {
                         // in-place animated resync; a generation bump would
                         // remount and visibly reload the whole grid.
                         resyncTrigger += 1
-                        showFeedback("Added \(added) photo\(added == 1 ? "" : "s")")
+                        if showSuccessFeedback {
+                            showFeedback("Added \(added) photo\(added == 1 ? "" : "s")")
+                        } else {
+                            feedbackTask?.cancel()
+                            feedback = nil
+                        }
                     }
                 }
             case .invite:
-                AlbumInviteSheet(album: album) { count in
-                    await refreshAlbum()
+                AlbumInviteSheet(
+                    album: album,
+                    isAlbumMutationInFlight: $isAlbumMutationInFlight,
+                    onAlbumChanged: setAlbum
+                ) { count in
                     showFeedback("Invited \(count) \(count == 1 ? "person" : "people")")
                 }
             case .options:
                 AlbumOptionsSheet(
                     album: album,
-                    onChanged: { await refreshAlbum() },
-                    onLeft: { dismiss() }
+                    isAlbumMutationInFlight: $isAlbumMutationInFlight,
+                    onAlbumChanged: setAlbum,
+                    onLeft: {
+                        onAlbumRemoved(album)
+                        dismiss()
+                    },
+                    onLeaveRolledBack: onAlbumRestored,
+                    onLeaveCommitted: onAlbumRemovalCommitted
                 )
             case .shareLinks:
                 ShareLinksSheet(target: .album(album)) { await refreshAlbum() }
@@ -134,6 +179,7 @@ struct AlbumDetailScreen: View {
                         systemImage: "arrow.up.arrow.down"
                     )
                 }
+                .disabled(isChangingOrder || isRemovingAlbum)
             }
             Button {
                 activeSheet = .options
@@ -147,16 +193,19 @@ struct AlbumDetailScreen: View {
                 } label: {
                     Label("Delete Album", systemImage: "trash")
                 }
+                .disabled(isRemovingAlbum)
             } else if myRole != nil {
                 Button(role: .destructive) {
                     showLeaveConfirm = true
                 } label: {
                     Label("Leave Album", systemImage: "rectangle.portrait.and.arrow.right")
                 }
+                .disabled(isRemovingAlbum)
             }
         } label: {
             Image(systemName: "ellipsis.circle")
         }
+        .disabled(isAlbumMutationInFlight)
         .accessibilityIdentifier("album-menu")
         // ios 26 morphs a confirmation out of its source control; the menu item
         // is gone by then, so the dialogs anchor to the menu button itself.
@@ -184,42 +233,105 @@ struct AlbumDetailScreen: View {
     // MARK: - actions
 
     private func refreshAlbum() async {
-        guard let client = session.client else { return }
-        if let fresh = try? await client.album(id: album.id) {
-            album = fresh
-        }
+        guard let client = session.client,
+              !isChangingOrder,
+              !isRemovingAlbum,
+              !isAlbumMutationInFlight else { return }
+        let ticket = albumLoadGate.begin()
+        guard let fresh = try? await client.album(id: album.id),
+              albumLoadGate.accepts(ticket),
+              !isChangingOrder,
+              !isRemovingAlbum,
+              !isAlbumMutationInFlight
+        else { return }
+        let reconciled = album.reconcilingServerVersion(fresh)
+        guard reconciled != album else { return }
+        setAlbum(reconciled)
     }
 
     private func toggleOrder() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isAlbumMutationInFlight else { return }
         let next = currentOrder == "asc" ? "desc" : "asc"
-        do {
-            try await client.updateAlbum(id: album.id, order: next)
-            await refreshAlbum()
-            timelineGeneration += 1
-        } catch {
-            showFeedback("Couldn't change the order")
+        let original = album
+        let optimistic = original.withOrder(next)
+        isChangingOrder = true
+        isAlbumMutationInFlight = true
+        defer {
+            isChangingOrder = false
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t change the album order.",
+            apply: {
+                setAlbum(optimistic)
+                timelineGeneration += 1
+            },
+            rollback: {
+                setAlbum(original)
+                timelineGeneration += 1
+            },
+            request: { try await client.updateAlbum(id: original.id, order: next) }
+        )
     }
 
     private func deleteAlbum() async {
         guard let client = session.client else { return }
-        do {
-            try await client.deleteAlbum(id: album.id)
-            dismiss()
-        } catch {
-            showFeedback("Couldn't delete the album")
+        guard !isRemovingAlbum, !isAlbumMutationInFlight else { return }
+        let original = album
+        albumLoadGate.invalidate()
+        isRemovingAlbum = true
+        isAlbumMutationInFlight = true
+        defer {
+            isRemovingAlbum = false
+            isAlbumMutationInFlight = false
         }
+        let deleted: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t delete the album.",
+            apply: {
+                onAlbumRemoved(original)
+                dismiss()
+            },
+            rollback: {
+                setAlbum(original)
+                onAlbumRestored(original)
+            },
+            request: { try await client.deleteAlbum(id: original.id) }
+        )
+        if deleted != nil { onAlbumRemovalCommitted(original.id) }
     }
 
     private func leaveAlbum() async {
         guard let client = session.client, let userID = session.user?.id else { return }
-        do {
-            try await client.removeAlbumUser(albumID: album.id, userID: userID)
-            dismiss()
-        } catch {
-            showFeedback("Couldn't leave the album")
+        guard !isRemovingAlbum, !isAlbumMutationInFlight else { return }
+        let original = album
+        albumLoadGate.invalidate()
+        isRemovingAlbum = true
+        isAlbumMutationInFlight = true
+        defer {
+            isRemovingAlbum = false
+            isAlbumMutationInFlight = false
         }
+        let left: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t leave the album.",
+            apply: {
+                onAlbumRemoved(original)
+                dismiss()
+            },
+            rollback: {
+                setAlbum(original)
+                onAlbumRestored(original)
+            },
+            request: {
+                try await client.removeAlbumUser(albumID: original.id, userID: userID)
+            }
+        )
+        if left != nil { onAlbumRemovalCommitted(original.id) }
+    }
+
+    private func setAlbum(_ replacement: Album) {
+        albumLoadGate.invalidate()
+        album = replacement
+        onAlbumChanged(replacement)
     }
 
     private func showFeedback(_ text: String) {

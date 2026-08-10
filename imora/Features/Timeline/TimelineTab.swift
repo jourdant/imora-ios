@@ -9,13 +9,14 @@ struct TimelineTab: View {
             TimelineScreen(
                 title: "Photos",
                 filter: TimelineFilter(withPartners: true, withStacked: true),
-                mergesLocalPhotos: true
-            ) {
-                VStack(spacing: 0) {
-                    LocalPhotosBanner()
-                    MemoryLane()
+                mergesLocalPhotos: true,
+                header: {
+                    VStack(spacing: 0) {
+                        LocalPhotosBanner()
+                        MemoryLane()
+                    }
                 }
-            }
+            )
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -50,9 +51,14 @@ struct ProfileAvatar: View {
 
     var body: some View {
         Group {
-            if let user = session.user, let client = session.client,
+            if let data = session.optimisticProfileImageData,
+               let image = UIImage(data: data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if let user = session.user, let client = session.client,
                user.profileImagePath?.isEmpty == false {
-                RemoteImage(url: client.profileImageURL(userID: user.id), targetPixelSize: 120)
+                RemoteImage(url: profileImageURL(client: client, userID: user.id), targetPixelSize: 120)
             } else {
                 Circle()
                     .fill(.indigo.gradient)
@@ -72,5 +78,13 @@ struct ProfileAvatar: View {
         let parts = name.split(separator: " ")
         let letters = parts.prefix(2).compactMap(\.first)
         return letters.isEmpty ? "?" : String(letters)
+    }
+
+    private func profileImageURL(client: ImmichClient, userID: String) -> URL {
+        guard let key = session.profileImageCacheKey else {
+            return client.profileImageURL(userID: userID)
+        }
+        return client.profileImageURL(userID: userID)
+            .appending(queryItems: [URLQueryItem(name: "c", value: key)])
     }
 }

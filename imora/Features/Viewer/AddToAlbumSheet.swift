@@ -1,12 +1,37 @@
 import SwiftUI
 
+nonisolated struct AlbumMembershipUpdate: Equatable {
+    nonisolated enum Change: Equatable {
+        case project(Album)
+        case commit(Album)
+        case rollback(String)
+        case replace(String, Album)
+    }
+
+    let id = UUID()
+    let operationID: UUID
+    let assetID: String
+    let change: Change
+}
+
 /// pick an album for the current asset, or create a new one with it inside.
 struct AddToAlbumSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(SessionStore.self) private var session
 
     let assetIDs: [String]
+    let onMembershipUpdate: (AlbumMembershipUpdate) -> Void
     let onDone: (String) -> Void
+
+    init(
+        assetIDs: [String],
+        onMembershipUpdate: @escaping (AlbumMembershipUpdate) -> Void = { _ in },
+        onDone: @escaping (String) -> Void
+    ) {
+        self.assetIDs = assetIDs
+        self.onMembershipUpdate = onMembershipUpdate
+        self.onDone = onDone
+    }
 
     @State private var albums: [Album] = []
     @State private var containingIDs: Set<String> = []
@@ -15,7 +40,6 @@ struct AddToAlbumSheet: View {
     @State private var query = ""
     @State private var showNewAlbum = false
     @State private var newAlbumName = ""
-    @State private var error: String?
 
     private var visibleAlbums: [Album] {
         guard !query.isEmpty else { return albums }
@@ -32,7 +56,7 @@ struct AddToAlbumSheet: View {
                     } label: {
                         Label("New Album", systemImage: "plus")
                     }
-                    .disabled(isWorking)
+                    .disabled(isWorking || isLoading)
                     .accessibilityIdentifier("add-to-album-new")
                 }
 
@@ -65,14 +89,10 @@ struct AddToAlbumSheet: View {
                 Button("Create") {
                     Task { await createAlbum() }
                 }
+                .disabled(isWorking || newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 Button("Cancel", role: .cancel) {}
             }
-            .alert(error ?? "", isPresented: Binding(
-                get: { error != nil },
-                set: { if !$0 { error = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            }
+            .interactiveDismissDisabled(isWorking)
         }
     }
 
@@ -139,38 +159,109 @@ struct AddToAlbumSheet: View {
     }
 
     private func add(to album: Album) async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isWorking else { return }
+        let requested = Set(assetIDs)
+        let originalContaining = containingIDs
+        let optimistic = album.withAssetCountDelta(requested.count)
+        let operationID = UUID()
         isWorking = true
         defer { isWorking = false }
-        do {
-            let results = try await client.addAssets(albumID: album.id, ids: assetIDs)
-            let added = results.filter(\.success).count
-            let duplicates = results.filter { $0.error == "duplicate" }.count
-            if added > 0 {
-                onDone("Added to \(album.albumName)")
-            } else if duplicates > 0 {
-                onDone("Already in \(album.albumName)")
-            } else {
-                onDone("Could not add to \(album.albumName)")
+        let result = await OptimisticAction.perform(
+            errorMessage: "Couldn’t add the selected items to the album.",
+            apply: {
+                containingIDs.insert(album.id)
+                replaceAlbum(id: album.id, with: optimistic)
+                emit(.project(optimistic), operationID: operationID)
+                dismiss()
+            },
+            rollback: {
+                containingIDs = originalContaining
+                replaceAlbum(id: album.id, with: album)
+                emit(.rollback(album.id), operationID: operationID)
+            },
+            request: { try await client.addAssets(albumID: album.id, ids: Array(requested)) },
+            commit: { results in
+                let outcome = BulkMutationOutcome(requestedIDs: requested, results: results)
+                replaceAlbum(
+                    id: album.id,
+                    with: album.withAssetCountDelta(outcome.successfulIDs.count)
+                )
+                if !outcome.successfulIDs.isEmpty {
+                    emit(
+                        .commit(album.withAssetCountDelta(outcome.successfulIDs.count)),
+                        operationID: operationID
+                    )
+                } else if !outcome.duplicateIDs.isEmpty {
+                    emit(.commit(album), operationID: operationID)
+                } else {
+                    containingIDs = originalContaining
+                    emit(.rollback(album.id), operationID: operationID)
+                }
+                reportFailures(outcome.failedIDs.count, action: "add")
             }
-            dismiss()
-        } catch {
-            self.error = "Could not add to the album: \(error.localizedDescription)"
+        )
+        guard let results = result else { return }
+        let outcome = BulkMutationOutcome(requestedIDs: requested, results: results)
+        guard outcome.failedIDs.isEmpty else { return }
+        if !outcome.successfulIDs.isEmpty {
+            onDone("Added to \(album.albumName)")
+        } else if !outcome.duplicateIDs.isEmpty {
+            onDone("Already in \(album.albumName)")
         }
     }
 
     private func createAlbum() async {
-        guard let client = session.client else { return }
+        guard let client = session.client, !isWorking else { return }
         let name = newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
+        let pending = Album.pending(name: name, assetCount: Set(assetIDs).count)
+        let operationID = UUID()
         isWorking = true
         defer { isWorking = false }
-        do {
-            let album = try await client.createAlbum(name: name, assetIds: assetIDs)
-            onDone("Added to \(album.albumName)")
-            dismiss()
-        } catch {
-            self.error = "Could not create the album: \(error.localizedDescription)"
-        }
+        let saved = await OptimisticAction.perform(
+            errorMessage: "Couldn’t create the album.",
+            apply: {
+                newAlbumName = ""
+                albums.insert(pending, at: 0)
+                containingIDs.insert(pending.id)
+                emit(.project(pending), operationID: operationID)
+                dismiss()
+            },
+            rollback: {
+                albums.removeAll { $0.id == pending.id }
+                containingIDs.remove(pending.id)
+                newAlbumName = name
+                emit(.rollback(pending.id), operationID: operationID)
+            },
+            request: { try await client.createAlbum(name: name, assetIds: assetIDs) },
+            commit: { album in
+                replaceAlbum(id: pending.id, with: album)
+                containingIDs.remove(pending.id)
+                containingIDs.insert(album.id)
+                emit(.replace(pending.id, album), operationID: operationID)
+            }
+        )
+        if let saved { onDone("Added to \(saved.albumName)") }
+    }
+
+    private func replaceAlbum(id: String, with replacement: Album) {
+        guard let index = albums.firstIndex(where: { $0.id == id }) else { return }
+        albums[index] = replacement
+    }
+
+    private func reportFailures(_ count: Int, action: String) {
+        guard count > 0 else { return }
+        ErrorToastCenter.shared.show(
+            "Couldn’t \(action) \(count) selected item\(count == 1 ? "" : "s")."
+        )
+    }
+
+    private func emit(_ change: AlbumMembershipUpdate.Change, operationID: UUID) {
+        guard let assetID = assetIDs.first else { return }
+        onMembershipUpdate(AlbumMembershipUpdate(
+            operationID: operationID,
+            assetID: assetID,
+            change: change
+        ))
     }
 }

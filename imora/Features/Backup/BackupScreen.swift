@@ -5,6 +5,7 @@ struct BackupScreen: View {
 
     @State private var cleanup: CleanupState = .idle
     @State private var confirmCleanup = false
+    @State private var reportsNextBackupFailure = false
 
     nonisolated private enum CleanupState: Equatable {
         case idle
@@ -25,14 +26,35 @@ struct BackupScreen: View {
         }
         .navigationTitle("Backup")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: session.backup?.phase) { _, phase in
+            guard reportsNextBackupFailure, let phase else { return }
+            switch phase {
+            case .error(let message):
+                reportsNextBackupFailure = false
+                ErrorToastCenter.shared.show("Couldn’t complete the backup. \(message)")
+            case .done(let summary):
+                reportsNextBackupFailure = false
+                if summary.failed > 0 {
+                    let detail = session.backup?.lastFailure ?? "Some items were not uploaded."
+                    ErrorToastCenter.shared.show("Some photos couldn’t be backed up. \(detail)")
+                }
+            default:
+                break
+            }
+        }
     }
 
     // MARK: - automatic backup
 
     private func autoSection(_ backup: BackupManager) -> some View {
-        @Bindable var backup = backup
         return Section {
-            Toggle(isOn: $backup.autoBackup) {
+            Toggle(isOn: Binding(
+                get: { backup.autoBackup },
+                set: { value in
+                    backup.autoBackup = value
+                    if value { reportsNextBackupFailure = true }
+                }
+            )) {
                 Label("Back Up Automatically", systemImage: "arrow.triangle.2.circlepath.icloud")
             }
             .accessibilityIdentifier("backup-auto-toggle")
@@ -108,6 +130,7 @@ struct BackupScreen: View {
     /// hands the run to the scheduler when it will take it, so the progress
     /// indicator survives leaving the app; otherwise backs up in app as before.
     private func startBackup(_ backup: BackupManager) {
+        reportsNextBackupFailure = true
         Task {
             let accepted = await ContinuedProcessing.backup.submit(
                 title: "Backing up",
@@ -238,7 +261,8 @@ struct BackupScreen: View {
                     confirmCleanup = true
                 }
             } catch {
-                cleanup = .failed(error.localizedDescription)
+                cleanup = .idle
+                ErrorToastCenter.shared.show("Couldn’t verify cleanup candidates", error: error)
             }
         }
     }

@@ -1,6 +1,37 @@
 import SwiftUI
 import MapKit
 
+private nonisolated struct AssetCoordinateValue: Equatable, Sendable {
+    let latitude: Double
+    let longitude: Double
+
+    init(_ coordinate: CLLocationCoordinate2D) {
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+    }
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+private struct AlbumMembershipRollback {
+    let album: Album?
+    let index: Int?
+}
+
+private extension Person {
+    func renamed(_ name: String) -> Person {
+        Person(
+            id: id,
+            name: name,
+            thumbnailPath: thumbnailPath,
+            isHidden: isHidden,
+            birthDate: birthDate
+        )
+    }
+}
+
 /// Photos-style metadata content for the viewer's native information sheet.
 /// The presenting screen owns the vertical scroll view and sheet behavior.
 struct AssetInfoPanel: View {
@@ -9,10 +40,15 @@ struct AssetInfoPanel: View {
     let asset: Asset
     /// Fires after an adjust-date save so the viewer can refresh its copy:
     /// UTC capture instant + photographer-local offset in hours.
-    var onDateAdjusted: ((Date, Double) -> Void)? = nil
+    var onDateAdjusted: ((String, Date, Double) -> Void)? = nil
     /// The viewer owns presentation of the album picker because it knows the
     /// remote ID for local assets that have just been backed up.
     var onAddToAlbum: (() -> Void)? = nil
+    /// Navigation belongs to the full-screen viewer, not to this sheet. These
+    /// callbacks let the presenter dismiss information before pushing.
+    var onOpenPerson: ((Person) -> Void)? = nil
+    var onOpenAlbum: ((Album) -> Void)? = nil
+    var albumMembershipUpdate: AlbumMembershipUpdate? = nil
 
     private enum LoadState {
         case loading
@@ -21,19 +57,32 @@ struct AssetInfoPanel: View {
     }
 
     @State private var loadState = LoadState.loading
-    @State private var albums: [Album] = []
+    @State private var albumsByAsset: [String: [Album]] = [:]
+    @State private var albumRevisions: [String: UInt64] = [:]
+    @State private var albumMembershipRollbacks: [UUID: AlbumMembershipRollback] = [:]
     @State private var descriptionDraft = ""
-    @State private var savedDescription = ""
+    @State private var captionsByAsset: [String: String] = [:]
     /// Which asset the caption draft belongs to.
     @State private var draftAssetID: String?
-    @State private var isSavingCaption = false
-    @State private var rating = 0
+    @State private var ratingsByAsset: [String: Int] = [:]
     @State private var showAdjustDate = false
     @State private var showAdjustLocation = false
+    @State private var locationsByAsset: [String: AssetCoordinateValue?] = [:]
+    @State private var canonicalLocationsByAsset: [String: AssetCoordinateValue?] = [:]
+    @State private var dateMutations = AssetOptimisticField<AssetDateAdjustment>()
+    @State private var captionMutations = AssetOptimisticField<String>()
+    @State private var ratingMutations = AssetOptimisticField<Int>()
+    @State private var locationMutations = AssetOptimisticField<AssetCoordinateValue?>()
+    @State private var loadGeneration: UInt64 = 0
     @State private var renamingPerson: Person?
     @State private var personNameDraft = ""
-    @State private var editError: String?
+    @State private var personNameOverrides: [String: String] = [:]
+    @State private var renamingPersonIDs: Set<String> = []
     @FocusState private var descriptionFocused: Bool
+
+    private var savedDescription: String { captionsByAsset[asset.id] ?? "" }
+    private var rating: Int { ratingsByAsset[asset.id] ?? 0 }
+    private var albums: [Album] { albumsByAsset[asset.id] ?? [] }
 
     /// Mutations are for the signed-in owner only; unknown user counts as
     /// owner so an offline session stays usable.
@@ -64,27 +113,31 @@ struct AssetInfoPanel: View {
             }
             .padding(.horizontal, 18)
         }
-        .padding(.bottom, 24)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color(uiColor: .systemBackground))
         .accessibilityIdentifier("asset-details")
         .task(id: asset.id) { await load() }
         .onDisappear {
             Task { await commitDescription() }
         }
+        .onChange(of: albumMembershipUpdate) { _, update in
+            guard let update else { return }
+            applyAlbumMembership(update)
+        }
         .sheet(isPresented: $showAdjustDate) {
             if let detail {
-                AdjustDateTimeSheet(asset: asset, detail: detail) { fileCreatedAt, offsetHours in
-                    onDateAdjusted?(fileCreatedAt, offsetHours)
-                    Task { await load() }
+                AdjustDateTimeSheet(asset: asset, detail: detail) { adjustment in
+                    submitDate(adjustment, for: asset.id)
                 }
             }
         }
         .sheet(isPresented: $showAdjustLocation) {
-            if let detail {
-                AdjustLocationSheet(asset: asset, detail: detail) {
-                    Task { await load() }
-                }
+            if detail != nil {
+                AdjustLocationSheet(
+                    initialCoordinate: displayedLocation(for: asset.id)?.coordinate,
+                    onSave: { coordinate in
+                        submitLocation(AssetCoordinateValue(coordinate), for: asset.id)
+                    }
+                )
             }
         }
         .alert("Name", isPresented: Binding(
@@ -98,12 +151,6 @@ struct AssetInfoPanel: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .alert(editError ?? "", isPresented: Binding(
-            get: { editError != nil },
-            set: { if !$0 { editError = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        }
     }
 
     // MARK: - Panel header
@@ -113,7 +160,7 @@ struct AssetInfoPanel: View {
             Text("Information")
                 .font(.title2.bold())
             Spacer()
-            if isSavingCaption {
+            if captionMutations.isPending(for: asset.id) {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.small)
@@ -126,8 +173,8 @@ struct AssetInfoPanel: View {
             }
         }
         .padding(.horizontal, 18)
-        .padding(.top, 18)
-        .padding(.bottom, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 12)
     }
 
     private var loadingState: some View {
@@ -252,20 +299,135 @@ struct AssetInfoPanel: View {
     @discardableResult
     private func commitDescription() async -> Bool {
         let trimmed = descriptionDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isSavingCaption, trimmed != savedDescription,
-              let target = draftAssetID, let client = session.client
+        guard let target = draftAssetID,
+              trimmed != (captionsByAsset[target] ?? ""),
+              let client = session.client
         else { return true }
-        isSavingCaption = true
-        defer { isSavingCaption = false }
-        do {
-            try await client.updateAsset(id: target, description: trimmed)
-            if draftAssetID == target { savedDescription = trimmed }
-            return true
-        } catch {
-            if draftAssetID == target { descriptionDraft = savedDescription }
-            editError = "Could not save the caption: \(error.localizedDescription)"
-            return false
+        if draftAssetID == target { descriptionDraft = trimmed }
+        captionMutations.submit(
+            assetID: target,
+            current: captionsByAsset[target] ?? "",
+            desired: trimmed,
+            errorMessage: "Couldn’t save the caption",
+            apply: applyCaptionProjection,
+            request: { value in
+                _ = try await client.updateAsset(id: target, description: value)
+                return value
+            }
+        )
+        return true
+    }
+
+    private func applyCaptionProjection(assetID: String, value: String) {
+        let previousProjection = captionsByAsset[assetID] ?? ""
+        captionsByAsset[assetID] = value
+        guard draftAssetID == assetID, descriptionDraft == previousProjection else { return }
+        descriptionDraft = value
+    }
+
+    private func submitDate(_ adjustment: AssetDateAdjustment, for assetID: String) {
+        guard let client = session.client else { return }
+        let current = AssetDateAdjustment(
+            instant: asset.fileCreatedAt,
+            offsetHours: asset.localOffsetHours,
+            apiTimestamp: ""
+        )
+        dateMutations.submit(
+            assetID: assetID,
+            current: current,
+            desired: adjustment,
+            errorMessage: "Couldn’t adjust the date",
+            apply: { id, value in
+                onDateAdjusted?(id, value.instant, value.offsetHours)
+            },
+            request: { value in
+                _ = try await client.updateAsset(id: assetID, dateTimeOriginal: value.apiTimestamp)
+                return value
+            }
+        )
+    }
+
+    private func submitLocation(_ desired: AssetCoordinateValue, for assetID: String) {
+        guard let client = session.client else { return }
+        let current = displayedLocation(for: assetID)
+        locationMutations.submit(
+            assetID: assetID,
+            current: current,
+            desired: desired,
+            errorMessage: "Couldn’t save the location",
+            apply: { id, value in
+                locationsByAsset[id] = value
+            },
+            request: { value in
+                guard let value else { return nil }
+                _ = try await client.updateAsset(
+                    id: assetID,
+                    latitude: value.latitude,
+                    longitude: value.longitude
+                )
+                return value
+            },
+            latestCommit: { id, _ in
+                guard draftAssetID == id else { return }
+                Task {
+                    await Task.yield()
+                    await load()
+                }
+            },
+            reportFailure: { message, error in
+                ErrorToastCenter.shared.show(message, error: error)
+                guard draftAssetID == assetID else { return }
+                Task {
+                    await Task.yield()
+                    await load()
+                }
+            }
+        )
+    }
+
+    private func displayedLocation(for assetID: String) -> AssetCoordinateValue? {
+        if let stored = locationsByAsset[assetID] { return stored }
+        return canonicalLocationsByAsset[assetID] ?? nil
+    }
+
+    private func applyAlbumMembership(_ update: AlbumMembershipUpdate) {
+        var values = albumsByAsset[update.assetID] ?? []
+        switch update.change {
+        case .project(let album):
+            if albumMembershipRollbacks[update.operationID] == nil {
+                albumMembershipRollbacks[update.operationID] = AlbumMembershipRollback(
+                    album: values.first(where: { $0.id == album.id }),
+                    index: values.firstIndex(where: { $0.id == album.id })
+                )
+            }
+            if let index = values.firstIndex(where: { $0.id == album.id }) {
+                values[index] = album
+            } else {
+                values.append(album)
+            }
+        case .commit(let album):
+            albumMembershipRollbacks.removeValue(forKey: update.operationID)
+            if let index = values.firstIndex(where: { $0.id == album.id }) {
+                values[index] = album
+            } else {
+                values.append(album)
+            }
+        case .rollback(let id):
+            let snapshot = albumMembershipRollbacks.removeValue(forKey: update.operationID)
+            values.removeAll { $0.id == id }
+            if let album = snapshot?.album {
+                values.insert(album, at: min(snapshot?.index ?? values.count, values.count))
+            }
+        case .replace(let id, let album):
+            albumMembershipRollbacks.removeValue(forKey: update.operationID)
+            if let index = values.firstIndex(where: { $0.id == id }) {
+                values[index] = album
+            } else if !values.contains(where: { $0.id == album.id }) {
+                values.append(album)
+            }
         }
+        albumsByAsset[update.assetID] = values
+        albumRevisions[update.assetID, default: 0] &+= 1
     }
 
     // MARK: - People
@@ -300,9 +462,15 @@ struct AssetInfoPanel: View {
         return "No people have been identified in this item."
     }
 
-    @ViewBuilder private func personCell(_ person: Person) -> some View {
-        NavigationLink {
-            PersonScreen(person: person)
+    private func personCell(_ person: Person) -> some View {
+        let person = person.renamed(personNameOverrides[person.id] ?? person.name)
+        return Button {
+            if person.name.isEmpty, isOwner {
+                personNameDraft = ""
+                renamingPerson = person
+            } else {
+                onOpenPerson?(person)
+            }
         } label: {
             VStack(spacing: 6) {
                 if let client = session.client {
@@ -342,14 +510,8 @@ struct AssetInfoPanel: View {
             .frame(width: 84)
         }
         .buttonStyle(.plain)
-        .simultaneousGesture(
-            person.name.isEmpty && isOwner
-                ? TapGesture().onEnded {
-                    personNameDraft = ""
-                    renamingPerson = person
-                }
-                : nil
-        )
+        .disabled(renamingPersonIDs.contains(person.id))
+        .accessibilityIdentifier("info-person-\(person.id)")
         .contextMenu {
             if isOwner {
                 Button {
@@ -386,36 +548,49 @@ struct AssetInfoPanel: View {
 
     private func renamePerson(_ person: Person, to name: String) async {
         guard let client = session.client else { return }
+        guard renamingPersonIDs.insert(person.id).inserted else { return }
+        defer { renamingPersonIDs.remove(person.id) }
+        let previous = personNameOverrides[person.id] ?? person.name
+        personNameOverrides[person.id] = name
         do {
             try await client.updatePerson(id: person.id, name: name)
-            await load()
         } catch {
-            editError = "Could not rename: \(error.localizedDescription)"
+            personNameOverrides[person.id] = previous
+            ErrorToastCenter.shared.show("Couldn’t rename this person", error: error)
         }
     }
 
     // MARK: - Location
 
     @ViewBuilder private func locationSection(_ exif: ExifInfo?) -> some View {
+        let displayed = displayedLocation(for: asset.id)
+        let coordinate = displayed?.coordinate ?? storedCoordinate(exif)
+        let canonical = canonicalLocationsByAsset[asset.id] ?? nil
+        let hidesStalePlaceName = displayed != canonical
+            || locationMutations.isPending(for: asset.id)
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 sectionLabel("Location")
                 Spacer()
                 if isOwner, !asset.isLocal, detail != nil {
-                    Button(hasCoordinates(exif) ? "Adjust" : "Add") {
+                    Button(coordinate == nil ? "Add" : "Adjust") {
                         showAdjustLocation = true
                     }
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.tint)
                     .buttonStyle(.plain)
                     .accessibilityIdentifier(
-                        hasCoordinates(exif) ? "info-adjust-location" : "info-add-location"
+                        coordinate == nil ? "info-add-location" : "info-adjust-location"
                     )
                 }
             }
 
-            if let exif, hasCoordinates(exif) {
-                locatedContent(exif)
+            if let coordinate {
+                locatedContent(
+                    exif,
+                    coordinate: coordinate,
+                    hidesStalePlaceName: hidesStalePlaceName
+                )
             } else {
                 emptyState(
                     systemImage: "map",
@@ -429,16 +604,20 @@ struct AssetInfoPanel: View {
         .padding(.vertical, 20)
     }
 
-    private func hasCoordinates(_ exif: ExifInfo?) -> Bool {
-        guard let latitude = exif?.latitude, let longitude = exif?.longitude else { return false }
-        return latitude != 0 || longitude != 0
+    private func storedCoordinate(_ exif: ExifInfo?) -> CLLocationCoordinate2D? {
+        guard let latitude = exif?.latitude, let longitude = exif?.longitude else { return nil }
+        guard latitude != 0 || longitude != 0 else { return nil }
+        return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 
-    private func locatedContent(_ exif: ExifInfo) -> some View {
-        let latitude = exif.latitude ?? 0
-        let longitude = exif.longitude ?? 0
-        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-        let place = [exif.city, exif.state, exif.country]
+    private func locatedContent(
+        _ exif: ExifInfo?,
+        coordinate: CLLocationCoordinate2D,
+        hidesStalePlaceName: Bool
+    ) -> some View {
+        let latitude = coordinate.latitude
+        let longitude = coordinate.longitude
+        let place = hidesStalePlaceName ? "" : [exif?.city, exif?.state, exif?.country]
             .compactMap { value in
                 guard let value, !value.isEmpty else { return nil }
                 return value
@@ -684,14 +863,18 @@ struct AssetInfoPanel: View {
 
     private func setRating(_ value: Int) async {
         guard let client = session.client else { return }
-        let previous = rating
-        rating = value
-        do {
-            try await client.updateAsset(id: asset.id, rating: value)
-        } catch {
-            rating = previous
-            editError = "Could not save the rating: \(error.localizedDescription)"
-        }
+        let assetID = asset.id
+        ratingMutations.submit(
+            assetID: assetID,
+            current: ratingsByAsset[assetID] ?? 0,
+            desired: value,
+            errorMessage: "Couldn’t save the rating",
+            apply: { id, projected in ratingsByAsset[id] = projected },
+            request: { projected in
+                _ = try await client.updateAsset(id: assetID, rating: projected)
+                return projected
+            }
+        )
     }
 
     // MARK: - Albums
@@ -723,7 +906,6 @@ struct AssetInfoPanel: View {
             }
         }
         .padding(.vertical, 20)
-        .padding(.bottom, 20)
     }
 
     private var albumsEmptyMessage: String {
@@ -736,8 +918,8 @@ struct AssetInfoPanel: View {
     private var albumRows: some View {
         VStack(spacing: 0) {
             ForEach(albums) { album in
-                NavigationLink {
-                    AlbumDetailScreen(album: album)
+                Button {
+                    onOpenAlbum?(album)
                 } label: {
                     HStack(spacing: 12) {
                         albumThumbnail(album)
@@ -760,6 +942,8 @@ struct AssetInfoPanel: View {
                     .padding(.vertical, 8)
                 }
                 .buttonStyle(.plain)
+                .disabled(album.isPending)
+                .accessibilityIdentifier("info-album-\(album.id)")
 
                 if album.id != albums.last?.id {
                     Divider()
@@ -924,30 +1108,35 @@ struct AssetInfoPanel: View {
     // MARK: - Loading
 
     private func load() async {
+        let requestedAsset = asset
+        let assetID = requestedAsset.id
         // Paging swaps the asset while this panel stays mounted. Flush the old
         // draft before adopting the next photo so it cannot be saved to it.
-        if let draftAssetID, draftAssetID != asset.id {
+        if let draftAssetID, draftAssetID != assetID {
             await commitDescription()
             descriptionFocused = false
         }
-        let isNewAsset = draftAssetID != asset.id
+        let isNewAsset = draftAssetID != assetID
         if isNewAsset {
-            draftAssetID = asset.id
-            descriptionDraft = ""
-            savedDescription = ""
-            rating = 0
-            albums = []
+            draftAssetID = assetID
+            descriptionDraft = captionsByAsset[assetID] ?? ""
             loadState = .loading
         }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let captionSnapshot = captionMutations.loadSnapshot(for: assetID)
+        let ratingSnapshot = ratingMutations.loadSnapshot(for: assetID)
+        let locationSnapshot = locationMutations.loadSnapshot(for: assetID)
+        let albumRevision = albumRevisions[assetID, default: 0]
 
         // Device-only assets answer from PhotoKit. Server concepts remain as
         // explicit empty sections instead of disappearing from the layout.
-        if asset.isLocal {
+        if requestedAsset.isLocal {
             var local: AssetDetail?
-            if let localIdentifier = asset.localIdentifier {
+            if let localIdentifier = requestedAsset.localIdentifier {
                 local = await PhotoLibraryService.localDetail(localIdentifier: localIdentifier)
             }
-            guard draftAssetID == asset.id else { return }
+            guard draftAssetID == assetID, loadGeneration == generation else { return }
             if let local {
                 loadState = .loaded(local)
             } else {
@@ -963,38 +1152,85 @@ struct AssetInfoPanel: View {
         let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
 
         do {
-            let detail = try await client.assetDetail(id: asset.id)
-            guard draftAssetID == asset.id else { return }
+            let detail = try await client.assetDetail(id: assetID)
+            guard draftAssetID == assetID, loadGeneration == generation else { return }
             loadState = .loaded(detail)
-            savedDescription = detail.exifInfo?.description ?? ""
-            if !descriptionFocused { descriptionDraft = savedDescription }
-            rating = detail.exifInfo?.rating.map { Int($0) } ?? 0
+            adoptMetadata(
+                detail,
+                assetID: assetID,
+                captionSnapshot: captionSnapshot,
+                ratingSnapshot: ratingSnapshot,
+                locationSnapshot: locationSnapshot
+            )
 
-            let loaded = (try? await client.albums(assetID: asset.id)) ?? []
-            guard draftAssetID == asset.id else { return }
-            albums = loaded
+            let loaded = (try? await client.albums(assetID: assetID)) ?? []
+            guard draftAssetID == assetID, loadGeneration == generation else { return }
+            if albumRevisions[assetID, default: 0] == albumRevision {
+                albumsByAsset[assetID] = loaded
+            }
             if let account {
-                let envelope = CachedAssetInfo(detail: detail, albums: loaded)
+                let envelope = CachedAssetInfo(
+                    detail: detail,
+                    albums: albumsByAsset[assetID] ?? loaded
+                )
                 Task.detached(priority: .utility) {
                     OfflineCache.store(envelope, key: "asset-info/\(detail.id)", account: account)
                 }
             }
         } catch {
             // Offline: the last fetched copy still answers most questions.
-            guard draftAssetID == asset.id else { return }
+            guard draftAssetID == assetID, loadGeneration == generation else { return }
             if let account,
                let cached: CachedAssetInfo = OfflineCache.value(
-                   key: "asset-info/\(asset.id)",
+                   key: "asset-info/\(assetID)",
                    account: account
                ) {
                 loadState = .loaded(cached.detail)
-                savedDescription = cached.detail.exifInfo?.description ?? ""
-                if !descriptionFocused { descriptionDraft = savedDescription }
-                rating = cached.detail.exifInfo?.rating.map { Int($0) } ?? 0
-                albums = cached.albums
+                adoptMetadata(
+                    cached.detail,
+                    assetID: assetID,
+                    captionSnapshot: captionSnapshot,
+                    ratingSnapshot: ratingSnapshot,
+                    locationSnapshot: locationSnapshot
+                )
+                if albumRevisions[assetID, default: 0] == albumRevision {
+                    albumsByAsset[assetID] = cached.albums
+                }
             } else {
                 loadState = .failed(error.localizedDescription)
             }
+        }
+    }
+
+    private func adoptMetadata(
+        _ detail: AssetDetail,
+        assetID: String,
+        captionSnapshot: AssetOptimisticField<String>.LoadSnapshot,
+        ratingSnapshot: AssetOptimisticField<Int>.LoadSnapshot,
+        locationSnapshot: AssetOptimisticField<AssetCoordinateValue?>.LoadSnapshot
+    ) {
+        if captionMutations.canAdoptServerValue(for: assetID, since: captionSnapshot) {
+            let serverValue = detail.exifInfo?.description ?? ""
+            let previousProjection = captionsByAsset[assetID] ?? ""
+            captionMutations.adoptServerValue(serverValue, for: assetID)
+            captionsByAsset[assetID] = serverValue
+            if draftAssetID == assetID,
+               !descriptionFocused || descriptionDraft == previousProjection {
+                descriptionDraft = serverValue
+            }
+        }
+
+        if ratingMutations.canAdoptServerValue(for: assetID, since: ratingSnapshot) {
+            let serverValue = detail.exifInfo?.rating.map { Int($0) } ?? 0
+            ratingMutations.adoptServerValue(serverValue, for: assetID)
+            ratingsByAsset[assetID] = serverValue
+        }
+
+        if locationMutations.canAdoptServerValue(for: assetID, since: locationSnapshot) {
+            let serverValue = storedCoordinate(detail.exifInfo).map(AssetCoordinateValue.init)
+            locationMutations.adoptServerValue(serverValue, for: assetID)
+            canonicalLocationsByAsset[assetID] = serverValue
+            locationsByAsset[assetID] = serverValue
         }
     }
 }
@@ -1003,7 +1239,7 @@ struct AssetInfoPanel: View {
 /// old name. New viewer layouts should embed `AssetInfoPanel` directly.
 struct AssetInfoSheet: View {
     let asset: Asset
-    var onDateAdjusted: ((Date, Double) -> Void)? = nil
+    var onDateAdjusted: ((String, Date, Double) -> Void)? = nil
 
     var body: some View {
         AssetInfoPanel(asset: asset, onDateAdjusted: onDateAdjusted)

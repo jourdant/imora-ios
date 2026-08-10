@@ -6,17 +6,17 @@ struct SettingsView: View {
 
     @State private var about: ServerAbout?
     @State private var confirmLogout = false
+    @State private var memoriesMutations = SerialOptimisticValue<Bool>()
+    @State private var peopleMutations = SerialOptimisticValue<Bool>()
 
-    private func preferenceToggle(_ title: String, icon: String, section: String, isOn: Bool) -> some View {
+    private func preferenceToggle(
+        _ title: String,
+        icon: String,
+        section: ServerFeaturePreference
+    ) -> some View {
         Toggle(isOn: Binding(
-            get: { isOn },
-            set: { newValue in
-                Task {
-                    if let updated = try? await session.client?.updatePreference(section: section, enabled: newValue) {
-                        session.preferences = updated
-                    }
-                }
-            }
+            get: { section.isEnabled(in: session.preferences) },
+            set: { updatePreference(section, enabled: $0) }
         )) {
             Label(title, systemImage: icon)
         }
@@ -40,8 +40,8 @@ struct SettingsView: View {
                 }
 
                 Section("Features") {
-                    preferenceToggle("Memories", icon: "clock.arrow.circlepath", section: "memories", isOn: session.preferences?.memoriesEnabled ?? true)
-                    preferenceToggle("People", icon: "person.2", section: "people", isOn: session.preferences?.peopleEnabled ?? true)
+                    preferenceToggle("Memories", icon: "clock.arrow.circlepath", section: .memories)
+                    preferenceToggle("People", icon: "person.2", section: .people)
                 }
 
                 Section {
@@ -111,5 +111,96 @@ struct SettingsView: View {
                 about = try? await session.client?.serverAbout()
             }
         }
+    }
+
+    private func updatePreference(_ section: ServerFeaturePreference, enabled: Bool) {
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("Couldn’t update \(section.title.lowercased()). The server is not available.")
+            return
+        }
+        let mutations = section == .memories ? memoriesMutations : peopleMutations
+        mutations.submit(
+            current: section.isEnabled(in: session.preferences),
+            desired: enabled,
+            errorMessage: "Couldn’t update \(section.title.lowercased())",
+            apply: { value in
+                guard session.client === client else { return }
+                let current = session.preferences ?? .emptyForLocalProjection
+                session.projectPreferences(
+                    current.replacingFeature(section, enabled: value),
+                    field: section.rawValue
+                )
+            },
+            request: { value in
+                let updated = try await client.updatePreference(section: section.rawValue, enabled: value)
+                return section.isEnabled(in: updated)
+            },
+            activityChanged: { active in
+                guard session.client === client else { return }
+                session.setPreferenceMutation(section.rawValue, active: active)
+            }
+        )
+    }
+}
+
+nonisolated enum ServerFeaturePreference: String {
+    case memories
+    case people
+
+    var title: String {
+        switch self {
+        case .memories: "Memories"
+        case .people: "People"
+        }
+    }
+
+    func isEnabled(in preferences: UserPreferences?) -> Bool {
+        switch self {
+        case .memories: preferences?.memoriesEnabled ?? true
+        case .people: preferences?.peopleEnabled ?? true
+        }
+    }
+}
+
+extension UserPreferences {
+    nonisolated static var emptyForLocalProjection: UserPreferences {
+        UserPreferences(
+            memories: nil,
+            people: nil,
+            folders: nil,
+            ratings: nil,
+            tags: nil,
+            sharedLinks: nil,
+            emailNotifications: nil
+        )
+    }
+
+    nonisolated func replacingFeature(
+        _ section: ServerFeaturePreference,
+        enabled: Bool
+    ) -> UserPreferences {
+        UserPreferences(
+            memories: section == .memories ? FeatureToggle(enabled: enabled) : memories,
+            people: section == .people ? FeatureToggle(enabled: enabled) : people,
+            folders: folders,
+            ratings: ratings,
+            tags: tags,
+            sharedLinks: sharedLinks,
+            emailNotifications: emailNotifications
+        )
+    }
+
+    nonisolated func replacingEmailNotifications(
+        with email: EmailNotificationPreferences
+    ) -> UserPreferences {
+        UserPreferences(
+            memories: memories,
+            people: people,
+            folders: folders,
+            ratings: ratings,
+            tags: tags,
+            sharedLinks: sharedLinks,
+            emailNotifications: email
+        )
     }
 }

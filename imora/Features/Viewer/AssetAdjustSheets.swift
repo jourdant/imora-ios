@@ -3,28 +3,31 @@ import MapKit
 
 // MARK: - date and time
 
+nonisolated struct AssetDateAdjustment: Equatable, Sendable {
+    let instant: Date
+    let offsetHours: Double
+    let apiTimestamp: String
+}
+
 /// photos-style adjust sheet: wall-clock picker plus time zone, saved as an
 /// offset-suffixed timestamp the way the official clients do.
 struct AdjustDateTimeSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(SessionStore.self) private var session
 
     let asset: Asset
     let detail: AssetDetail
-    let onSaved: (Date, Double) -> Void
+    let onSave: (AssetDateAdjustment) -> Void
 
     /// wall clock held in utc components, matching how asset dates render.
     @State private var wallClock: Date
     @State private var zoneID: String
-    @State private var isSaving = false
-    @State private var error: String?
 
     private static let utc = TimeZone(identifier: "UTC")!
 
-    init(asset: Asset, detail: AssetDetail, onSaved: @escaping (Date, Double) -> Void) {
+    init(asset: Asset, detail: AssetDetail, onSave: @escaping (AssetDateAdjustment) -> Void) {
         self.asset = asset
         self.detail = detail
-        self.onSaved = onSaved
+        self.onSave = onSave
         _wallClock = State(initialValue: asset.localDate)
         _zoneID = State(initialValue: Self.initialZone(detail: detail, offsetHours: asset.localOffsetHours))
     }
@@ -89,16 +92,9 @@ struct AdjustDateTimeSheet: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { Task { await save() } }
-                        .disabled(isSaving)
+                    Button("Save") { save() }
                         .accessibilityIdentifier("adjust-date-save")
                 }
-            }
-            .alert(error ?? "", isPresented: Binding(
-                get: { error != nil },
-                set: { if !$0 { error = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
             }
         }
     }
@@ -121,11 +117,7 @@ struct AdjustDateTimeSheet: View {
         return zone.secondsFromGMT(for: instant)
     }
 
-    private func save() async {
-        guard let client = session.client else { return }
-        isSaving = true
-        defer { isSaving = false }
-
+    private func save() {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = Self.utc
         let formatter = DateFormatter()
@@ -135,15 +127,13 @@ struct AdjustDateTimeSheet: View {
 
         let offset = offsetSeconds
         let iso = formatter.string(from: wallClock) + AssetInfoSheet.offsetLabel(hours: Double(offset) / 3600)
-
-        do {
-            try await client.updateAsset(id: asset.id, dateTimeOriginal: iso)
-            let instant = wallClock.addingTimeInterval(TimeInterval(-offset))
-            onSaved(instant, Double(offset) / 3600)
-            dismiss()
-        } catch {
-            self.error = "Could not adjust the date: \(error.localizedDescription)"
-        }
+        let instant = wallClock.addingTimeInterval(TimeInterval(-offset))
+        onSave(AssetDateAdjustment(
+            instant: instant,
+            offsetHours: Double(offset) / 3600,
+            apiTimestamp: iso
+        ))
+        dismiss()
     }
 }
 
@@ -198,27 +188,21 @@ private struct TimeZonePicker: View {
 /// pick a place by searching or tapping the map, photos style.
 struct AdjustLocationSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(SessionStore.self) private var session
 
-    let asset: Asset
-    let detail: AssetDetail
-    let onSaved: () -> Void
+    let onSave: (CLLocationCoordinate2D) -> Void
 
     @State private var coordinate: CLLocationCoordinate2D?
     @State private var camera: MapCameraPosition
     @State private var search = LocationSearchModel()
     @State private var query = ""
-    @State private var isSaving = false
-    @State private var error: String?
 
-    init(asset: Asset, detail: AssetDetail, onSaved: @escaping () -> Void) {
-        self.asset = asset
-        self.detail = detail
-        self.onSaved = onSaved
-        if let latitude = detail.exifInfo?.latitude,
-           let longitude = detail.exifInfo?.longitude,
-           latitude != 0 || longitude != 0 {
-            let center = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    init(
+        initialCoordinate: CLLocationCoordinate2D?,
+        onSave: @escaping (CLLocationCoordinate2D) -> Void
+    ) {
+        self.onSave = onSave
+        if let initialCoordinate {
+            let center = initialCoordinate
             _coordinate = State(initialValue: center)
             _camera = State(initialValue: .region(MKCoordinateRegion(
                 center: center,
@@ -303,16 +287,10 @@ struct AdjustLocationSheet: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { Task { await save() } }
-                        .disabled(isSaving || coordinate == nil)
+                    Button("Save") { save() }
+                        .disabled(coordinate == nil)
                         .accessibilityIdentifier("adjust-location-save")
                 }
-            }
-            .alert(error ?? "", isPresented: Binding(
-                get: { error != nil },
-                set: { if !$0 { error = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
             }
         }
     }
@@ -328,21 +306,10 @@ struct AdjustLocationSheet: View {
         search.results = []
     }
 
-    private func save() async {
-        guard let client = session.client, let coordinate else { return }
-        isSaving = true
-        defer { isSaving = false }
-        do {
-            try await client.updateAsset(
-                id: asset.id,
-                latitude: coordinate.latitude,
-                longitude: coordinate.longitude
-            )
-            onSaved()
-            dismiss()
-        } catch {
-            self.error = "Could not save the location: \(error.localizedDescription)"
-        }
+    private func save() {
+        guard let coordinate else { return }
+        onSave(coordinate)
+        dismiss()
     }
 }
 

@@ -6,16 +6,21 @@ struct AlbumEditSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let album: Album
-    let onSaved: () async -> Void
+    @Binding var isAlbumMutationInFlight: Bool
+    let onAlbumChanged: (Album) -> Void
 
     @State private var name: String
     @State private var descriptionText: String
     @State private var isSaving = false
-    @State private var error: String?
 
-    init(album: Album, onSaved: @escaping () async -> Void) {
+    init(
+        album: Album,
+        isAlbumMutationInFlight: Binding<Bool>,
+        onAlbumChanged: @escaping (Album) -> Void
+    ) {
         self.album = album
-        self.onSaved = onSaved
+        _isAlbumMutationInFlight = isAlbumMutationInFlight
+        self.onAlbumChanged = onAlbumChanged
         _name = State(initialValue: album.albumName)
         _descriptionText = State(initialValue: album.description)
     }
@@ -36,13 +41,6 @@ struct AlbumEditSheet: View {
                         .lineLimit(3...8)
                         .accessibilityIdentifier("album-edit-description")
                 }
-                if let error {
-                    Section {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-                }
             }
             .navigationTitle("Edit Album")
             .navigationBarTitleDisplayMode(.inline)
@@ -54,7 +52,7 @@ struct AlbumEditSheet: View {
                     Button("Save") {
                         Task { await save() }
                     }
-                    .disabled(trimmedName.isEmpty || isSaving)
+                    .disabled(trimmedName.isEmpty || isSaving || isAlbumMutationInFlight)
                     .accessibilityIdentifier("album-edit-save")
                 }
             }
@@ -64,19 +62,31 @@ struct AlbumEditSheet: View {
 
     private func save() async {
         guard let client = session.client else { return }
+        guard !isSaving, !isAlbumMutationInFlight else { return }
+        let optimistic = album.withDetails(
+            name: trimmedName,
+            description: descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         isSaving = true
-        error = nil
-        do {
-            try await client.updateAlbum(
-                id: album.id,
-                name: trimmedName,
-                description: descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-            await onSaved()
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
+        isAlbumMutationInFlight = true
+        defer {
             isSaving = false
+            isAlbumMutationInFlight = false
         }
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t save the album.",
+            apply: {
+                onAlbumChanged(optimistic)
+                dismiss()
+            },
+            rollback: { onAlbumChanged(album) },
+            request: {
+                try await client.updateAlbum(
+                    id: album.id,
+                    name: optimistic.albumName,
+                    description: optimistic.description
+                )
+            }
+        )
     }
 }
