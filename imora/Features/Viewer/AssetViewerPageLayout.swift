@@ -1,49 +1,45 @@
 import CoreGraphics
 
-/// The media's resting treatment for each viewer presentation. Immersive
-/// viewing preserves every pixel; the compact region above information crops
-/// like an aspect-fill image so the reserved viewport never shows letterbox
-/// gaps.
-nonisolated enum AssetViewerMediaLayoutMode: String, Equatable {
-    case fit
-    case fill
-
-    init(informationPresented: Bool) {
-        self = informationPresented ? .fill : .fit
-    }
-}
-
-/// Sizes the media as the viewer moves between its immersive and information
-/// presentations. The information surface occupies 80% of the viewport, so
-/// the asset remains visible and refits the strip above it.
-nonisolated struct AssetViewerPageLayout: Equatable {
-    /// SwiftUI measures fractional sheet detents inside the maximum-detent
-    /// region rather than the whole display. 0.88 leaves roughly one fifth of
-    /// a Dynamic Island phone visible above the sheet.
+/// continuous geometry for the viewer's information transition. progress 0 is
+/// the immersive full-screen fit, progress 1 leaves a compact strip above the
+/// information panel with the media covering it edge to edge like an
+/// aspect-fill image. every value in between is a plain scale and translate
+/// of the very same page, so the transition can track a finger frame by frame
+/// with no content swap or relayout anywhere.
+nonisolated enum AssetViewerPageLayout {
+    /// swiftui measures fractional sheet detents inside the maximum-detent
+    /// region rather than the whole display. used by the regular-width
+    /// floating sheet only.
     static let informationSheetFraction: CGFloat = 0.88
+    /// share of the viewport the media keeps above the information panel.
     static let informationMediaFraction: CGFloat = 0.2
 
-    let mediaHeight: CGFloat
-    let informationMediaHeight: CGFloat
-    private let viewportWidth: CGFloat
-
-    init(viewportHeight: CGFloat, viewportWidth: CGFloat = 0) {
-        let pageHeight = max(0, viewportHeight)
-        mediaHeight = pageHeight
-        informationMediaHeight = pageHeight * Self.informationMediaFraction
-        self.viewportWidth = max(0, viewportWidth)
+    static func mediaStripHeight(viewportHeight: CGFloat) -> CGFloat {
+        max(1, viewportHeight * informationMediaFraction)
     }
 
-    /// Once presented, the sheet's real global frame is the source of truth
-    /// for the media region. Regular-width floating sheets leave the full
-    /// viewer in place instead of collapsing an unrelated strip behind them.
-    func mediaHeight(forInformationSheet sheetFrame: CGRect, compactWidth: Bool = true) -> CGFloat {
-        guard sheetFrame.width > 0 else {
-            return compactWidth ? informationMediaHeight : mediaHeight
-        }
-        guard viewportWidth <= 0 || sheetFrame.width >= viewportWidth * 0.9 else {
-            return mediaHeight
-        }
-        return min(mediaHeight, max(0, sheetFrame.minY))
+    /// how far the information panel travels between hidden and presented,
+    /// which is also the finger travel that maps to the full transition.
+    static func informationPanelTravel(viewportHeight: CGFloat) -> CGFloat {
+        max(1, viewportHeight - mediaStripHeight(viewportHeight: viewportHeight))
+    }
+
+    /// scale and vertical shift that carry a fit-rendered page from resting
+    /// full screen to covering the strip at progress 1. the scale grows until
+    /// the fitted image fills the strip and the offset recenters it there.
+    static func mediaTransform(
+        ratio: Double,
+        viewport: CGSize,
+        progress: CGFloat
+    ) -> (scale: CGFloat, offsetY: CGFloat) {
+        guard progress > 0, viewport.width > 0, viewport.height > 0 else { return (1, 0) }
+        let ratio = CGFloat(ratio > 0 ? ratio : 1)
+        let fitWidth = min(viewport.width, viewport.height * ratio)
+        let fitHeight = fitWidth / ratio
+        let strip = mediaStripHeight(viewportHeight: viewport.height)
+        let fillScale = max(viewport.width / fitWidth, strip / fitHeight)
+        let scale = 1 + (fillScale - 1) * progress
+        let offsetY = (strip - viewport.height) / 2 * progress
+        return (scale, offsetY)
     }
 }

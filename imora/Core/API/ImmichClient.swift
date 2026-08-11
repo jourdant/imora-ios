@@ -582,6 +582,47 @@ nonisolated final class ImmichClient: Sendable {
         try await mutate("people/\(id)", method: "PUT", body: ["name": name])
     }
 
+    func createPerson(name: String) async throws -> Person {
+        try await request("people", method: "POST", body: ["name": name])
+    }
+
+    // MARK: - faces
+
+    /// every face on one asset, assigned or not. the query param is named id
+    /// but the server reads it as the asset id.
+    func assetFaces(assetID: String) async throws -> [AssetFace] {
+        try await get("faces", query: [URLQueryItem(name: "id", value: assetID)])
+    }
+
+    /// manual person tag. the server normalizes the box against the given
+    /// frame, so a whole-image box is valid when no face region is known.
+    func createFace(
+        assetID: String,
+        personID: String,
+        imageWidth: Int,
+        imageHeight: Int,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int
+    ) async throws {
+        try await mutate("faces", method: "POST", body: [
+            "assetId": AnyEncodable(assetID),
+            "personId": AnyEncodable(personID),
+            "imageWidth": AnyEncodable(imageWidth),
+            "imageHeight": AnyEncodable(imageHeight),
+            "x": AnyEncodable(x),
+            "y": AnyEncodable(y),
+            "width": AnyEncodable(width),
+            "height": AnyEncodable(height)
+        ])
+    }
+
+    /// deletes one face row, which untags that person occurrence on the asset.
+    func deleteFace(id: String, force: Bool = false) async throws {
+        try await mutate("faces/\(id)", method: "DELETE", body: ["force": force])
+    }
+
     // MARK: - map
 
     /// every geotagged asset the filter allows, one point each. the server has

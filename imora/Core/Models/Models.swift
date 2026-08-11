@@ -515,6 +515,13 @@ nonisolated struct PeopleResponse: Codable {
     let hidden: Int?
 }
 
+/// one detected or manual face region on an asset. person stays nil while
+/// the face is unassigned.
+nonisolated struct AssetFace: Codable, Identifiable, Hashable {
+    let id: String
+    let person: Person?
+}
+
 nonisolated struct SearchAssetPage: Codable {
     let total: Int
     let count: Int

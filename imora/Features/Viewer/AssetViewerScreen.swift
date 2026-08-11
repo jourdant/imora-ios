@@ -22,6 +22,13 @@ private struct ViewerRemoval {
     let index: Int
 }
 
+/// full-bleed screen size plus the ignored bottom inset, mirrored into state
+/// so gestures and the information panel share the media stage's numbers.
+private nonisolated struct ViewerViewport: Equatable, Sendable {
+    var size = CGSize.zero
+    var bottomInset: CGFloat = 0
+}
+
 /// the album a grid belongs to, when it belongs to one. carries the owner so
 /// the viewer can offer removal to the same people the server accepts it from.
 nonisolated struct AlbumContext: Equatable {
@@ -82,6 +89,7 @@ private struct ViewerConfirmationDialog<Actions: View>: ViewModifier {
 /// Owns the viewer's nonmodal information surface and any presentation that
 /// originates inside it. Keeping the album picker on this sheet avoids asking
 /// the underlying viewer controller to present through an existing sheet.
+/// used on regular width only, where the sheet floats over unchanged media.
 private struct AssetInformationSheet: View {
     private static let detent = PresentationDetent.fraction(
         AssetViewerPageLayout.informationSheetFraction
@@ -93,7 +101,6 @@ private struct AssetInformationSheet: View {
     let onAlbumAdded: (String) -> Void
     let onOpenPerson: (Person) -> Void
     let onOpenAlbum: (Album) -> Void
-    @Binding var presentationFrame: CGRect
 
     @State private var showAddToAlbum = false
     @State private var albumMembershipUpdate: AlbumMembershipUpdate?
@@ -116,14 +123,6 @@ private struct AssetInformationSheet: View {
         .presentationBackground(Color(uiColor: .systemBackground))
         .presentationBackgroundInteraction(.enabled(upThrough: Self.detent))
         .tint(.accentColor)
-        .onGeometryChange(for: CGRect.self) { geometry in
-            geometry.frame(in: .global)
-        } action: { frame in
-            presentationFrame = frame
-        }
-        .onDisappear {
-            presentationFrame = .zero
-        }
         .sheet(isPresented: $showAddToAlbum) {
             if let serverAssetID {
                 AddToAlbumSheet(
@@ -138,6 +137,379 @@ private struct AssetInformationSheet: View {
                     onDone: onAlbumAdded
                 )
             }
+        }
+    }
+}
+
+/// the compact-width information surface. it lives in the viewer's own
+/// hierarchy instead of a modal sheet so its presentation is a plain offset
+/// that a drag can drive frame by frame.
+private struct AssetInformationPanel: View {
+    @Environment(SessionStore.self) private var session
+
+    let asset: Asset
+    let serverAssetID: String?
+    let bottomInset: CGFloat
+    let onDateAdjusted: (String, Date, Double) -> Void
+    let onAlbumAdded: (String) -> Void
+    let onOpenPerson: (Person) -> Void
+    let onOpenAlbum: (Album) -> Void
+    let onPullDrag: (CGFloat) -> Void
+    let onPullEnd: (CGFloat) -> Void
+
+    @State private var showAddToAlbum = false
+    @State private var albumMembershipUpdate: AlbumMembershipUpdate?
+
+    var body: some View {
+        InformationSheetScrollView(
+            contentKey: contentKey,
+            bottomInset: bottomInset,
+            onPullDrag: onPullDrag,
+            onPullEnd: onPullEnd
+        ) {
+            AssetInfoPanel(
+                asset: asset,
+                onDateAdjusted: onDateAdjusted,
+                onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+                onOpenPerson: onOpenPerson,
+                onOpenAlbum: onOpenAlbum,
+                albumMembershipUpdate: albumMembershipUpdate
+            )
+            .padding(.top, 18)
+            // the hosted root does not inherit this screen's environment.
+            .environment(session)
+            .tint(.accentColor)
+        }
+        .sheet(isPresented: $showAddToAlbum) {
+            if let serverAssetID {
+                AddToAlbumSheet(
+                    assetIDs: [serverAssetID],
+                    onMembershipUpdate: { update in
+                        albumMembershipUpdate = AlbumMembershipUpdate(
+                            operationID: update.operationID,
+                            assetID: asset.id,
+                            change: update.change
+                        )
+                    },
+                    onDone: onAlbumAdded
+                )
+                // the viewer root tints white; this modal wants the accent.
+                .tint(.accentColor)
+            }
+        }
+    }
+
+    /// the hosted content re-renders only when this changes, so drag frames
+    /// that re-evaluate the screen never touch the info tree.
+    private var contentKey: String {
+        let membership = albumMembershipUpdate?.operationID.uuidString ?? ""
+        return "\(asset.id)|\(serverAssetID ?? "")|\(membership)|\(asset.fileCreatedAt.timeIntervalSince1970)"
+    }
+}
+
+/// uiscrollview host for the panel content that collaborates with the
+/// interactive presentation, photos style: a tracked pull past the top pins
+/// the content in place and routes the drag into the panel, pushing back up
+/// restores the panel to full before the content scrolls again - all inside
+/// one continuous gesture, with no rubber-band detour.
+private struct InformationSheetScrollView<Content: View>: UIViewRepresentable {
+    let contentKey: String
+    let bottomInset: CGFloat
+    let onPullDrag: (CGFloat) -> Void
+    let onPullEnd: (CGFloat) -> Void
+    @ViewBuilder let content: Content
+
+    func makeUIView(context: Context) -> UIScrollView {
+        let scrollView = UIScrollView()
+        scrollView.delegate = context.coordinator
+        scrollView.alwaysBounceVertical = true
+        scrollView.keyboardDismissMode = .interactive
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.backgroundColor = .clear
+
+        let hosted = context.coordinator.hostingController
+        hosted.view.backgroundColor = .clear
+        hosted.sizingOptions = .intrinsicContentSize
+        hosted.safeAreaRegions = []
+        hosted.view.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(hosted.view)
+        NSLayoutConstraint.activate([
+            hosted.view.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            hosted.view.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            hosted.view.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            hosted.view.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            hosted.view.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+        ])
+        scrollView.panGestureRecognizer.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.handlePan(_:))
+        )
+        context.coordinator.scrollView = scrollView
+        context.coordinator.observeKeyboard()
+        return scrollView
+    }
+
+    func updateUIView(_ scrollView: UIScrollView, context: Context) {
+        context.coordinator.onPullDrag = onPullDrag
+        context.coordinator.onPullEnd = onPullEnd
+        context.coordinator.restingBottomInset = bottomInset
+        context.coordinator.applyBottomInset()
+        guard context.coordinator.contentKey != contentKey else { return }
+        context.coordinator.contentKey = contentKey
+        context.coordinator.hostingController.rootView = content
+    }
+
+    static func dismantleUIView(_ scrollView: UIScrollView, coordinator: Coordinator) {
+        scrollView.delegate = nil
+        scrollView.panGestureRecognizer.removeTarget(coordinator, action: nil)
+        coordinator.stopObservingKeyboard()
+        coordinator.hostingController.view.removeFromSuperview()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            contentKey: contentKey,
+            content: content,
+            bottomInset: bottomInset,
+            onPullDrag: onPullDrag,
+            onPullEnd: onPullEnd
+        )
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        let hostingController: UIHostingController<Content>
+        var contentKey: String
+        var restingBottomInset: CGFloat
+        var onPullDrag: (CGFloat) -> Void
+        var onPullEnd: (CGFloat) -> Void
+        weak var scrollView: UIScrollView?
+
+        private var isPulling = false
+        private var pullStartTranslation: CGFloat = 0
+        private var keyboardOverlap: CGFloat = 0
+        private var keyboardObserver: NSObjectProtocol?
+
+        init(
+            contentKey: String,
+            content: Content,
+            bottomInset: CGFloat,
+            onPullDrag: @escaping (CGFloat) -> Void,
+            onPullEnd: @escaping (CGFloat) -> Void
+        ) {
+            self.contentKey = contentKey
+            hostingController = UIHostingController(rootView: content)
+            restingBottomInset = bottomInset
+            self.onPullDrag = onPullDrag
+            self.onPullEnd = onPullEnd
+        }
+
+        func applyBottomInset() {
+            guard let scrollView else { return }
+            let inset = max(restingBottomInset, keyboardOverlap)
+            guard scrollView.contentInset.bottom != inset else { return }
+            scrollView.contentInset.bottom = inset
+            scrollView.verticalScrollIndicatorInsets.bottom = inset
+        }
+
+        // MARK: - keyboard
+
+        /// the scroll view opts out of automatic adjustment, so the caption
+        /// field keeps its room above the keyboard through a manual inset.
+        func observeKeyboard() {
+            keyboardObserver = NotificationCenter.default.addObserver(
+                forName: UIResponder.keyboardWillChangeFrameNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] note in
+                let endFrame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?
+                    .cgRectValue
+                MainActor.assumeIsolated {
+                    guard let self, let scrollView = self.scrollView,
+                          scrollView.window != nil, let endFrame
+                    else { return }
+                    let local = scrollView.convert(endFrame, from: nil)
+                    self.keyboardOverlap = max(0, scrollView.bounds.maxY - local.minY)
+                    self.applyBottomInset()
+                }
+            }
+        }
+
+        func stopObservingKeyboard() {
+            if let keyboardObserver { NotificationCenter.default.removeObserver(keyboardObserver) }
+            keyboardObserver = nil
+        }
+
+        // MARK: - pull collaboration
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            if !isPulling, scrollView.isTracking, scrollView.contentOffset.y < 0 {
+                // the finger pulled past the top: the panel takes over.
+                isPulling = true
+                pullStartTranslation = scrollView.panGestureRecognizer.translation(in: scrollView).y
+            }
+            if isPulling, scrollView.contentOffset.y != 0 {
+                scrollView.contentOffset.y = 0
+            }
+        }
+
+        func scrollViewWillEndDragging(
+            _ scrollView: UIScrollView,
+            withVelocity velocity: CGPoint,
+            targetContentOffset: UnsafeMutablePointer<CGPoint>
+        ) {
+            // a release that was driving the panel must not also decelerate
+            // the pinned content.
+            if isPulling { targetContentOffset.pointee = .zero }
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard let scrollView else { return }
+            switch recognizer.state {
+            case .changed:
+                guard isPulling else { return }
+                let delta = recognizer.translation(in: scrollView).y - pullStartTranslation
+                if delta <= 0 {
+                    // pushed back to fully open: the panel settles and the
+                    // content scrolls again from exactly here.
+                    isPulling = false
+                    onPullDrag(0)
+                    onPullEnd(0)
+                } else {
+                    onPullDrag(delta)
+                }
+            case .ended:
+                guard isPulling else { return }
+                isPulling = false
+                onPullEnd(recognizer.velocity(in: scrollView).y)
+            case .cancelled, .failed:
+                guard isPulling else { return }
+                isPulling = false
+                onPullEnd(0)
+            default:
+                break
+            }
+        }
+    }
+}
+
+/// invisible anchor that installs one vertical pan on the viewer's root
+/// view. other pans in the viewer wait for it to fail, so a claimed vertical
+/// drag can never page the horizontal strip sideways at the same time, while
+/// refused directions fail at the recognition threshold and hand the touch
+/// straight back to paging, zooming or dismissal.
+private struct ViewerInfoPanRecognizer: UIViewRepresentable {
+    let shouldBegin: (CGPoint, CGPoint) -> Bool
+    let onChanged: (CGFloat) -> Void
+    let onEnded: (CGFloat) -> Void
+
+    func makeUIView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        view.isUserInteractionEnabled = false
+        view.coordinator = context.coordinator
+        return view
+    }
+
+    func updateUIView(_ view: AnchorView, context: Context) {
+        context.coordinator.shouldBegin = shouldBegin
+        context.coordinator.onChanged = onChanged
+        context.coordinator.onEnded = onEnded
+        view.coordinator = context.coordinator
+        context.coordinator.attachIfNeeded(from: view)
+    }
+
+    static func dismantleUIView(_ view: AnchorView, coordinator: Coordinator) {
+        coordinator.detach()
+        view.coordinator = nil
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(shouldBegin: shouldBegin, onChanged: onChanged, onEnded: onEnded)
+    }
+
+    final class AnchorView: UIView {
+        weak var coordinator: Coordinator?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            coordinator?.attachIfNeeded(from: self)
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var shouldBegin: (CGPoint, CGPoint) -> Bool
+        var onChanged: (CGFloat) -> Void
+        var onEnded: (CGFloat) -> Void
+
+        private var pan: UIPanGestureRecognizer?
+        private weak var host: UIView?
+
+        init(
+            shouldBegin: @escaping (CGPoint, CGPoint) -> Bool,
+            onChanged: @escaping (CGFloat) -> Void,
+            onEnded: @escaping (CGFloat) -> Void
+        ) {
+            self.shouldBegin = shouldBegin
+            self.onChanged = onChanged
+            self.onEnded = onEnded
+        }
+
+        func attachIfNeeded(from anchor: AnchorView) {
+            guard anchor.window != nil else {
+                detach()
+                return
+            }
+            // the nearest controller-backed ancestor spans the whole viewer
+            // content. toolbars and pushed destinations live outside it, so
+            // their touches never reach this recognizer.
+            var responder: UIResponder? = anchor.next
+            while let current = responder, !(current is UIViewController) {
+                responder = current.next
+            }
+            guard let target = (responder as? UIViewController)?.view else { return }
+            if host === target, pan != nil { return }
+            detach()
+            let recognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+            recognizer.maximumNumberOfTouches = 1
+            recognizer.delegate = self
+            target.addGestureRecognizer(recognizer)
+            pan = recognizer
+            host = target
+        }
+
+        func detach() {
+            if let pan { pan.view?.removeGestureRecognizer(pan) }
+            pan = nil
+            host = nil
+        }
+
+        @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard let host else { return }
+            switch recognizer.state {
+            case .began:
+                recognizer.setTranslation(.zero, in: host)
+            case .changed:
+                onChanged(recognizer.translation(in: host).y)
+            case .ended:
+                onEnded(recognizer.velocity(in: host).y)
+            case .cancelled, .failed:
+                onEnded(0)
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = recognizer as? UIPanGestureRecognizer, let host else { return false }
+            return shouldBegin(pan.velocity(in: host), pan.location(in: host))
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            otherGestureRecognizer is UIPanGestureRecognizer
         }
     }
 }
@@ -177,7 +549,23 @@ struct AssetViewerScreen: View {
     @State private var selectedAssetID: String?
     @State private var chromeVisible = true
     @State private var showInfo = false
-    @State private var informationSheetFrame = CGRect.zero
+    /// compact-width information presentation, 0 hidden through 1 presented.
+    /// a drag writes it directly so the panel and the media track the finger.
+    @State private var infoProgress: CGFloat = 0
+    /// progress at the moment the active drag claimed the transition, nil
+    /// while no drag drives it.
+    @State private var infoDragBase: CGFloat?
+    /// true while a release or toggle animation is still moving the panel.
+    /// keeps the panel mounted through a closing settle and marks that the
+    /// on-screen value differs from the settled state.
+    @State private var infoSettling = false
+    @State private var infoSettleGeneration: UInt64 = 0
+    /// the panel's actual on-screen progress, read back from geometry every
+    /// frame. a drag that begins mid-settle starts from here so it catches
+    /// the panel where it visually is, without a jump.
+    @State private var panelObservedProgress: CGFloat = 0
+    /// full-bleed viewport mirrored from the media stage geometry.
+    @State private var viewport = ViewerViewport()
     @State private var informationNavigationPath: [AssetInformationDestination] = []
     @State private var pendingInformationDestination: AssetInformationDestination?
     @State private var showAddToAlbum = false
@@ -282,44 +670,40 @@ struct AssetViewerScreen: View {
 
     private var core: some View {
         NavigationStack(path: $informationNavigationPath) {
-            GeometryReader { geometry in
-                let pageLayout = AssetViewerPageLayout(
-                    viewportHeight: geometry.size.height,
-                    viewportWidth: geometry.size.width
-                )
-                let informationMediaHeight = pageLayout.mediaHeight(
-                    forInformationSheet: informationSheetFrame,
-                    compactWidth: horizontalSizeClass != .regular
-                )
+            ZStack(alignment: .bottom) {
+                GeometryReader { geometry in
+                    mediaStage(size: geometry.size)
+                        .onGeometryChange(for: ViewerViewport.self) { proxy in
+                            ViewerViewport(
+                                size: proxy.size,
+                                bottomInset: proxy.safeAreaInsets.bottom
+                            )
+                        } action: { viewport = $0 }
+                }
+                .ignoresSafeArea()
+                .safeAreaBar(edge: .bottom) {
+                    if !isContextPreview, chromeVisible, !showInfo,
+                       infoDragBase == nil, infoProgress == 0, let current,
+                       current.isVideo, playback.ownerID == current.id, playback.player != nil {
+                        VideoControlsBar(playback: playback)
+                            .padding(.bottom, 4)
+                            .transition(.opacity)
+                    }
+                }
 
-                mediaStage
-                    .frame(
-                        width: geometry.size.width,
-                        height: showInfo ? informationMediaHeight : pageLayout.mediaHeight
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .background(Color(uiColor: chromeVisible ? .systemBackground : .black))
-                    .animation(
-                        reduceMotion ? nil : .smooth(duration: 0.35),
-                        value: showInfo
-                    )
-            }
-            .ignoresSafeArea()
-            .safeAreaBar(edge: .bottom) {
-                if !isContextPreview, chromeVisible, !showInfo, let current,
-                   current.isVideo, playback.ownerID == current.id, playback.player != nil {
-                    VideoControlsBar(playback: playback)
-                        .padding(.bottom, 4)
-                        .transition(.opacity)
+                if horizontalSizeClass != .regular {
+                    informationPanel
                 }
             }
             .toolbar { toolbarContent }
             .toolbarVisibility(
-                !isContextPreview && chromeVisible && !showInfo ? .visible : .hidden,
+                !isContextPreview && chromeVisible && !showInfo && infoDragBase == nil
+                    ? .visible : .hidden,
                 for: .navigationBar
             )
             .toolbarVisibility(
-                !isContextPreview && chromeVisible && !showInfo ? .visible : .hidden,
+                !isContextPreview && chromeVisible && !showInfo && infoDragBase == nil
+                    ? .visible : .hidden,
                 for: .bottomBar
             )
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar, .bottomBar)
@@ -332,8 +716,7 @@ struct AssetViewerScreen: View {
                     .toolbarBackgroundVisibility(.automatic, for: .navigationBar)
                     .toolbarColorScheme(nil, for: .navigationBar)
             }
-            .onChange(of: showInfo, initial: true) { _, isVisible in
-                if !isVisible { informationSheetFrame = .zero }
+            .onChange(of: showInfo, initial: true) { _, _ in
                 reportMediaAtTop()
             }
             .onChange(of: informationNavigationPath) {
@@ -341,6 +724,11 @@ struct AssetViewerScreen: View {
             }
             .onChange(of: pendingInformationDestination) {
                 reportMediaAtTop()
+            }
+            .onChange(of: horizontalSizeClass) {
+                // presentation style swaps with the size class, so the panel
+                // progress resyncs to whichever surface owns information now.
+                infoProgress = showInfo && horizontalSizeClass != .regular ? 1 : 0
             }
         }
         .statusBarHidden(isContextPreview || !chromeVisible)
@@ -363,20 +751,15 @@ struct AssetViewerScreen: View {
             onPageZoomChanged(false)
             onDismissed()
         }
-        .sheet(isPresented: $showInfo, onDismiss: openPendingInformationDestination) {
+        .sheet(isPresented: regularInformationPresented, onDismiss: openPendingInformationDestination) {
             if let current {
                 AssetInformationSheet(
                     asset: current,
                     serverAssetID: serverAssetID,
-                    onDateAdjusted: { assetID, fileCreatedAt, offsetHours in
-                        guard let index = assets.firstIndex(where: { $0.id == assetID }) else { return }
-                        assets[index].fileCreatedAt = fileCreatedAt
-                        assets[index].localOffsetHours = offsetHours
-                    },
+                    onDateAdjusted: applyDateAdjustment,
                     onAlbumAdded: { toast = $0 },
                     onOpenPerson: { queueInformationDestination(.person($0)) },
-                    onOpenAlbum: { queueInformationDestination(.album($0)) },
-                    presentationFrame: $informationSheetFrame
+                    onOpenAlbum: { queueInformationDestination(.album($0)) }
                 )
             }
         }
@@ -452,7 +835,7 @@ struct AssetViewerScreen: View {
         }
     }
 
-    private var mediaStage: some View {
+    private func mediaStage(size: CGSize) -> some View {
         ZStack {
             Color(uiColor: chromeVisible ? .systemBackground : .black)
                 .accessibilityIdentifier("asset-viewer")
@@ -463,7 +846,8 @@ struct AssetViewerScreen: View {
                 selection: $selectedAssetID,
                 mutesVideo: isContextPreview,
                 playback: playback,
-                mediaLayoutMode: AssetViewerMediaLayoutMode(informationPresented: showInfo),
+                infoProgress: horizontalSizeClass == .regular ? 0 : infoProgress,
+                viewport: size,
                 optimisticEdits: optimisticEdits,
                 editCacheKeys: editCacheKeys
             ) { id, isZoomed in
@@ -473,11 +857,27 @@ struct AssetViewerScreen: View {
             }
             .scrollEdgeEffectHidden(true, for: .top)
             .onTapGesture {
+                // photos closes an open information panel from a tap on the
+                // media before anything else.
+                if horizontalSizeClass != .regular, showInfo {
+                    setInfoVisible(false)
+                    return
+                }
                 withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
                     chromeVisible.toggle()
                 }
             }
-            .simultaneousGesture(swipeUpForInfo)
+            .simultaneousGesture(infoSwipeGesture)
+
+            // compact width drives the information transition through this
+            // exclusive uikit pan instead of a swiftui gesture.
+            ViewerInfoPanRecognizer(
+                shouldBegin: shouldBeginInfoPan,
+                onChanged: { driveInfoDrag(translationY: $0) },
+                onEnded: { endInfoDrag(velocityY: $0) }
+            )
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
 
             AirPlayRoutePicker(trigger: $airPlayTrigger)
                 .frame(width: 1, height: 1)
@@ -517,13 +917,43 @@ struct AssetViewerScreen: View {
         guard showInfo != visible else { return }
         guard !visible || !currentPageZoomed else { return }
         showInfo = visible
+        guard horizontalSizeClass != .regular else { return }
+        animateInfo(
+            to: visible ? 1 : 0,
+            animation: reduceMotion ? .linear(duration: 0.15) : .smooth(duration: 0.35)
+        )
+    }
+
+    /// the native floating sheet serves regular width only. compact width
+    /// renders the in-hierarchy panel instead.
+    private var regularInformationPresented: Binding<Bool> {
+        Binding(
+            get: { showInfo && horizontalSizeClass == .regular },
+            set: { value in
+                showInfo = value
+                if !value { infoProgress = 0 }
+            }
+        )
+    }
+
+    private func applyDateAdjustment(_ assetID: String, _ fileCreatedAt: Date, _ offsetHours: Double) {
+        guard let index = assets.firstIndex(where: { $0.id == assetID }) else { return }
+        assets[index].fileCreatedAt = fileCreatedAt
+        assets[index].localOffsetHours = offsetHours
     }
 
     private func queueInformationDestination(_ destination: AssetInformationDestination) {
-        pendingInformationDestination = destination
         chromeVisible = true
-        onMediaAtTopChanged(false)
-        showInfo = false
+        if horizontalSizeClass == .regular {
+            pendingInformationDestination = destination
+            onMediaAtTopChanged(false)
+            showInfo = false
+        } else {
+            // the panel is part of this hierarchy, so the destination pushes
+            // right over it and pops back to it intact.
+            informationNavigationPath.append(destination)
+            reportMediaAtTop()
+        }
     }
 
     private func openPendingInformationDestination() {
@@ -536,9 +966,78 @@ struct AssetViewerScreen: View {
     private func reportMediaAtTop() {
         onMediaAtTopChanged(
             !showInfo
+                && infoProgress == 0
+                && infoDragBase == nil
                 && pendingInformationDestination == nil
                 && informationNavigationPath.isEmpty
         )
+    }
+
+    // MARK: - interactive information transition
+
+    /// fluid-interfaces mechanics: the drag maps one to one onto the panel's
+    /// travel, release projects the momentum to pick a side and the settle
+    /// spring inherits the finger's velocity, so the surface tracks in real
+    /// time and can be caught mid-flight without a jump.
+
+    private func driveInfoDrag(translationY: CGFloat) {
+        guard viewport.size.height > 0 else { return }
+        let travel = AssetViewerPageLayout.informationPanelTravel(viewportHeight: viewport.size.height)
+        if infoDragBase == nil {
+            // a settling panel is grabbed where it visually is, an at-rest
+            // one at its settled state. the claim is animated so chrome and
+            // video controls fade away while tracking begins - the tracking
+            // writes themselves stay unanimated to follow the finger exactly.
+            let base = infoSettling ? min(1, max(0, panelObservedProgress)) : infoProgress
+            infoSettleGeneration &+= 1
+            infoSettling = false
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                infoDragBase = base
+            }
+            reportMediaAtTop()
+        }
+        guard let base = infoDragBase else { return }
+        var transaction = Transaction()
+        transaction.isContinuous = true
+        withTransaction(transaction) {
+            infoProgress = min(1, max(0, base - translationY / travel))
+        }
+    }
+
+    private func endInfoDrag(velocityY: CGFloat) {
+        guard infoDragBase != nil, viewport.size.height > 0 else { return }
+        infoDragBase = nil
+        let travel = AssetViewerPageLayout.informationPanelTravel(viewportHeight: viewport.size.height)
+        let progressVelocity = -velocityY / travel
+        // where the finger's momentum would coast to with the standard
+        // scroll deceleration rate decides the resting side.
+        let projected = infoProgress + progressVelocity * 0.499
+        let target: CGFloat = projected > 0.5 ? 1 : 0
+        let delta = target - infoProgress
+        let initialVelocity = abs(delta) > 0.001 ? max(-30, min(30, progressVelocity / delta)) : 0
+        showInfo = target == 1
+        animateInfo(
+            to: target,
+            animation: reduceMotion
+                ? .linear(duration: 0.15)
+                : .interpolatingSpring(stiffness: 320, damping: 32, initialVelocity: initialVelocity)
+        )
+        reportMediaAtTop()
+    }
+
+    /// animated settle with completion bookkeeping. the generation guards
+    /// against an interrupted settle clearing the flag of the one that
+    /// replaced it.
+    private func animateInfo(to target: CGFloat, animation: Animation?) {
+        infoSettleGeneration &+= 1
+        let generation = infoSettleGeneration
+        infoSettling = true
+        withAnimation(animation) {
+            infoProgress = target
+        } completion: {
+            guard infoSettleGeneration == generation else { return }
+            infoSettling = false
+        }
     }
 
     @ViewBuilder private func informationDestinationView(
@@ -568,11 +1067,33 @@ struct AssetViewerScreen: View {
         }
     }
 
-    /// Photos-style upward swipe reveals the native information surface while
-    /// horizontal movement remains available to the asset pager.
-    private var swipeUpForInfo: some Gesture {
+    /// gate for the exclusive media pan: a clearly vertical drag on the
+    /// unobstructed media, pointing somewhere the transition can go. refused
+    /// pans fail instantly and leave paging, zooming and dismissal untouched.
+    private func shouldBeginInfoPan(velocity: CGPoint, location: CGPoint) -> Bool {
+        guard horizontalSizeClass != .regular, !isContextPreview else { return false }
+        guard !currentPageZoomed, informationNavigationPath.isEmpty else { return false }
+        let height = viewport.size.height
+        guard height > 0 else { return false }
+        guard abs(velocity.y) > abs(velocity.x) else { return false }
+        let travel = AssetViewerPageLayout.informationPanelTravel(viewportHeight: height)
+        let progress = infoSettling ? min(1, max(0, panelObservedProgress)) : infoProgress
+        // the panel owns everything below its top edge through its own
+        // scroll collaboration and grabber.
+        guard location.y < height - travel * progress else { return false }
+        if showInfo || infoProgress > 0 {
+            return velocity.y > 0
+        }
+        return velocity.y < 0
+    }
+
+    /// regular width keeps the original swipe-to-open commit - the floating
+    /// sheet cannot track a finger there. compact width is driven by the
+    /// exclusive uikit pan instead.
+    private var infoSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 30)
             .onEnded { value in
+                guard horizontalSizeClass == .regular else { return }
                 guard !currentPageZoomed, !showInfo else { return }
                 let upwardDistance = -value.translation.height
                 guard upwardDistance > 60,
@@ -580,6 +1101,64 @@ struct AssetViewerScreen: View {
                 else { return }
                 setInfoVisible(true)
             }
+    }
+
+    /// compact information surface pinned under the media stage. its offset,
+    /// the media transform and the panel geometry all derive from the same
+    /// progress value, so the two views adapt together frame by frame.
+    @ViewBuilder private var informationPanel: some View {
+        let travel = AssetViewerPageLayout.informationPanelTravel(viewportHeight: viewport.size.height)
+        let panelVisible = showInfo || infoDragBase != nil || infoProgress > 0 || infoSettling
+        if panelVisible, viewport.size.height > 0, let current {
+            AssetInformationPanel(
+                asset: current,
+                serverAssetID: serverAssetID,
+                bottomInset: viewport.bottomInset,
+                onDateAdjusted: applyDateAdjustment,
+                onAlbumAdded: { toast = $0 },
+                onOpenPerson: { queueInformationDestination(.person($0)) },
+                onOpenAlbum: { queueInformationDestination(.album($0)) },
+                onPullDrag: { driveInfoDrag(translationY: $0) },
+                onPullEnd: { endInfoDrag(velocityY: $0) }
+            )
+            .frame(height: travel, alignment: .top)
+            .frame(maxWidth: .infinity)
+            .background(Color(uiColor: .systemBackground))
+            .clipShape(.rect(topLeadingRadius: 24, topTrailingRadius: 24))
+            .shadow(color: .black.opacity(0.18), radius: 16, y: -2)
+            .overlay(alignment: .top) { informationGrabber }
+            // measured inside the offset effect, which applies to descendant
+            // geometry frame by frame even mid-animation. a new drag reads
+            // this back to catch a settling panel where it actually is.
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.frame(in: .global).minY
+            } action: { top in
+                guard travel > 0 else { return }
+                let observed = (viewport.size.height - top) / travel
+                panelObservedProgress = observed < 0.004 ? 0 : min(1, observed)
+            }
+            .offset(y: viewport.bottomInset + travel * (1 - infoProgress))
+        }
+    }
+
+    /// grabber strip along the panel's top edge. dragging it drives the same
+    /// transition the media drag does, in either direction.
+    private var informationGrabber: some View {
+        Capsule()
+            .fill(.tertiary)
+            .frame(width: 36, height: 5)
+            .frame(maxWidth: .infinity)
+            .frame(height: 26, alignment: .center)
+            .contentShape(.rect)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        driveInfoDrag(translationY: value.translation.height)
+                    }
+                    .onEnded { value in
+                        endInfoDrag(velocityY: value.velocity.height)
+                    }
+            )
     }
 
     // MARK: - chrome
@@ -1512,7 +2091,8 @@ private struct AssetPager: View {
     @Binding var selection: String?
     let mutesVideo: Bool
     let playback: VideoPlayback
-    let mediaLayoutMode: AssetViewerMediaLayoutMode
+    let infoProgress: CGFloat
+    let viewport: CGSize
     let optimisticEdits: [String: AssetEditProjection]
     let editCacheKeys: [String: String]
     let onZoomChanged: (String, Bool) -> Void
@@ -1526,7 +2106,8 @@ private struct AssetPager: View {
                         isActive: asset.id == selection,
                         mutesVideo: mutesVideo,
                         playback: playback,
-                        mediaLayoutMode: mediaLayoutMode,
+                        infoProgress: infoProgress,
+                        viewport: viewport,
                         optimisticEdit: optimisticEdits[asset.id],
                         editCacheKey: editCacheKeys[asset.id]
                     ) { isZoomed in
@@ -1552,7 +2133,8 @@ private struct AssetPage: View {
     let isActive: Bool
     let mutesVideo: Bool
     let playback: VideoPlayback
-    let mediaLayoutMode: AssetViewerMediaLayoutMode
+    let infoProgress: CGFloat
+    let viewport: CGSize
     let optimisticEdit: AssetEditProjection?
     let editCacheKey: String?
     let onZoomChanged: (Bool) -> Void
@@ -1574,21 +2156,31 @@ private struct AssetPage: View {
         // selection instead built the hosting controller mid-swipe, which is
         // exactly when a stall shows. kept transparent so the screen backdrop
         // still fades during drag dismiss.
+        // the information transition is a pure transform of the fit-rendered
+        // page, never a relayout or content swap, so it can run every frame
+        // of a drag without flicker.
+        let transform = AssetViewerPageLayout.mediaTransform(
+            ratio: asset.ratio,
+            viewport: viewport,
+            progress: infoProgress
+        )
         ZStack {
             Color.clear
             pageContent
         }
+        .scaleEffect(transform.scale)
+        .offset(y: transform.offsetY)
     }
 
     @ViewBuilder private var pageContent: some View {
         if let optimisticEdit, let image = UIImage(data: optimisticEdit.imageData) {
             ZoomableScrollView(
-                contentID: "\(asset.id)#edit-\(optimisticEdit.operationID)#\(mediaLayoutMode.rawValue)",
+                contentID: "\(asset.id)#edit-\(optimisticEdit.operationID)",
                 onZoomChanged: onZoomChanged
             ) {
                 Image(uiImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: mediaLayoutMode.swiftUIContentMode)
+                    .aspectRatio(contentMode: .fit)
             }
         } else if asset.isVideo {
             VideoPlayerPage(
@@ -1597,19 +2189,18 @@ private struct AssetPage: View {
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
-                mediaLayoutMode: mediaLayoutMode,
                 onZoomChanged: onZoomChanged
             )
         } else if let localId = deviceIdentifier {
             ZoomableScrollView(
-                contentID: "\(asset.id)#\(mediaLayoutMode.rawValue)",
+                contentID: asset.id,
                 onZoomChanged: onZoomChanged
             ) {
                 LocalPhotoImage(
                     localIdentifier: localId,
                     targetPixelSize: pagePixelSize,
                     fallbackTargetPixelSize: 640,
-                    contentMode: mediaLayoutMode.swiftUIContentMode,
+                    contentMode: .fit,
                     onUnavailable: { localUnavailable = true }
                 )
             }
@@ -1617,7 +2208,7 @@ private struct AssetPage: View {
             // the thumbhash cache key re-renders the page when edits land.
             let cacheKey = editCacheKey ?? asset.thumbhash
             ZoomableScrollView(
-                contentID: "\(asset.id)#\(cacheKey ?? "")#\(mediaLayoutMode.rawValue)",
+                contentID: "\(asset.id)#\(cacheKey ?? "")",
                 onZoomChanged: onZoomChanged
             ) {
                 RemoteImage(
@@ -1626,18 +2217,9 @@ private struct AssetPage: View {
                     thumbhash: asset.thumbhash,
                     fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
                     fallbackTargetPixelSize: 640,
-                    contentMode: mediaLayoutMode.swiftUIContentMode
+                    contentMode: .fit
                 )
             }
-        }
-    }
-}
-
-extension AssetViewerMediaLayoutMode {
-    var swiftUIContentMode: ContentMode {
-        switch self {
-        case .fit: .fit
-        case .fill: .fill
         }
     }
 }

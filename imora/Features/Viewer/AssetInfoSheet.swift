@@ -78,11 +78,28 @@ struct AssetInfoPanel: View {
     @State private var personNameDraft = ""
     @State private var personNameOverrides: [String: String] = [:]
     @State private var renamingPersonIDs: Set<String> = []
+    @State private var peopleByAsset: [String: [Person]] = [:]
+    @State private var peopleMutations = AssetOptimisticField<[Person]>()
+    @State private var showAddPeople = false
+    @State private var removingPerson: Person?
     @FocusState private var descriptionFocused: Bool
 
     private var savedDescription: String { captionsByAsset[asset.id] ?? "" }
     private var rating: Int { ratingsByAsset[asset.id] ?? 0 }
     private var albums: [Album] { albumsByAsset[asset.id] ?? [] }
+
+    /// People shown for the current asset: the optimistic projection when one
+    /// exists, otherwise the loaded detail's visible people.
+    private var displayedPeople: [Person] {
+        peopleByAsset[asset.id] ?? detail?.people?.filter { $0.isHidden != true } ?? []
+    }
+
+    /// Manual tagging talks to the server, so it needs an owned server asset
+    /// and the people section enabled.
+    private var canTagPeople: Bool {
+        isOwner && !asset.isLocal && session.client != nil
+            && session.preferences?.peopleEnabled != false
+    }
 
     /// Mutations are for the signed-in owner only; unknown user counts as
     /// owner so an offline session stays usable.
@@ -138,6 +155,11 @@ struct AssetInfoPanel: View {
                         submitLocation(AssetCoordinateValue(coordinate), for: asset.id)
                     }
                 )
+            }
+        }
+        .sheet(isPresented: $showAddPeople) {
+            FaceTagSheet(asset: asset) { person, region in
+                submitTagPerson(person, region: region, for: asset.id)
             }
         }
         .alert("Name", isPresented: Binding(
@@ -239,7 +261,7 @@ struct AssetInfoPanel: View {
     @ViewBuilder private func detailContent(_ detail: AssetDetail) -> some View {
         captionSection
         sectionDivider
-        peopleSection(detail.people?.filter { $0.isHidden != true } ?? [])
+        peopleSection(displayedPeople)
         sectionDivider
         detailsSection(detail)
         sectionDivider
@@ -435,21 +457,64 @@ struct AssetInfoPanel: View {
     private func peopleSection(_ people: [Person]) -> some View {
         infoSection("People") {
             if people.isEmpty {
-                emptyState(
-                    systemImage: "person.crop.circle.badge.questionmark",
-                    title: "No People",
-                    message: peopleEmptyMessage
-                )
+                VStack(alignment: .leading, spacing: 14) {
+                    emptyState(
+                        systemImage: "person.crop.circle.badge.questionmark",
+                        title: "No People",
+                        message: peopleEmptyMessage
+                    )
+
+                    if canTagPeople {
+                        Button {
+                            showAddPeople = true
+                        } label: {
+                            Label("Add People", systemImage: "plus.circle.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.tint)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("info-add-person")
+                    }
+                }
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 14) {
                         ForEach(people) { person in
                             personCell(person)
                         }
+
+                        if canTagPeople {
+                            addPersonCell
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Trailing tile of the people strip that opens the tagging sheet.
+    private var addPersonCell: some View {
+        Button {
+            showAddPeople = true
+        } label: {
+            VStack(spacing: 6) {
+                Circle()
+                    .fill(.quaternary)
+                    .frame(width: 72, height: 72)
+                    .overlay {
+                        Image(systemName: "plus")
+                            .font(.system(size: 22, weight: .medium))
+                            .foregroundStyle(.tint)
+                    }
+                Text("Add")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.tint)
+                    .lineLimit(1)
+            }
+            .frame(width: 84)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("info-add-person")
     }
 
     private var peopleEmptyMessage: String {
@@ -473,7 +538,7 @@ struct AssetInfoPanel: View {
             }
         } label: {
             VStack(spacing: 6) {
-                if let client = session.client {
+                if let client = session.client, !person.isPending {
                     RemoteImage(
                         url: client.personThumbnailURL(personID: person.id),
                         targetPixelSize: 160
@@ -510,17 +575,41 @@ struct AssetInfoPanel: View {
             .frame(width: 84)
         }
         .buttonStyle(.plain)
-        .disabled(renamingPersonIDs.contains(person.id))
+        .disabled(renamingPersonIDs.contains(person.id) || person.isPending)
         .accessibilityIdentifier("info-person-\(person.id)")
         .contextMenu {
-            if isOwner {
+            if isOwner, !person.isPending {
                 Button {
                     personNameDraft = person.name
                     renamingPerson = person
                 } label: {
                     Label(person.name.isEmpty ? "Add a Name" : "Rename", systemImage: "pencil")
                 }
+
+                if canTagPeople {
+                    Button(role: .destructive) {
+                        removingPerson = person
+                    } label: {
+                        Label("Remove from This Item", systemImage: "person.badge.minus")
+                    }
+                }
             }
+        }
+        // The iOS 26 dialog morphs out of its presenting control, so the
+        // attachment lives on each cell and only the matching one presents.
+        .confirmationDialog(
+            person.name.isEmpty ? "Remove This Person?" : "Remove \(person.name)?",
+            isPresented: Binding(
+                get: { removingPerson?.id == person.id },
+                set: { if !$0, removingPerson?.id == person.id { removingPerson = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) {
+                submitRemovePerson(person, for: asset.id)
+            }
+        } message: {
+            Text("This person's tag will be removed from this item.")
         }
     }
 
@@ -558,6 +647,70 @@ struct AssetInfoPanel: View {
             personNameOverrides[person.id] = previous
             ErrorToastCenter.shared.show("Couldn’t rename this person", error: error)
         }
+    }
+
+    /// Tags one person at the face region chosen in the tag sheet. A pending
+    /// person is created on the server first, then the face row is stored.
+    private func submitTagPerson(_ person: Person, region: FaceRegion, for assetID: String) {
+        guard let client = session.client else { return }
+        let current = displayedPeople
+        let isNewPerson = !current.contains { $0.id == person.id }
+        // A person already on the asset can gain a second face region; the
+        // visible list only changes for a new person.
+        let desired = isNewPerson ? current + [person] : current
+
+        peopleMutations.submit(
+            assetID: assetID,
+            current: current,
+            desired: desired,
+            errorMessage: "Couldn’t tag this person",
+            apply: { id, value in peopleByAsset[id] = value },
+            request: { projected in
+                var kept = projected
+                var resolved = person
+                if person.isPending {
+                    resolved = try await client.createPerson(name: person.name)
+                }
+                try await client.createFace(
+                    assetID: assetID,
+                    personID: resolved.id,
+                    imageWidth: region.imageWidth,
+                    imageHeight: region.imageHeight,
+                    x: region.x,
+                    y: region.y,
+                    width: region.width,
+                    height: region.height
+                )
+                // Swap the pending placeholder for the server person.
+                if let index = kept.firstIndex(where: { $0.id == person.id }) {
+                    kept[index] = resolved
+                }
+                return kept
+            }
+        )
+    }
+
+    /// Untags a person by deleting every face row of theirs on this asset.
+    private func submitRemovePerson(_ person: Person, for assetID: String) {
+        guard let client = session.client else { return }
+        let current = displayedPeople
+        let desired = current.filter { $0.id != person.id }
+        guard desired.count != current.count else { return }
+
+        peopleMutations.submit(
+            assetID: assetID,
+            current: current,
+            desired: desired,
+            errorMessage: "Couldn’t remove this person",
+            apply: { id, value in peopleByAsset[id] = value },
+            request: { projected in
+                let faces = try await client.assetFaces(assetID: assetID)
+                for face in faces where face.person?.id == person.id {
+                    try await client.deleteFace(id: face.id)
+                }
+                return projected
+            }
+        )
     }
 
     // MARK: - Location
@@ -1127,6 +1280,7 @@ struct AssetInfoPanel: View {
         let captionSnapshot = captionMutations.loadSnapshot(for: assetID)
         let ratingSnapshot = ratingMutations.loadSnapshot(for: assetID)
         let locationSnapshot = locationMutations.loadSnapshot(for: assetID)
+        let peopleSnapshot = peopleMutations.loadSnapshot(for: assetID)
         let albumRevision = albumRevisions[assetID, default: 0]
 
         // Device-only assets answer from PhotoKit. Server concepts remain as
@@ -1160,7 +1314,8 @@ struct AssetInfoPanel: View {
                 assetID: assetID,
                 captionSnapshot: captionSnapshot,
                 ratingSnapshot: ratingSnapshot,
-                locationSnapshot: locationSnapshot
+                locationSnapshot: locationSnapshot,
+                peopleSnapshot: peopleSnapshot
             )
 
             let loaded = (try? await client.albums(assetID: assetID)) ?? []
@@ -1191,7 +1346,8 @@ struct AssetInfoPanel: View {
                     assetID: assetID,
                     captionSnapshot: captionSnapshot,
                     ratingSnapshot: ratingSnapshot,
-                    locationSnapshot: locationSnapshot
+                    locationSnapshot: locationSnapshot,
+                    peopleSnapshot: peopleSnapshot
                 )
                 if albumRevisions[assetID, default: 0] == albumRevision {
                     albumsByAsset[assetID] = cached.albums
@@ -1207,7 +1363,8 @@ struct AssetInfoPanel: View {
         assetID: String,
         captionSnapshot: AssetOptimisticField<String>.LoadSnapshot,
         ratingSnapshot: AssetOptimisticField<Int>.LoadSnapshot,
-        locationSnapshot: AssetOptimisticField<AssetCoordinateValue?>.LoadSnapshot
+        locationSnapshot: AssetOptimisticField<AssetCoordinateValue?>.LoadSnapshot,
+        peopleSnapshot: AssetOptimisticField<[Person]>.LoadSnapshot
     ) {
         if captionMutations.canAdoptServerValue(for: assetID, since: captionSnapshot) {
             let serverValue = detail.exifInfo?.description ?? ""
@@ -1231,6 +1388,12 @@ struct AssetInfoPanel: View {
             locationMutations.adoptServerValue(serverValue, for: assetID)
             canonicalLocationsByAsset[assetID] = serverValue
             locationsByAsset[assetID] = serverValue
+        }
+
+        if peopleMutations.canAdoptServerValue(for: assetID, since: peopleSnapshot) {
+            let serverValue = detail.people?.filter { $0.isHidden != true } ?? []
+            peopleMutations.adoptServerValue(serverValue, for: assetID)
+            peopleByAsset[assetID] = serverValue
         }
     }
 }
