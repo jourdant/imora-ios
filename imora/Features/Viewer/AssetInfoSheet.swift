@@ -36,8 +36,13 @@ private extension Person {
 /// The presenting screen owns the vertical scroll view and sheet behavior.
 struct AssetInfoPanel: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let asset: Asset
+    /// The regular-width sheet retains an explicit title. Compact inline
+    /// presentations can omit it because the surrounding viewer flow already
+    /// establishes the information context and vertical space is at a premium.
+    var showsHeader = true
     /// Fires after an adjust-date save so the viewer can refresh its copy:
     /// UTC capture instant + photographer-local offset in hours.
     var onDateAdjusted: ((String, Date, Double) -> Void)? = nil
@@ -54,6 +59,12 @@ struct AssetInfoPanel: View {
         case loading
         case loaded(AssetDetail)
         case failed(String)
+    }
+
+    private struct CaptureMetricValue: Identifiable {
+        let title: String
+        let value: String
+        var id: String { title }
     }
 
     @State private var loadState = LoadState.loading
@@ -88,6 +99,16 @@ struct AssetInfoPanel: View {
     private var rating: Int { ratingsByAsset[asset.id] ?? 0 }
     private var albums: [Album] { albumsByAsset[asset.id] ?? [] }
 
+    private var canEditCaption: Bool { isOwner && !asset.isLocal }
+    private var showsCaptionSection: Bool { canEditCaption || !savedDescription.isEmpty }
+    private var showsPeopleSection: Bool { !displayedPeople.isEmpty || canTagPeople }
+    private var showsAlbumsSection: Bool { !albums.isEmpty || onAddToAlbum != nil }
+    private var showsRatingSection: Bool {
+        session.preferences?.ratingsEnabled == true
+            && !asset.isLocal
+            && (isOwner || rating > 0)
+    }
+
     /// People shown for the current asset: the optimistic projection when one
     /// exists, otherwise the loaded detail's visible people.
     private var displayedPeople: [Person] {
@@ -115,8 +136,10 @@ struct AssetInfoPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            panelHeader
-            Divider()
+            if showsHeader {
+                panelHeader
+                Divider()
+            }
 
             VStack(alignment: .leading, spacing: 0) {
                 switch loadState {
@@ -181,22 +204,27 @@ struct AssetInfoPanel: View {
         HStack(alignment: .firstTextBaseline) {
             Text("Information")
                 .font(.title2.bold())
+                .accessibilityAddTraits(.isHeader)
             Spacer()
-            if captionMutations.isPending(for: asset.id) {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Saving")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Saving caption")
-            }
+            captionSavingStatus
         }
         .padding(.horizontal, 18)
         .padding(.top, 10)
         .padding(.bottom, 12)
+    }
+
+    @ViewBuilder private var captionSavingStatus: some View {
+        if captionMutations.isPending(for: asset.id) {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Saving")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Saving caption")
+        }
     }
 
     private var loadingState: some View {
@@ -221,6 +249,8 @@ struct AssetInfoPanel: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.tint)
                 .buttonStyle(.plain)
+                .frame(minHeight: 44, alignment: .leading)
+                .contentShape(.rect)
         }
         .padding(.vertical, 28)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -250,6 +280,8 @@ struct AssetInfoPanel: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.tint)
                     .buttonStyle(.plain)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(.rect)
                     .accessibilityIdentifier("info-adjust-date")
             }
         }
@@ -259,61 +291,74 @@ struct AssetInfoPanel: View {
     // MARK: - Sections
 
     @ViewBuilder private func detailContent(_ detail: AssetDetail) -> some View {
-        captionSection
-        sectionDivider
-        peopleSection(displayedPeople)
-        sectionDivider
-        detailsSection(detail)
-        sectionDivider
-        locationSection(detail.exifInfo)
-
-        if session.preferences?.tagsEnabled != false {
+        if showsCaptionSection {
+            captionSection
             sectionDivider
-            tagsSection(detail.tags ?? [])
         }
 
-        if session.preferences?.ratingsEnabled == true {
+        detailsSection(detail)
+
+        if showsLocationSection(detail.exifInfo) {
+            sectionDivider
+            locationSection(detail.exifInfo)
+        }
+
+        if showsPeopleSection {
+            sectionDivider
+            peopleSection(displayedPeople)
+        }
+
+        if showsAlbumsSection {
+            sectionDivider
+            albumsSection
+        }
+
+        if session.preferences?.tagsEnabled != false, let tags = detail.tags, !tags.isEmpty {
+            sectionDivider
+            tagsSection(tags)
+        }
+
+        if showsRatingSection {
             sectionDivider
             ratingSection
         }
-
-        sectionDivider
-        albumsSection
     }
 
     // MARK: - Caption
 
-    @ViewBuilder private var captionSection: some View {
-        if isOwner, !asset.isLocal {
-            infoSection("Caption") {
+    private var captionSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                sectionLabel("Caption")
+                Spacer()
+                if !showsHeader { captionSavingStatus }
+            }
+
+            if canEditCaption {
                 TextField("Add a caption", text: $descriptionDraft, axis: .vertical)
                     .font(.body)
                     .textFieldStyle(.plain)
                     .lineLimit(1...6)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(minHeight: 44, alignment: .topLeading)
+                    .background(surfaceFill, in: .rect(cornerRadius: 12))
+                    .contentShape(.rect(cornerRadius: 12))
                     .focused($descriptionFocused)
                     .onChange(of: descriptionFocused) { was, isNow in
                         if was, !isNow { Task { await commitDescription() } }
                     }
                     .accessibilityIdentifier("info-caption")
-            }
-        } else {
-            infoSection("Caption") {
-                if savedDescription.isEmpty {
-                    emptyState(
-                        systemImage: "text.bubble",
-                        title: "No Caption",
-                        message: asset.isLocal
-                            ? "Back up this item before adding a caption."
-                            : "No caption has been added."
-                    )
-                } else {
-                    Text(savedDescription)
-                        .font(.body)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+            } else {
+                Text(savedDescription)
+                    .font(.body)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .background(surfaceFill, in: .rect(cornerRadius: 12))
             }
         }
+        .padding(.vertical, 20)
     }
 
     /// Writes the draft back to the asset it was typed on. The panel can stay
@@ -473,6 +518,8 @@ struct AssetInfoPanel: View {
                                 .foregroundStyle(.tint)
                         }
                         .buttonStyle(.plain)
+                        .frame(minHeight: 44, alignment: .leading)
+                        .contentShape(.rect)
                         .accessibilityIdentifier("info-add-person")
                     }
                 }
@@ -715,6 +762,12 @@ struct AssetInfoPanel: View {
 
     // MARK: - Location
 
+    private func showsLocationSection(_ exif: ExifInfo?) -> Bool {
+        displayedLocation(for: asset.id) != nil
+            || storedCoordinate(exif) != nil
+            || (isOwner && !asset.isLocal)
+    }
+
     @ViewBuilder private func locationSection(_ exif: ExifInfo?) -> some View {
         let displayed = displayedLocation(for: asset.id)
         let coordinate = displayed?.coordinate ?? storedCoordinate(exif)
@@ -732,6 +785,8 @@ struct AssetInfoPanel: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.tint)
                     .buttonStyle(.plain)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(.rect)
                     .accessibilityIdentifier(
                         coordinate == nil ? "info-add-location" : "info-adjust-location"
                     )
@@ -788,9 +843,10 @@ struct AssetInfoPanel: View {
                 ))) {
                     Marker(markerName, coordinate: coordinate)
                 }
-                .frame(height: 190)
-                .clipShape(.rect(cornerRadius: 18))
+                .frame(height: 148)
+                .clipShape(.rect(cornerRadius: 14))
                 .allowsHitTesting(false)
+                .accessibilityHidden(true)
 
                 HStack(spacing: 10) {
                     Image(systemName: "mappin.and.ellipse")
@@ -819,6 +875,11 @@ struct AssetInfoPanel: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(place.isEmpty ? "Photo location" : place)
+        .accessibilityValue(
+            "Latitude \(latitude.formatted(.number.precision(.fractionLength(4)))), longitude \(longitude.formatted(.number.precision(.fractionLength(4))))"
+        )
         .accessibilityHint("Opens this location in Maps")
     }
 
@@ -832,21 +893,35 @@ struct AssetInfoPanel: View {
     // MARK: - Technical details
 
     private func detailsSection(_ detail: AssetDetail) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let exif = detail.exifInfo
+        let showsCamera = exif.flatMap(cameraName) != nil || nonEmpty(exif?.lensModel) != nil
+        let showsMetrics = hasCaptureMetrics(exif)
+
+        return VStack(alignment: .leading, spacing: 14) {
             sectionLabel("Details")
 
             VStack(spacing: 0) {
                 captureDateRow
                 metadataDivider
                 fileRow(detail)
-                metadataDivider
-                cameraRow(detail.exifInfo)
-                metadataDivider
-                captureMetrics(detail.exifInfo)
+
+                if showsCamera {
+                    metadataDivider
+                    cameraRow(exif)
+                }
+
+                if showsMetrics {
+                    metadataDivider
+                    captureMetrics(exif)
+                }
             }
-            .background(surfaceFill, in: .rect(cornerRadius: 18))
+            .background(surfaceFill, in: .rect(cornerRadius: 16))
         }
         .padding(.vertical, 20)
+    }
+
+    private func hasCaptureMetrics(_ exif: ExifInfo?) -> Bool {
+        !captureMetricValues(exif).isEmpty
     }
 
     private func fileRow(_ detail: AssetDetail) -> some View {
@@ -889,51 +964,81 @@ struct AssetInfoPanel: View {
     }
 
     private func cameraRow(_ exif: ExifInfo?) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        let camera = exif.flatMap(cameraName)
+        let lens = nonEmpty(exif?.lensModel)
+
+        return HStack(alignment: .top, spacing: 12) {
             metadataIcon("camera")
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(exif.flatMap(cameraName) ?? "Camera not available")
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
+                if let camera {
+                    Text(camera)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
+                }
 
-                Text(nonEmpty(exif?.lensModel) ?? "Lens not available")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                if let lens {
+                    Text(lens)
+                        .font(camera == nil ? .subheadline.weight(.semibold) : .caption)
+                        .foregroundStyle(camera == nil ? .primary : .secondary)
+                        .lineLimit(2)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(14)
     }
 
-    private func captureMetrics(_ exif: ExifInfo?) -> some View {
-        HStack(alignment: .top, spacing: 0) {
-            captureMetric("Focal", value: focalLength(exif))
-            metricDivider
-            captureMetric("Aperture", value: aperture(exif))
-            metricDivider
-            captureMetric("Shutter", value: exposure(exif))
-            metricDivider
-            captureMetric("ISO", value: iso(exif))
+    @ViewBuilder private func captureMetrics(_ exif: ExifInfo?) -> some View {
+        let metrics = captureMetricValues(exif)
+        if dynamicTypeSize.isAccessibilitySize {
+            LazyVGrid(
+                columns: [GridItem(.flexible()), GridItem(.flexible())],
+                spacing: 12
+            ) {
+                ForEach(metrics) { metric in
+                    captureMetric(metric)
+                }
+            }
+            .padding(12)
+        } else {
+            HStack(alignment: .top, spacing: 0) {
+                ForEach(Array(metrics.enumerated()), id: \.element.id) { index, metric in
+                    if index > 0 { metricDivider }
+                    captureMetric(metric)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 12)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 12)
     }
 
-    private func captureMetric(_ title: String, value: String?) -> some View {
+    private func captureMetricValues(_ exif: ExifInfo?) -> [CaptureMetricValue] {
+        [
+            focalLength(exif).map { CaptureMetricValue(title: "Focal", value: $0) },
+            aperture(exif).map { CaptureMetricValue(title: "Aperture", value: $0) },
+            exposure(exif).map { CaptureMetricValue(title: "Shutter", value: $0) },
+            iso(exif).map { CaptureMetricValue(title: "ISO", value: $0) },
+        ]
+        .compactMap { $0 }
+    }
+
+    private func captureMetric(_ metric: CaptureMetricValue) -> some View {
         VStack(spacing: 3) {
-            Text(value ?? "—")
+            Text(metric.value)
                 .font(.subheadline.weight(.semibold))
                 .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.65)
-            Text(title)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 0.85 : 0.65)
+            Text(metric.title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(metric.title)
+        .accessibilityValue(metric.value)
     }
 
     private var metricDivider: some View {
@@ -957,25 +1062,15 @@ struct AssetInfoPanel: View {
 
     private func tagsSection(_ tags: [Tag]) -> some View {
         infoSection("Tags") {
-            if tags.isEmpty {
-                emptyState(
-                    systemImage: "tag.slash",
-                    title: "No Tags",
-                    message: asset.isLocal
-                        ? "Back up this item before adding tags."
-                        : "No tags have been added to this item."
-                )
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(tags) { tag in
-                            Label(tag.value, systemImage: "tag.fill")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(surfaceFill, in: .capsule)
-                        }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(tags) { tag in
+                        Label(tag.value, systemImage: "tag.fill")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(surfaceFill, in: .capsule)
                     }
                 }
             }
@@ -986,31 +1081,29 @@ struct AssetInfoPanel: View {
 
     private var ratingSection: some View {
         infoSection("Rating") {
-            if asset.isLocal {
-                emptyState(
-                    systemImage: "star.slash",
-                    title: "Not Rated",
-                    message: "Back up this item before adding a rating."
-                )
-            } else {
-                HStack(spacing: 10) {
-                    ForEach(1...5, id: \.self) { star in
-                        Button {
-                            Task { await setRating(star == rating ? 0 : star) }
-                        } label: {
-                            Image(systemName: star <= rating ? "star.fill" : "star")
-                                .font(.system(size: 26))
-                                .foregroundStyle(
-                                    star <= rating ? Color.accentColor : Color.secondary.opacity(0.5)
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!isOwner)
-                        .accessibilityLabel("\(star) stars")
+            HStack(spacing: 4) {
+                ForEach(1...5, id: \.self) { star in
+                    Button {
+                        Task { await setRating(star == rating ? 0 : star) }
+                    } label: {
+                        Image(systemName: star <= rating ? "star.fill" : "star")
+                            .font(.system(size: 26))
+                            .foregroundStyle(
+                                star <= rating ? Color.accentColor : Color.secondary.opacity(0.5)
+                            )
+                            .frame(width: 44, height: 44)
                     }
+                    .buttonStyle(.plain)
+                    .disabled(!isOwner)
+                    .accessibilityLabel(star == 1 ? "1 star" : "\(star) stars")
+                    .accessibilityValue(star == rating ? "Selected" : "Not selected")
+                    .accessibilityAddTraits(star == rating ? .isSelected : [])
+                    .accessibilityHint(
+                        star == rating ? "Double-tap to clear the rating" : "Double-tap to set the rating"
+                    )
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1051,6 +1144,8 @@ struct AssetInfoPanel: View {
                                 .foregroundStyle(.tint)
                         }
                         .buttonStyle(.plain)
+                        .frame(minHeight: 44, alignment: .leading)
+                        .contentShape(.rect)
                         .accessibilityIdentifier("info-add-to-album")
                     }
                 }
@@ -1146,6 +1241,7 @@ struct AssetInfoPanel: View {
     private func sectionLabel(_ title: String) -> some View {
         Text(title)
             .font(.headline)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private var sectionDivider: some View {

@@ -191,7 +191,7 @@ nonisolated struct Asset: Identifiable, Hashable, Codable {
     /// milliseconds, nil for stills.
     let duration: Int?
     let livePhotoVideoId: String?
-    let ratio: Double
+    var ratio: Double
     let city: String?
     let country: String?
     /// server upload time, drives the recently-added ordering.

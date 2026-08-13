@@ -16,6 +16,30 @@ nonisolated struct ViewerRoute: Identifiable, Hashable {
     }
 }
 
+/// Resolves the semantic pager selection after a page leaves the collection.
+/// Identity wins over a stale numeric index; if the selected page itself was
+/// removed, its following neighbor (or the new last page) takes its place.
+nonisolated struct AssetViewerSelectionResolution: Equatable, Sendable {
+    let assetID: String?
+    let index: Int
+
+    static func resolve(
+        remainingAssetIDs: [String],
+        selectedAssetID: String?,
+        removedIndex: Int
+    ) -> Self {
+        if let selectedAssetID,
+           let index = remainingAssetIDs.firstIndex(of: selectedAssetID) {
+            return Self(assetID: selectedAssetID, index: index)
+        }
+        guard !remainingAssetIDs.isEmpty else {
+            return Self(assetID: nil, index: 0)
+        }
+        let index = min(max(0, removedIndex), remainingAssetIDs.count - 1)
+        return Self(assetID: remainingAssetIDs[index], index: index)
+    }
+}
+
 @MainActor
 @Observable
 final class ViewerPresentation {
