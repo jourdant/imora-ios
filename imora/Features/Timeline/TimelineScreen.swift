@@ -93,6 +93,9 @@ struct TimelineScreen<Header: View>: View {
     /// identifier here makes a reopened context menu correct immediately.
     @State private var downloadedLocalIdentifiers: [String: String] = [:]
     @State private var columnCount = 3
+    /// Nil follows the width-aware default. Once the user pinches, retain
+    /// their choice across window changes and only clamp the rendered value.
+    @State private var preferredColumnCount: Int?
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
     @State private var tileRegistry = AssetTileRegistry()
@@ -126,7 +129,39 @@ struct TimelineScreen<Header: View>: View {
     }
 
     private func tileSide(for width: CGFloat) -> CGFloat {
-        (width - CGFloat(columnCount - 1) * 2) / CGFloat(columnCount)
+        AssetGridLayout.tileSide(viewportWidth: width, columns: columnCount)
+    }
+
+    private func applyColumnCount(
+        _ target: Int,
+        viewportWidth: CGFloat,
+        viewportHeight: CGFloat,
+        preservedFraction: CGFloat,
+        recordsUserPreference: Bool
+    ) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            if recordsUserPreference { preferredColumnCount = target }
+            columnCount = target
+            model.columns = target
+        }
+
+        let newSide = AssetGridLayout.tileSide(
+            viewportWidth: viewportWidth,
+            columns: target
+        )
+        let contentHeight = model.contentHeight(tileSide: newSide)
+            + endPadding(side: newSide, viewportHeight: viewportHeight)
+        let offset = preservedFraction * max(0, contentHeight - viewportHeight)
+        // Wait for the rebuilt rows to enter layout before restoring position.
+        Task { @MainActor in
+            var scrollTransaction = Transaction()
+            scrollTransaction.disablesAnimations = true
+            withTransaction(scrollTransaction) {
+                scrollPosition.scrollTo(y: offset)
+            }
+        }
     }
 
     /// pads the scroll bottom so the last month header can reach the top of
@@ -194,6 +229,18 @@ struct TimelineScreen<Header: View>: View {
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
                 scrollContext.viewportWidth = width
+                let range = AssetGridLayout.columnRange(viewportWidth: width)
+                let target = preferredColumnCount.map {
+                    min(range.upperBound, max(range.lowerBound, $0))
+                } ?? AssetGridLayout.defaultColumnCount(viewportWidth: width)
+                guard target != columnCount else { return }
+                applyColumnCount(
+                    target,
+                    viewportWidth: width,
+                    viewportHeight: geometry.size.height,
+                    preservedFraction: scrub.fraction,
+                    recordsUserPreference: false
+                )
             }
             // the window is otherwise only recomputed while scrolling, so a
             // grid that has just filled in sits with nothing warmed past the
@@ -338,7 +385,10 @@ struct TimelineScreen<Header: View>: View {
            let model,
            context.viewportWidth > 0,
            let anchor = context.firstVisibleRowID {
-            let side = (context.viewportWidth - CGFloat(model.columns - 1) * 2) / CGFloat(model.columns)
+            let side = AssetGridLayout.tileSide(
+                viewportWidth: context.viewportWidth,
+                columns: model.columns
+            )
             if let oldStart = TimelineModel.rowStart(of: anchor, in: old, tileSide: side),
                let newStart = TimelineModel.rowStart(of: anchor, in: new, tileSide: side),
                abs(newStart - oldStart) > 0.5 {
@@ -714,33 +764,24 @@ struct TimelineScreen<Header: View>: View {
                 let base = pinchBaseColumns ?? columnCount
                 pinchBaseColumns = base
                 // zooming in shows fewer, larger tiles.
-                let target = min(5, max(2, Int((Double(base) / value.magnification).rounded())))
+                let range = AssetGridLayout.columnRange(viewportWidth: viewportWidth)
+                let target = min(
+                    range.upperBound,
+                    max(range.lowerBound, Int((Double(base) / value.magnification).rounded()))
+                )
                 guard target != columnCount else { return }
 
                 let preservedFraction = scrub.fraction
                 let generator = UISelectionFeedbackGenerator()
                 generator.selectionChanged()
 
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    columnCount = target
-                    model.columns = target
-                }
-
-                let newSide = (viewportWidth - CGFloat(target - 1) * 2) / CGFloat(target)
-                let contentHeight = model.contentHeight(tileSide: newSide)
-                    + endPadding(side: newSide, viewportHeight: viewportHeight)
-                // one tick later so content size and offset never both
-                // change inside the same gesture frame.
-                let offset = preservedFraction * max(0, contentHeight - viewportHeight)
-                Task { @MainActor in
-                    var scrollTransaction = Transaction()
-                    scrollTransaction.disablesAnimations = true
-                    withTransaction(scrollTransaction) {
-                        scrollPosition.scrollTo(y: offset)
-                    }
-                }
+                applyColumnCount(
+                    target,
+                    viewportWidth: viewportWidth,
+                    viewportHeight: viewportHeight,
+                    preservedFraction: preservedFraction,
+                    recordsUserPreference: true
+                )
             }
             .onEnded { _ in pinchBaseColumns = nil }
     }
