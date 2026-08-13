@@ -258,6 +258,9 @@ struct AssetTile: View {
                 if showsBackupBadge { uploadOverlay }
             }
             .contentShape(.rect)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilitySummary)
+            .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier("asset-tile")
             // "assetid|phase" lets ui tests target one tile and observe its
             // thumbnail state at the same time; badge grids append the badge
@@ -267,6 +270,32 @@ struct AssetTile: View {
                     ? "\(asset.id)|\(thumbnailPhase)|\(badgeToken)"
                     : "\(asset.id)|\(thumbnailPhase)"
             )
+    }
+
+    private var accessibilitySummary: String {
+        var parts = [
+            asset.isVideo ? "Video" : "Photo",
+            asset.localDate.formatted(date: .long, time: .shortened),
+        ]
+        if let duration = asset.durationLabel { parts.append(duration) }
+        if asset.isFavorite { parts.append("Favorite") }
+        if showsBackupBadge { parts.append(backupAccessibilitySummary) }
+        return parts.joined(separator: ", ")
+    }
+
+    private var backupAccessibilitySummary: String {
+        switch uploadState {
+        case .uploading(let fraction):
+            return "Backing up, \(Int(fraction * 100)) percent"
+        case .failed:
+            return "Backup failed"
+        case nil:
+            if asset.isLocal {
+                return asset.isLocalBackedUp ? "Backed up" : "Not backed up"
+            }
+            return session.backup?.backedUpRemoteIds.contains(asset.id) == true
+                ? "Backed up" : "Stored in cloud"
+        }
     }
 
     // MARK: - backup status
@@ -334,14 +363,16 @@ struct AssetTile: View {
             }
         case .failed:
             ZStack {
-                Color.red.opacity(0.6)
+                Color.black.opacity(0.58)
                 VStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.circle")
+                    Image(systemName: "exclamationmark.circle.fill")
                         .font(.system(size: 30))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .red)
                     Text("Error")
                         .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
                 }
-                .foregroundStyle(.white)
             }
         case nil:
             EmptyView()
