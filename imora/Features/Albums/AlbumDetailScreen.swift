@@ -203,9 +203,10 @@ struct AlbumDetailScreen: View {
                 .disabled(isRemovingAlbum)
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            Image(systemName: "ellipsis")
         }
         .disabled(isAlbumMutationInFlight)
+        .accessibilityLabel("More")
         .accessibilityIdentifier("album-menu")
         // ios 26 morphs a confirmation out of its source control; the menu item
         // is gone by then, so the dialogs anchor to the menu button itself.

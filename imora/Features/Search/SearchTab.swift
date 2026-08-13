@@ -725,8 +725,9 @@ struct PersonScreen: View {
                     }
                     .disabled(renameInFlight)
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis")
                 }
+                .accessibilityLabel("More")
             }
         }
         .alert("Name", isPresented: $showRename) {

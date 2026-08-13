@@ -265,8 +265,9 @@ struct TrashScreen: View {
                         Label("Empty Trash", systemImage: "trash.slash")
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis")
                 }
+                .accessibilityLabel("More")
                 // ios 26 morphs the dialog out of its source control, so it sits
                 // on the menu button - on the screen root it floats detached.
                 .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
