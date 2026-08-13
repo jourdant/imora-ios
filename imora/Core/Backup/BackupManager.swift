@@ -104,7 +104,9 @@ final class BackupManager {
     /// wired by sessionstore to the realtime hub, which debounces.
     var onLocalChange: (() -> Void)?
     /// wired by sessionstore to raise the end-of-run notification. carries the
-    /// terminal phase so a cancelled run stays silent.
+    /// terminal phase so a cancelled run stays silent. not called when the
+    /// server was unreachable - every launch and foreground retries, and each
+    /// retry would repeat the same banner.
     var onRunFinished: ((BackupPhase) -> Void)?
     /// wired by the continued-processing task, which has to keep feeding the
     /// system progress ui or the scheduler expires it.
@@ -390,6 +392,7 @@ final class BackupManager {
     private func run() async {
         var uploadsAllowed = runAllowsUploads
         var chainFullRun = false
+        var reportsOutcome = true
         summary = BackupSummary()
         lastFailure = nil
         phase = .scanning
@@ -443,13 +446,16 @@ final class BackupManager {
             await index.save()
             if runAllowsUploads {
                 phase = .error(error.localizedDescription)
+                // the backup screen still shows the error; the banner is
+                // reserved for outcomes the server took part in.
+                reportsOutcome = !Self.isUnreachable(error)
             } else {
                 // nobody asked for this run, so it fails silently.
                 backupLog.error("passive reconcile failed: \(error)")
                 phase = .idle
             }
         }
-        onRunFinished?(phase)
+        if reportsOutcome { onRunFinished?(phase) }
         uploadStates.removeAll()
         localChanged()
         runTask = nil
@@ -459,6 +465,22 @@ final class BackupManager {
         } else if rerunRequested {
             rerunRequested = false
             startIfIdle()
+        }
+    }
+
+    /// transport failures that mean the server never saw the request - offline,
+    /// dns, timeouts. a run ending on one of these happens on every automatic
+    /// retry while the network is away, so it is not an outcome to announce.
+    private nonisolated static func isUnreachable(_ error: any Error) -> Bool {
+        if case ImmichError.unreachable = error { return true }
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet, .networkConnectionLost, .timedOut,
+             .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .dataNotAllowed, .internationalRoamingOff:
+            return true
+        default:
+            return false
         }
     }
 
