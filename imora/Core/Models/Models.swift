@@ -495,10 +495,12 @@ nonisolated struct SharedLink: Codable, Identifiable, Hashable {
 
 nonisolated struct Person: Codable, Identifiable, Hashable {
     let id: String
-    let name: String
+    var name: String
     let thumbnailPath: String?
-    let isHidden: Bool?
-    let birthDate: String?
+    var isHidden: Bool?
+    /// date-only string, "yyyy-MM-dd".
+    var birthDate: String?
+    var isFavorite: Bool?
 }
 
 nonisolated struct Tag: Codable, Identifiable, Hashable {
@@ -513,6 +515,11 @@ nonisolated struct PeopleResponse: Codable {
     let people: [Person]
     let total: Int
     let hidden: Int?
+    let hasNextPage: Bool?
+}
+
+nonisolated struct PersonStatistics: Codable {
+    let assets: Int
 }
 
 /// one detected or manual face region on an asset. person stays nil while

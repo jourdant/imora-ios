@@ -9,7 +9,8 @@ extension Person {
             name: name,
             thumbnailPath: nil,
             isHidden: false,
-            birthDate: nil
+            birthDate: nil,
+            isFavorite: nil
         )
     }
 

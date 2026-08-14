@@ -563,8 +563,17 @@ nonisolated final class ImmichClient: Sendable {
 
     func tags() async throws -> [Tag] { try await get("tags") }
 
-    func people(withHidden: Bool = false) async throws -> PeopleResponse {
-        try await get("people", query: [URLQueryItem(name: "withHidden", value: withHidden ? "true" : "false")])
+    /// closestPersonID asks the server to order by facial similarity to that
+    /// person, which the merge picker uses. pages are 1-based.
+    func people(
+        withHidden: Bool = false,
+        page: Int? = nil,
+        closestPersonID: String? = nil
+    ) async throws -> PeopleResponse {
+        var query = [URLQueryItem(name: "withHidden", value: withHidden ? "true" : "false")]
+        if let page { query.append(URLQueryItem(name: "page", value: String(page))) }
+        if let closestPersonID { query.append(URLQueryItem(name: "closestPersonId", value: closestPersonID)) }
+        return try await get("people", query: query)
     }
 
     func person(id: String) async throws -> Person { try await get("people/\(id)") }
@@ -578,8 +587,31 @@ nonisolated final class ImmichClient: Sendable {
         try await get("search/cities")
     }
 
-    func updatePerson(id: String, name: String) async throws {
-        try await mutate("people/\(id)", method: "PUT", body: ["name": name])
+    /// birthDate is date-only "yyyy-MM-dd"; pass .some(nil) to clear it on
+    /// the server, omit to leave it untouched.
+    func updatePerson(
+        id: String,
+        name: String? = nil,
+        birthDate: String?? = nil,
+        isHidden: Bool? = nil,
+        isFavorite: Bool? = nil
+    ) async throws {
+        var body: [String: AnyEncodable] = [:]
+        if let name { body["name"] = AnyEncodable(name) }
+        if let birthDate { body["birthDate"] = AnyEncodable(birthDate) }
+        if let isHidden { body["isHidden"] = AnyEncodable(isHidden) }
+        if let isFavorite { body["isFavorite"] = AnyEncodable(isFavorite) }
+        try await mutate("people/\(id)", method: "PUT", body: body)
+    }
+
+    /// folds the given people into the target person. their assets move over
+    /// and the merged people disappear from the server.
+    func mergePerson(targetID: String, ids: [String]) async throws -> [BulkIdResult] {
+        try await request("people/\(targetID)/merge", method: "POST", body: ["ids": ids])
+    }
+
+    func personStatistics(id: String) async throws -> PersonStatistics {
+        try await get("people/\(id)/statistics")
     }
 
     func createPerson(name: String) async throws -> Person {

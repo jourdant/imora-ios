@@ -22,13 +22,9 @@ private struct AlbumMembershipRollback {
 
 private extension Person {
     func renamed(_ name: String) -> Person {
-        Person(
-            id: id,
-            name: name,
-            thumbnailPath: thumbnailPath,
-            isHidden: isHidden,
-            birthDate: birthDate
-        )
+        var copy = self
+        copy.name = name
+        return copy
     }
 }
 

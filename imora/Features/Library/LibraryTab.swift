@@ -5,6 +5,11 @@ import SwiftUI
 struct LibraryTab: View {
     @Environment(SessionStore.self) private var session
     @State private var people: [Person] = []
+    @State private var peopleTotal = 0
+    /// serializes the carousel quick actions per person.
+    @State private var mutatingPersonIDs = Set<String>()
+
+    private static let carouselLimit = 16
 
     var body: some View {
         NavigationStack {
@@ -27,30 +32,23 @@ struct LibraryTab: View {
                 }
 
                 if !people.isEmpty && session.preferences?.peopleEnabled != false {
-                    Section("People") {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
-                                ForEach(people.prefix(24)) { person in
-                                    NavigationLink(value: person) {
-                                        VStack(spacing: 6) {
-                                            if let client = session.client {
-                                                RemoteImage(url: client.personThumbnailURL(personID: person.id), targetPixelSize: 160)
-                                                    .frame(width: 64, height: 64)
-                                                    .clipShape(.circle)
-                                            }
-                                            Text(person.name.isEmpty ? "Unnamed" : person.name)
-                                                .font(.caption2)
-                                                .foregroundStyle(.primary)
-                                                .lineLimit(1)
-                                                .frame(width: 68)
-                                        }
-                                    }
-                                    .buttonStyle(.plain)
+                    Section {
+                        peopleCarousel
+                            .listRowInsets(EdgeInsets())
+
+                        NavigationLink(value: LibraryDestination.people) {
+                            HStack {
+                                Label("All People", systemImage: "person.2")
+                                Spacer()
+                                if peopleTotal > 0 {
+                                    Text("\(peopleTotal)")
+                                        .foregroundStyle(.secondary)
                                 }
                             }
-                            .padding(.vertical, 6)
                         }
-                        .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 0))
+                        .accessibilityIdentifier("library-all-people")
+                    } header: {
+                        Text("People")
                     }
                 }
             }
@@ -75,6 +73,8 @@ struct LibraryTab: View {
                     )
                 case .places:
                     PlacesScreen()
+                case .people:
+                    PeopleScreen()
                 case .trash:
                     TrashScreen()
                 }
@@ -85,18 +85,132 @@ struct LibraryTab: View {
             .navigationDestination(for: PlaceLink.self) { place in
                 PlaceScreen(city: place.city, coordinate: place.coordinate)
             }
-            .task {
-                if let response = try? await session.client?.people() {
-                    people = response.people.filter { !($0.isHidden ?? false) }
+            .task { await loadPeople() }
+            // returning from people screens picks up hides, merges and renames.
+            .onAppear {
+                if !people.isEmpty {
+                    Task { await loadPeople() }
                 }
             }
         }
+    }
+
+    // MARK: - people carousel
+
+    private var peopleCarousel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 14) {
+                ForEach(people.prefix(Self.carouselLimit)) { person in
+                    NavigationLink(value: person) {
+                        VStack(spacing: 7) {
+                            PersonAvatar(person: person, targetPixelSize: 240)
+                                .frame(width: 76, height: 76)
+                            Text(person.name.isEmpty ? "Unnamed" : person.name)
+                                .font(.caption)
+                                .foregroundStyle(person.name.isEmpty ? .secondary : .primary)
+                                .lineLimit(1)
+                                .frame(width: 82)
+                        }
+                    }
+                    .buttonStyle(PressableCardStyle())
+                    .disabled(mutatingPersonIDs.contains(person.id))
+                    .accessibilityLabel(person.name.isEmpty ? "Unnamed person" : person.name)
+                    .contextMenu {
+                        carouselMenu(for: person)
+                    }
+                }
+
+                if peopleTotal > Self.carouselLimit || people.count > Self.carouselLimit {
+                    NavigationLink(value: LibraryDestination.people) {
+                        VStack(spacing: 7) {
+                            Circle()
+                                .fill(Color(.secondarySystemFill))
+                                .frame(width: 76, height: 76)
+                                .overlay {
+                                    Image(systemName: "chevron.right")
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                            Text("View All")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 82)
+                        }
+                    }
+                    .buttonStyle(PressableCardStyle())
+                    .accessibilityIdentifier("library-people-view-all")
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+    }
+
+    @ViewBuilder private func carouselMenu(for person: Person) -> some View {
+        let isFavorite = person.isFavorite == true
+
+        Button {
+            Task { await setFavorite(person, to: !isFavorite) }
+        } label: {
+            Label(isFavorite ? "Unfavorite" : "Favorite", systemImage: isFavorite ? "heart.slash" : "heart")
+        }
+
+        Button {
+            Task { await hide(person) }
+        } label: {
+            Label("Hide Person", systemImage: "eye.slash")
+        }
+    }
+
+    private func loadPeople() async {
+        guard let response = try? await session.client?.people() else { return }
+        people = response.people.filter { !($0.isHidden ?? false) }
+        peopleTotal = max(people.count, response.total - (response.hidden ?? 0))
+    }
+
+    private func setFavorite(_ person: Person, to value: Bool) async {
+        guard let client = session.client, !mutatingPersonIDs.contains(person.id) else { return }
+        mutatingPersonIDs.insert(person.id)
+        defer { mutatingPersonIDs.remove(person.id) }
+        let previous = person.isFavorite
+        await OptimisticAction.perform(
+            errorMessage: value ? "Couldn’t favorite this person" : "Couldn’t unfavorite this person",
+            apply: { updatePerson(person.id) { $0.isFavorite = value } },
+            rollback: { updatePerson(person.id) { $0.isFavorite = previous } },
+            request: { try await client.updatePerson(id: person.id, isFavorite: value) }
+        )
+    }
+
+    private func hide(_ person: Person) async {
+        guard let client = session.client, !mutatingPersonIDs.contains(person.id) else { return }
+        mutatingPersonIDs.insert(person.id)
+        defer { mutatingPersonIDs.remove(person.id) }
+        let snapshot = people
+        let totalSnapshot = peopleTotal
+        await OptimisticAction.perform(
+            errorMessage: "Couldn’t hide this person",
+            apply: {
+                people.removeAll { $0.id == person.id }
+                peopleTotal = max(0, peopleTotal - 1)
+            },
+            rollback: {
+                people = snapshot
+                peopleTotal = totalSnapshot
+            },
+            request: { try await client.updatePerson(id: person.id, isHidden: true) }
+        )
+    }
+
+    private func updatePerson(_ id: String, _ mutation: (inout Person) -> Void) {
+        guard let index = people.firstIndex(where: { $0.id == id }) else { return }
+        mutation(&people[index])
     }
 }
 
 nonisolated enum LibraryDestination: Hashable {
     case favorites
     case places
+    case people
     case archive
     case trash
 }
