@@ -19,7 +19,6 @@ nonisolated struct AssetViewerScrollPresentation: Equatable, Sendable {
 nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
     let showsTopToolbarItems: Bool
     let showsViewerBottomBar: Bool
-    let usesInformationBottomBarStyle: Bool
     let reservesVideoControls: Bool
     let showsVideoControls: Bool
 
@@ -37,7 +36,6 @@ nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
 
         showsTopToolbarItems = canShowChrome && mediaIsUnobstructed
         showsViewerBottomBar = canShowChrome && (isCompact || !isInformationPresented)
-        usesInformationBottomBarStyle = isCompact && !isAtMedia
         reservesVideoControls = isVideo && !isContextPreview
         showsVideoControls = reservesVideoControls
             && canShowChrome

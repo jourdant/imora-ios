@@ -235,7 +235,7 @@ private struct AssetInformationPanel: View {
                     },
                     onDone: onAlbumAdded
                 )
-                // the viewer root tints white; this modal wants the accent.
+                // the viewer root tints primary; this modal wants the accent.
                 .tint(.accentColor)
             }
         }
@@ -254,7 +254,6 @@ struct AssetViewerScreen: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.openURL) private var openURL
     @Environment(SessionStore.self) private var session
@@ -430,21 +429,14 @@ struct AssetViewerScreen: View {
                 for: .bottomBar
             )
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar, .bottomBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
-            .toolbarColorScheme(
-                chromePresentation.usesInformationBottomBarStyle ? colorScheme : .dark,
-                for: .bottomBar
-            )
             .navigationBarTitleDisplayMode(.inline)
-            .tint(
-                chromePresentation.usesInformationBottomBarStyle
-                    ? Color.primary : Color.white
-            )
+            // chrome only shows over the system background, so its monochrome
+            // controls follow the scheme instead of assuming a dark stage.
+            .tint(.primary)
             .navigationDestination(for: AssetInformationDestination.self) { destination in
                 informationDestinationView(destination)
                     .tint(.accentColor)
                     .toolbarBackgroundVisibility(.automatic, for: .navigationBar)
-                    .toolbarColorScheme(nil, for: .navigationBar)
             }
             .onChange(of: showInfo, initial: true) { _, _ in
                 reportMediaAtTop()
