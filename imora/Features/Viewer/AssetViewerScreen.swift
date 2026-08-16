@@ -2114,13 +2114,30 @@ private struct AssetPage: View {
 
 // MARK: - zoom container
 
+/// rotation resizes the page without going through swiftui updates, so the
+/// scroll view watches its own bounds and reports size changes to re-fit the
+/// asset. otherwise the stale zoom offset from the previous orientation
+/// survives until the page is remounted.
+private final class AssetZoomScrollView: UIScrollView {
+    var onBoundsSizeChanged: (() -> Void)?
+    private var lastBoundsSize = CGSize.zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.size != lastBoundsSize else { return }
+        let hadValidSize = lastBoundsSize != .zero
+        lastBoundsSize = bounds.size
+        if hadValidSize { onBoundsSizeChanged?() }
+    }
+}
+
 struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     let contentID: String
     let onZoomChanged: (Bool) -> Void
     @ViewBuilder let content: Content
 
     func makeUIView(context: Context) -> UIScrollView {
-        let scrollView = UIScrollView()
+        let scrollView = AssetZoomScrollView()
         scrollView.delegate = context.coordinator
         scrollView.maximumZoomScale = 6
         scrollView.minimumZoomScale = 1
@@ -2154,6 +2171,12 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
         scrollView.addGestureRecognizer(doubleTap)
+
+        let coordinator = context.coordinator
+        scrollView.onBoundsSizeChanged = { [weak scrollView] in
+            guard let scrollView else { return }
+            coordinator.resetToFit(scrollView)
+        }
         return scrollView
     }
 
@@ -2191,6 +2214,21 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         }
 
         func resetZoomReporting() {
+            lastReportedZoomed = false
+            onZoomChanged(false)
+        }
+
+        /// re-fits the asset after the page geometry changed, e.g. rotation.
+        /// zooming out through the delegate keeps pan and zoom reporting in
+        /// sync; the offset still needs clearing since a min-zoom page never
+        /// gets clamped by the scroll view itself while panning is disabled.
+        func resetToFit(_ scrollView: UIScrollView) {
+            if scrollView.zoomScale != scrollView.minimumZoomScale {
+                scrollView.setZoomScale(scrollView.minimumZoomScale, animated: false)
+            }
+            scrollView.contentOffset = .zero
+            scrollView.panGestureRecognizer.isEnabled = false
+            guard lastReportedZoomed else { return }
             lastReportedZoomed = false
             onZoomChanged(false)
         }
