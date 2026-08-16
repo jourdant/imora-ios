@@ -6,9 +6,13 @@ struct TimelineTab: View {
 
     var body: some View {
         NavigationStack {
+            // no title: the tab bar already says Photos, and a large title
+            // snaps between expanded and collapsed as you scroll near the top,
+            // which jumps the grid by the height of that collapse.
             TimelineScreen(
-                title: "Photos",
+                title: "",
                 filter: TimelineFilter(withPartners: true, withStacked: true),
+                showsLargeTitle: false,
                 mergesLocalPhotos: true,
                 header: {
                     VStack(spacing: 0) {
