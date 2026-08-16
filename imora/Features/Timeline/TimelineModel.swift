@@ -227,18 +227,34 @@ nonisolated struct TileRun: Hashable {
     let assets: [Asset]
 }
 
+/// per-month row tallies captured at build time so the scrubber overlay can
+/// map months to exact offsets without walking rows.
+nonisolated struct TimelineSectionSpan: Hashable {
+    let id: String
+    let title: String
+    let year: Int
+    let titleBands: Int
+    let tileRows: Int
+    /// this month's first row. the scrubber scrolls by row identity rather
+    /// than by pixel offset, which a lazy stack clamps against whatever
+    /// content height it currently believes in. the index is where the walk
+    /// into the month starts; the id validates it against the current rows.
+    let firstRowID: String
+    let firstRowIndex: Int
+}
+
 /// flat list element with a deterministic height. fixed heights are what keep
 /// lazyvstack from re-measuring and jumping while scrolling backwards.
 nonisolated enum TimelineRow: Identifiable, Hashable {
     case titleBand(String, [TitleSegment])
     case tiles(String, [TileRun])
-    case placeholder(String, String, Int)
+    case placeholder(String, String, Int, Int)
 
     var id: String {
         switch self {
         case .titleBand(let id, _): id
         case .tiles(let id, _): id
-        case .placeholder(let id, _, _): id
+        case .placeholder(let id, _, _, _): id
         }
     }
 
@@ -246,7 +262,8 @@ nonisolated enum TimelineRow: Identifiable, Hashable {
         switch self {
         case .titleBand: 36
         case .tiles: tileSide + 2
-        case .placeholder(_, _, let rows): CGFloat(rows) * (tileSide + 2)
+        case .placeholder(_, _, let rows, let bands):
+            CGFloat(bands) * 36 + CGFloat(rows) * (tileSide + 2)
         }
     }
 }
@@ -260,6 +277,9 @@ final class TimelineModel {
     let mergesLocal: Bool
     private(set) var sections: [TimelineSection] = []
     private(set) var rows: [TimelineRow] = []
+    /// the month each row belongs to. the scrubber names its month from the
+    /// row actually at the viewport top rather than from offset arithmetic,
+    /// so the label is right even while unloaded months are still estimates.
     private(set) var monthByRowID: [String: String] = [:]
     /// anchors a visible row back into `flatAssets` so the prefetcher can size
     /// its window in assets rather than rows.
@@ -270,12 +290,18 @@ final class TimelineModel {
 
     /// row tallies kept in sync by rebuildRows so screens can do o(1) height
     /// math instead of summing thousands of rows.
-    private(set) var sectionCount = 0
     private(set) var titleBandCount = 0
     private(set) var tileRowCount = 0
-    /// title bands and tile rows belonging to the last month only.
-    private(set) var tailTitleBands = 0
-    private(set) var tailTileRows = 0
+    /// months in display order with their row tallies, for scrubber markers.
+    private(set) var sectionSpans: [TimelineSectionSpan] = []
+
+    /// how many photos a day holds on average in this library, the one number
+    /// an unloaded month needs to be laid out like a loaded one. measured from
+    /// the months already in hand and persisted, so the very first frame after
+    /// launch places every month about where it will finally sit instead of
+    /// letting the grid stretch bucket by bucket as the prefetch lands.
+    private var assetsPerDay = TimelineModel.defaultAssetsPerDay
+    private var persistedAssetsPerDay = TimelineModel.defaultAssetsPerDay
 
     var columns: Int = 3 {
         didSet { if columns != oldValue { rebuildRows() } }
@@ -315,6 +341,16 @@ final class TimelineModel {
     init(filter: TimelineFilter, mergesLocal: Bool = false) {
         self.filter = filter
         self.mergesLocal = mergesLocal
+        // read before the first rebuild below - that rebuild lays out every
+        // month the cache knows about, and it needs last launch's ratio to
+        // place them where they will stay.
+        if let key = Self.assetsPerDayKey(for: filter) {
+            let stored = UserDefaults.standard.double(forKey: key)
+            if stored > 0 {
+                assetsPerDay = stored
+                persistedAssetsPerDay = stored
+            }
+        }
         // built in init, not in load(): a task runs after the first frame, and
         // that frame is exactly the spinner this is here to avoid.
         if let host = UserDefaults.standard.url(forKey: "imora.serverURL")?.host(),
@@ -451,6 +487,8 @@ final class TimelineModel {
         sections = fresh
         staleBucketIDs.formIntersection(buckets.map(\.timeBucket))
         rebuildRows(rebuildAssets: true)
+        // the first bucket lands before the prefetch, and it is what calibrates
+        // the estimate for every month still unloaded.
         if let first = sections.first { await loadBucket(first.id) }
         startPrefetch()
     }
@@ -576,6 +614,7 @@ final class TimelineModel {
 
     private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false) {
         var result: [TimelineRow] = []
+        var spans: [TimelineSectionSpan] = []
         var monthByRowID: [String: String] = [:]
         var firstAssetIDByRowID: [String: String] = [:]
         var flattened: [Asset] = []
@@ -585,16 +624,19 @@ final class TimelineModel {
             flattened.reserveCapacity(sections.reduce(0) { $0 + $1.count })
         }
 
-        var sections = 0
         var titleBands = 0
         var tileRows = 0
-        var sectionTitleBands = 0
-        var sectionTileRows = 0
+        // grows as loaded months are walked, so placeholders further down get
+        // a ratio measured on this very rebuild; the value kept from the last
+        // one - or from the last launch - covers the months above them.
+        var assetTally = 0
+        var dayTally = 0
+        var ratio = assetsPerDay
 
         for section in mergedSections() {
-            sections += 1
-            sectionTitleBands = 0
-            sectionTileRows = 0
+            var sectionTitleBands = 0
+            var sectionTileRows = 0
+            let sectionFirstRow = result.count
 
             if let days = section.days {
                 if rebuildAssets {
@@ -645,37 +687,96 @@ final class TimelineModel {
                         sectionTileRows += 1
                     }
                 }
+                assetTally += days.reduce(0) { $0 + $1.assets.count }
+                dayTally += days.count
+                if dayTally > 0 { ratio = Double(assetTally) / Double(dayTally) }
             } else {
-                let estimated = max(1, Int((Double(section.count) / Double(columns)).rounded(.up)))
+                let estimate = Self.placeholderEstimate(
+                    count: section.count,
+                    columns: columns,
+                    assetsPerDay: ratio
+                )
                 let placeholderID = "p-\(section.id)"
-                result.append(.placeholder(placeholderID, section.id, estimated))
+                result.append(.placeholder(placeholderID, section.id, estimate.tileRows, estimate.titleBands))
                 monthByRowID[placeholderID] = section.monthTitle
-                sectionTileRows += estimated
+                sectionTitleBands += estimate.titleBands
+                sectionTileRows += estimate.tileRows
             }
 
+            guard result.count > sectionFirstRow else { continue }
+            spans.append(TimelineSectionSpan(
+                id: section.id,
+                title: section.monthTitle,
+                year: Self.year(for: section.id),
+                titleBands: sectionTitleBands,
+                tileRows: sectionTileRows,
+                firstRowID: result[sectionFirstRow].id,
+                firstRowIndex: sectionFirstRow
+            ))
             titleBands += sectionTitleBands
             tileRows += sectionTileRows
         }
 
+        if dayTally > 0, assetTally > 0 {
+            assetsPerDay = ratio
+            // rebuilds are frequent; only a ratio that actually moved is
+            // worth writing out for the next launch.
+            if abs(ratio - persistedAssetsPerDay) > 0.25, let key = Self.assetsPerDayKey(for: filter) {
+                persistedAssetsPerDay = ratio
+                UserDefaults.standard.set(ratio, forKey: key)
+            }
+        }
+
         let commit = {
             self.rows = result
+            self.sectionSpans = spans
             self.monthByRowID = monthByRowID
             self.firstAssetIDByRowID = firstAssetIDByRowID
             if rebuildAssets {
                 self.flatAssets = flattened
                 self.flatAssetIndexByID = flattenedIndex
             }
-            self.sectionCount = sections
             self.titleBandCount = titleBands
             self.tileRowCount = tileRows
-            self.tailTitleBands = sectionTitleBands
-            self.tailTileRows = sectionTileRows
         }
         if animated, rows != result, !rows.isEmpty, let applyRowsUpdate {
             applyRowsUpdate(rows, result, commit)
         } else {
             commit()
         }
+    }
+
+    /// how tall an unloaded month renders, in the row units the real layout
+    /// uses. the month's photos are spread over a plausible number of days and
+    /// run through the very packer the loaded path uses, so day titles and
+    /// imperfect packing are both priced in and the answer follows the column
+    /// count through a pinch. a month cannot span more than 31 days, which is
+    /// what keeps a busy month from being estimated as hundreds of tiny ones.
+    private static func placeholderEstimate(
+        count: Int,
+        columns: Int,
+        assetsPerDay: Double
+    ) -> (tileRows: Int, titleBands: Int) {
+        guard count > 0, columns > 0 else { return (1, 0) }
+        let perDay = max(1, assetsPerDay)
+        let days = min(31, max(1, Int((Double(count) / perDay).rounded())))
+        let base = count / days
+        let remainder = count % days
+        let counts = (0..<days).map { $0 < remainder ? base + 1 : base }
+        let bands = TimelineFlowLayout.pack(counts: counts.filter { $0 > 0 }, columns: columns)
+        guard !bands.isEmpty else {
+            return (max(1, Int((Double(count) / Double(columns)).rounded(.up))), 0)
+        }
+        return (bands.reduce(0) { $0 + $1.rowCount }, bands.count)
+    }
+
+    static let defaultAssetsPerDay: Double = 6
+
+    /// scoped to the grid, since an album's photos-per-day says nothing about
+    /// the main timeline's. grids the cache deliberately skips - albums,
+    /// people, map areas - keep the ratio in memory only.
+    private static func assetsPerDayKey(for filter: TimelineFilter) -> String? {
+        TimelineCache.key(for: filter).map { "imora.timeline.assetsPerDay.\($0)" }
     }
 
     /// offset of a row's top edge within the rows stack. deterministic heights
@@ -693,15 +794,6 @@ final class TimelineModel {
     func contentHeight(tileSide: CGFloat) -> CGFloat {
         CGFloat(titleBandCount) * 36
             + CGFloat(tileRowCount) * (tileSide + 2)
-    }
-
-    /// the last month's rows. the screen pads the scroll bottom so this tail
-    /// can fill the viewport, letting the scrubber actually land on the final
-    /// month even when it holds few photos.
-    func tailHeight(tileSide: CGFloat) -> CGFloat {
-        guard sectionCount > 0 else { return 0 }
-        return CGFloat(tailTitleBands) * 36
-            + CGFloat(tailTileRows) * (tileSide + 2)
     }
 
     private func scheduleRebuild() {
@@ -1326,17 +1418,18 @@ final class TimelineModel {
         bucketParser.date(from: String(raw.prefix(10)))
     }
 
+    /// short month plus year, the label format both immich clients use for
+    /// their scrubbers.
     private static func monthTitle(for raw: String) -> String {
         guard let date = bucketDate(raw) else { return raw }
+        return date.formatted(.dateTime.month(.abbreviated).year().utc())
+    }
+
+    private static func year(for raw: String) -> Int {
+        guard let date = bucketDate(raw) else { return Int(raw.prefix(4)) ?? 0 }
         var calendar = Calendar.current
         calendar.timeZone = TimeZone(identifier: "UTC")!
-        let now = Date()
-        let sameYear = calendar.component(.year, from: date) == Calendar.current.component(.year, from: now)
-        return date.formatted(
-            sameYear
-                ? .dateTime.month(.wide).utc()
-                : .dateTime.month(.wide).year().utc()
-        )
+        return calendar.component(.year, from: date)
     }
 
     private static func groupByDay(_ assets: [Asset], byUploadDate: Bool = false) -> [DayGroup] {
