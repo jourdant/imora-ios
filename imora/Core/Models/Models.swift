@@ -201,10 +201,17 @@ nonisolated struct Asset: Identifiable, Hashable, Codable {
     /// snapshot of the backup index at merge time: true once every component
     /// of the device asset is confirmed on the server.
     var isLocalBackedUp = false
+    /// device live photo whose motion half lives in photokit. the server pairs
+    /// its two assets through `livePhotoVideoId`, but a device-only asset has
+    /// no server ids yet and would otherwise look like a plain still.
+    var hasLocalMotion = false
 
     var isLocal: Bool { localIdentifier != nil }
 
     var isVideo: Bool { !isImage }
+
+    /// a still with a motion half, from either source.
+    var isLivePhoto: Bool { isImage && (livePhotoVideoId != nil || hasLocalMotion) }
 
     /// date shifted into the asset's local timezone for grouping and display.
     var localDate: Date { fileCreatedAt.addingTimeInterval(localOffsetHours * 3600) }

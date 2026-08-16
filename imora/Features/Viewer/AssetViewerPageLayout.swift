@@ -15,12 +15,13 @@ nonisolated struct AssetViewerScrollPresentation: Equatable, Sendable {
 
 /// Resolves viewer chrome from semantic state in one place. The transport bar
 /// has a separate reservation flag so loading, hiding chrome, or opening
-/// information never changes a video's vertical viewport mid-transition.
+/// information never changes a playable asset's vertical viewport mid-
+/// transition. Videos and live photos both reserve it.
 nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
     let showsTopToolbarItems: Bool
     let showsViewerBottomBar: Bool
-    let reservesVideoControls: Bool
-    let showsVideoControls: Bool
+    let reservesTransportControls: Bool
+    let showsTransportControls: Bool
 
     init(
         isCompact: Bool,
@@ -28,19 +29,19 @@ nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
         isInformationPresented: Bool,
         isChromeVisible: Bool,
         isContextPreview: Bool,
-        isVideo: Bool,
-        isVideoReady: Bool
+        isPlayable: Bool,
+        isPlayerReady: Bool
     ) {
         let canShowChrome = isChromeVisible && !isContextPreview
         let mediaIsUnobstructed = isCompact ? isAtMedia : !isInformationPresented
 
         showsTopToolbarItems = canShowChrome && mediaIsUnobstructed
         showsViewerBottomBar = canShowChrome && (isCompact || !isInformationPresented)
-        reservesVideoControls = isVideo && !isContextPreview
-        showsVideoControls = reservesVideoControls
+        reservesTransportControls = isPlayable && !isContextPreview
+        showsTransportControls = reservesTransportControls
             && canShowChrome
             && mediaIsUnobstructed
-            && isVideoReady
+            && isPlayerReady
     }
 }
 

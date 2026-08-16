@@ -240,6 +240,12 @@ struct AssetTile: View {
                         .padding(.vertical, 3)
                         .background(.black.opacity(0.4), in: .capsule)
                         .padding(5)
+                } else if asset.isLivePhoto {
+                    Image(systemName: "livephoto")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.6), radius: 3)
+                        .padding(7)
                 }
             }
             .overlay(alignment: .bottomLeading) {
@@ -274,7 +280,7 @@ struct AssetTile: View {
 
     private var accessibilitySummary: String {
         var parts = [
-            asset.isVideo ? "Video" : "Photo",
+            asset.isVideo ? "Video" : (asset.isLivePhoto ? "Live Photo" : "Photo"),
             asset.localDate.formatted(date: .long, time: .shortened),
         ]
         if let duration = asset.durationLabel { parts.append(duration) }

@@ -415,7 +415,7 @@ struct AssetViewerScreen: View {
             }
             .ignoresSafeArea()
             .safeAreaBar(edge: .bottom, spacing: 4) {
-                videoControlsBar
+                transportControlsBar
             }
             .toolbar { toolbarContent }
             .toolbarVisibility(
@@ -694,21 +694,27 @@ struct AssetViewerScreen: View {
         }
     }
 
-    /// A video's transport row owns a stable system safe-area slot for the
-    /// entire page lifetime. Visibility never changes its height, so opening
+    /// A playable asset's transport row owns a stable system safe-area slot for
+    /// the entire page lifetime. Visibility never changes its height, so opening
     /// information cannot rebase the scroll view, and the system places it
     /// above (rather than behind) the native bottom toolbar.
-    @ViewBuilder private var videoControlsBar: some View {
-        if chromePresentation.reservesVideoControls {
-            VideoControlsBar(playback: playback)
-                .padding(.bottom, 4)
-                .opacity(chromePresentation.showsVideoControls ? 1 : 0)
-                .allowsHitTesting(chromePresentation.showsVideoControls)
-                .accessibilityHidden(!chromePresentation.showsVideoControls)
-                .animation(
-                    reduceMotion ? nil : .easeOut(duration: 0.16),
-                    value: chromePresentation.showsVideoControls
-                )
+    @ViewBuilder private var transportControlsBar: some View {
+        if chromePresentation.reservesTransportControls {
+            Group {
+                if current?.isLivePhoto == true {
+                    LivePhotoControlsBar(playback: playback)
+                } else {
+                    VideoControlsBar(playback: playback)
+                }
+            }
+            .padding(.bottom, 4)
+            .opacity(chromePresentation.showsTransportControls ? 1 : 0)
+            .allowsHitTesting(chromePresentation.showsTransportControls)
+            .accessibilityHidden(!chromePresentation.showsTransportControls)
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.16),
+                value: chromePresentation.showsTransportControls
+            )
         }
     }
 
@@ -931,8 +937,8 @@ struct AssetViewerScreen: View {
     private var chromePresentation: AssetViewerChromePresentation {
         let isCompact = horizontalSizeClass != .regular
         let isAtMedia = isCompact ? compactScrollEndpoint == .media : !showInfo
-        let isVideo = current?.isVideo == true
-        let isVideoReady = current.map {
+        let isPlayable = current?.isVideo == true || current?.isLivePhoto == true
+        let isPlayerReady = current.map {
             playback.ownerID == $0.id && playback.player != nil
         } ?? false
         return AssetViewerChromePresentation(
@@ -941,8 +947,8 @@ struct AssetViewerScreen: View {
             isInformationPresented: showInfo,
             isChromeVisible: chromeVisible,
             isContextPreview: isContextPreview,
-            isVideo: isVideo,
-            isVideoReady: isVideoReady
+            isPlayable: isPlayable,
+            isPlayerReady: isPlayerReady
         )
     }
 
@@ -2072,6 +2078,15 @@ private struct AssetPage: View {
             }
         } else if asset.isVideo {
             VideoPlayerPage(
+                asset: asset,
+                deviceIdentifier: deviceIdentifier,
+                isActive: isActive,
+                forcesMute: mutesVideo,
+                playback: playback,
+                onZoomChanged: onZoomChanged
+            )
+        } else if asset.isLivePhoto {
+            LivePhotoPage(
                 asset: asset,
                 deviceIdentifier: deviceIdentifier,
                 isActive: isActive,

@@ -54,7 +54,8 @@ nonisolated struct DeviceAsset: Sendable {
             country: nil,
             createdAt: nil,
             localIdentifier: localIdentifier,
-            isLocalBackedUp: backedUp
+            isLocalBackedUp: backedUp,
+            hasLocalMotion: isLivePhoto
         )
     }
 }

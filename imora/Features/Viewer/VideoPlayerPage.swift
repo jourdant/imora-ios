@@ -22,6 +22,11 @@ final class VideoPlayback {
     private(set) var isBuffering = false
     private(set) var isFailed = false
     private(set) var isScrubbing = false
+    /// the clip has been asked to move at least once. a live photo shows its
+    /// still until this flips, and again once the clip runs out - the still is
+    /// not video frame zero, so deriving this from the position would swap the
+    /// picture underneath anyone stepping back to the start.
+    private(set) var isEngaged = false
     private(set) var duration: Double = 0
     private(set) var currentTime: Double = 0
 
@@ -36,19 +41,29 @@ final class VideoPlayback {
 
     /// context previews force silence regardless of the user toggle.
     @ObservationIgnored private var forcesMute = false
+    /// live photos return to their still once the clip ends instead of holding
+    /// the last frame, which is what makes the page look like a photo again.
+    @ObservationIgnored private var rewindsAtEnd = false
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var statusObservation: NSKeyValueObservation?
     @ObservationIgnored private var itemStatusObservation: NSKeyValueObservation?
     @ObservationIgnored private var endObserver: NSObjectProtocol?
+    /// one frame of the current item, read off its video track. the 30fps
+    /// assumption only stands until that load lands.
+    @ObservationIgnored private var frameInterval = 1.0 / 30
     @ObservationIgnored private var wasPlayingBeforeScrub = false
     @ObservationIgnored private var isSeeking = false
     @ObservationIgnored private var pendingSeekSeconds: Double?
 
+    /// `autoPlays` is false for live photos: their page opens on the still and
+    /// only moves once the viewer asks it to.
     func claim(
         assetID: String,
         forceMuted: Bool,
         seedDuration: Double?,
+        autoPlays: Bool = true,
+        rewindsAtEnd: Bool = false,
         makeItem: @MainActor () async -> AVPlayerItem?
     ) async {
         if ownerID == assetID {
@@ -56,7 +71,7 @@ final class VideoPlayback {
             // preview committing to the full viewer.
             forcesMute = forceMuted
             applyMute()
-            if !forceMuted, !isMuted { activatePlaybackAudioSession() }
+            if !forceMuted, !isMuted, isPlaying { activatePlaybackAudioSession() }
             return
         }
         generation &+= 1
@@ -64,6 +79,7 @@ final class VideoPlayback {
         teardown()
         ownerID = assetID
         forcesMute = forceMuted
+        self.rewindsAtEnd = rewindsAtEnd
         if let seedDuration { duration = seedDuration }
         let item = await makeItem()
         guard gen == generation, !Task.isCancelled else { return }
@@ -75,6 +91,14 @@ final class VideoPlayback {
         self.player = player
         applyMute()
         attachObservers(to: player, item: item)
+        // frame stepping is the only consumer, so the track load trails the
+        // first frame instead of delaying it.
+        Task { [weak self] in
+            guard let interval = await Self.frameInterval(of: item) else { return }
+            guard let self, self.generation == gen else { return }
+            self.frameInterval = interval
+        }
+        guard autoPlays else { return }
         if !forceMuted, !isMuted { activatePlaybackAudioSession() }
         player.play()
     }
@@ -91,6 +115,7 @@ final class VideoPlayback {
         if isPlaying {
             player.pause()
         } else {
+            isEngaged = true
             if duration > 0, currentTime >= duration - 0.1 {
                 player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
                 currentTime = 0
@@ -100,9 +125,24 @@ final class VideoPlayback {
         }
     }
 
+    /// pauses and moves exactly one picture, so a live photo can be walked
+    /// frame by frame. deliberately not `AVPlayerItem.step(byCount:)`: that
+    /// snaps to the next sync sample, which on a real clip skips several
+    /// frames at a time. a zero-tolerance seek decodes to the exact time.
+    func stepFrame(by count: Int) {
+        guard let player, duration > 0, !isFailed else { return }
+        isEngaged = true
+        player.pause()
+        let target = min(max(currentTime + Double(count) * frameInterval, 0), duration)
+        currentTime = target
+        pendingSeekSeconds = target
+        pumpSeek()
+    }
+
     func beginScrubbing() {
         guard !isScrubbing else { return }
         isScrubbing = true
+        isEngaged = true
         wasPlayingBeforeScrub = isPlaying
         player?.pause()
     }
@@ -144,6 +184,14 @@ final class VideoPlayback {
 
     private func applyMute() {
         player?.isMuted = forcesMute || isMuted
+    }
+
+    private nonisolated static func frameInterval(of item: AVPlayerItem) async -> Double? {
+        guard let track = try? await item.asset.loadTracks(withMediaType: .video).first,
+              let rate = try? await track.load(.nominalFrameRate),
+              rate > 0
+        else { return nil }
+        return 1 / Double(rate)
     }
 
     private func attachObservers(to player: AVPlayer, item: AVPlayerItem) {
@@ -191,7 +239,13 @@ final class VideoPlayback {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.currentTime = self.duration
+                guard self.rewindsAtEnd else {
+                    self.currentTime = self.duration
+                    return
+                }
+                self.player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+                self.currentTime = 0
+                self.isEngaged = false
             }
         }
     }
@@ -205,6 +259,8 @@ final class VideoPlayback {
         endObserver = nil
         pendingSeekSeconds = nil
         isSeeking = false
+        rewindsAtEnd = false
+        frameInterval = 1.0 / 30
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
@@ -212,6 +268,7 @@ final class VideoPlayback {
         isBuffering = false
         isFailed = false
         isScrubbing = false
+        isEngaged = false
         duration = 0
         currentTime = 0
     }
@@ -236,8 +293,9 @@ struct VideoPlayerPage: View {
             contentID: asset.id,
             onZoomChanged: onZoomChanged
         ) {
-            VideoSurfaceStack(
+            MediaSurfaceStack(
                 assetID: asset.id,
+                mode: .video,
                 posterLocalIdentifier: deviceIdentifier,
                 posterURL: posterURL,
                 posterFallbackURL: posterFallbackURL,
@@ -291,16 +349,40 @@ struct VideoPlayerPage: View {
     }
 }
 
+/// what the still underneath means for a given page. a video's poster is only
+/// a placeholder, while a live photo's still is the asset itself and stays
+/// visible whenever the clip is parked at its start.
+enum MediaSurfaceMode {
+    case video
+    case livePhoto
+}
+
 /// hosted inside the zoom container, so it reads the playback observable
 /// itself - the container only reassigns its root when the content id
 /// changes, and the video surface has to appear without that.
-private struct VideoSurfaceStack: View {
+struct MediaSurfaceStack: View {
     let assetID: String
+    let mode: MediaSurfaceMode
     let posterLocalIdentifier: String?
     let posterURL: URL?
     let posterFallbackURL: URL?
     let thumbhash: String?
     let playback: VideoPlayback
+    /// only a live photo needs this: its still is the asset, so losing the
+    /// device copy would leave an empty page rather than a stale poster.
+    var onPosterUnavailable: (() -> Void)?
+
+    /// a live photo shows its own still until the clip actually moves, so the
+    /// page renders full-resolution pixels rather than a video frame at rest.
+    private var showsVideo: Bool {
+        guard playback.ownerID == assetID, playback.player != nil else { return false }
+        switch mode {
+        case .video:
+            return true
+        case .livePhoto:
+            return playback.isEngaged
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -309,7 +391,8 @@ private struct VideoSurfaceStack: View {
                     localIdentifier: posterLocalIdentifier,
                     targetPixelSize: pagePixelSize,
                     fallbackTargetPixelSize: 640,
-                    contentMode: .fit
+                    contentMode: .fit,
+                    onUnavailable: { onPosterUnavailable?() }
                 )
             } else if let posterURL {
                 RemoteImage(
@@ -321,7 +404,7 @@ private struct VideoSurfaceStack: View {
                     contentMode: .fit
                 )
             }
-            if playback.ownerID == assetID, let player = playback.player {
+            if showsVideo, let player = playback.player {
                 VideoPlayerSurface(player: player)
             }
         }
@@ -332,7 +415,7 @@ private struct VideoSurfaceStack: View {
 
 /// bare video layer with no transport chrome. hidden until the first frame is
 /// ready, then fades over the poster rather than popping in mid-render.
-private struct VideoPlayerSurface: UIViewRepresentable {
+struct VideoPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
 
     final class LayerView: UIView {
@@ -430,8 +513,9 @@ struct VideoControlsBar: View {
 
 /// drag anywhere on the track to seek; the bar thickens while scrubbing like
 /// the system players.
-private struct VideoScrubber: View {
+struct VideoScrubber: View {
     let playback: VideoPlayback
+    var identifier = "video-scrubber"
 
     var body: some View {
         GeometryReader { geometry in
@@ -461,11 +545,11 @@ private struct VideoScrubber: View {
             )
         }
         .frame(height: 30)
-        .accessibilityIdentifier("video-scrubber")
+        .accessibilityIdentifier(identifier)
     }
 }
 
-private func videoTimeLabel(_ seconds: Double) -> String {
+func videoTimeLabel(_ seconds: Double) -> String {
     let total = max(0, Int(seconds.rounded()))
     let h = total / 3600
     let m = (total % 3600) / 60

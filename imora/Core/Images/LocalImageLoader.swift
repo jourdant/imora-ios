@@ -19,6 +19,8 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     /// photokit only ever answers through a callback.
     private let cache: NSCache<NSString, UIImage>
     private let assets = OSAllocatedUnfairLock<[String: PHAsset]>(initialState: [:])
+    /// exported live photo motion files in least-recently-used order.
+    private let motionFiles = OSAllocatedUnfairLock<[URL]>(initialState: [])
     /// a window can be eighty identifiers wide and every miss is a synchronous
     /// library query, so the bookkeeping stays off the caller's thread. serial
     /// keeps a stop from overtaking the start it cancels.
@@ -129,5 +131,86 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                 continuation.resume(returning: item)
             }
         }
+    }
+
+    // MARK: - live photo motion
+
+    /// exported motion halves, newest last. the viewer seeks through these, so
+    /// they outlive a single page, but browsing a library of live photos would
+    /// otherwise fill the temp directory a few megabytes at a time.
+    private static let motionCacheLimit = 24
+
+    private var motionDirectory: URL {
+        FileManager.default.temporaryDirectory.appending(path: "live-photo-motion")
+    }
+
+    /// motion half of a device live photo as a seekable item. photokit only
+    /// vends live photos as `PHLivePhoto`, which plays as an opaque unit and
+    /// cannot be scrubbed, so the paired video resource is exported instead.
+    func motionPlayerItem(localIdentifier: String, allowsNetwork: Bool = true) async -> AVPlayerItem? {
+        guard let url = await motionFile(localIdentifier: localIdentifier, allowsNetwork: allowsNetwork)
+        else { return nil }
+        return AVPlayerItem(url: url)
+    }
+
+    /// concurrent for the same reason as `image`: the resource lookup and the
+    /// export are both blocking photokit work.
+    @concurrent
+    private func motionFile(localIdentifier: String, allowsNetwork: Bool) async -> URL? {
+        let directory = motionDirectory
+        // localidentifiers carry a "uuid/L0/001" shape that cannot be a path.
+        let name = localIdentifier.replacingOccurrences(of: "/", with: "_")
+        let destination = directory.appending(path: "\(name).mov")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            noteMotionUse(destination)
+            return destination
+        }
+
+        guard let asset = fetchAsset(localIdentifier) else { return nil }
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .fullSizePairedVideo })
+            ?? resources.first(where: { $0.type == .pairedVideo })
+        else { return nil }
+
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = allowsNetwork
+        // written to a unique path first: an interrupted write would otherwise
+        // leave a truncated file that every later play would trust.
+        let staging = directory.appending(path: "staging-\(UUID().uuidString).mov")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                PHAssetResourceManager.default().writeData(for: resource, toFile: staging, options: options) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+            // a concurrent export of the same asset may have landed first.
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try? FileManager.default.removeItem(at: staging)
+            } else {
+                try FileManager.default.moveItem(at: staging, to: destination)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            return nil
+        }
+        noteMotionUse(destination)
+        return destination
+    }
+
+    /// keeps the export directory bounded, evicting whatever was touched least
+    /// recently rather than whatever happens to be on screen.
+    private func noteMotionUse(_ url: URL) {
+        let evicted = motionFiles.withLock { files -> URL? in
+            files.removeAll { $0 == url }
+            files.append(url)
+            guard files.count > Self.motionCacheLimit else { return nil }
+            return files.removeFirst()
+        }
+        if let evicted { try? FileManager.default.removeItem(at: evicted) }
     }
 }

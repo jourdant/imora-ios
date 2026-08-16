@@ -1264,7 +1264,7 @@ struct AssetInfoPanel: View {
 
     private func fileIcon(for type: AssetType) -> String {
         switch type {
-        case .image: "photo"
+        case .image: asset.isLivePhoto ? "livephoto" : "photo"
         case .video: "video"
         case .audio: "waveform"
         case .other: "doc"
@@ -1288,6 +1288,8 @@ struct AssetInfoPanel: View {
         }
         if let duration = asset.durationLabel {
             parts.append(duration)
+        } else if asset.isLivePhoto {
+            parts.append("Live Photo")
         }
 
         return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
