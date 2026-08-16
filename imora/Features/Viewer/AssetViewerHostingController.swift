@@ -104,6 +104,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         session: SessionStore,
         sourceRegistry: AssetTileRegistry,
         album: AlbumContext?,
+        personID: String?,
         willPresent: @escaping (ViewerRoute) -> Bool,
         didDismiss: @escaping (UUID) -> Void,
         onChange: @escaping (AssetChange) -> Void
@@ -125,6 +126,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             displayState: state,
             dismissalRelay: relay,
             album: album,
+            personID: personID,
             onChange: onChange
         )
         .environment(session)
@@ -373,6 +375,7 @@ private struct AssetViewerHostRoot: View {
     let displayState: AssetViewerDisplayState
     let dismissalRelay: AssetViewerDismissalRelay
     let album: AlbumContext?
+    let personID: String?
     let onChange: (AssetChange) -> Void
 
     @ViewBuilder var body: some View {
@@ -382,6 +385,7 @@ private struct AssetViewerHostRoot: View {
             presentationID: route.id,
             isContextPreview: displayState.mode == .contextPreview,
             album: album,
+            personID: personID,
             onRequestDismissal: { dismissalRelay.request() },
             onSelectionChanged: { displayState.currentAssetID = $0 },
             onPageZoomChanged: { displayState.currentPageZoomed = $0 },

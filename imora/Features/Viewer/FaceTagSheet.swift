@@ -165,13 +165,10 @@ struct FaceTagSheet: View {
             selection = isSelected ? nil : person
         } label: {
             HStack(spacing: 12) {
-                if let client = session.client {
-                    RemoteImage(
-                        url: client.personThumbnailURL(personID: person.id),
-                        targetPixelSize: 120
-                    )
-                    .frame(width: 48, height: 48)
-                    .clipShape(.circle)
+                if let url = session.personThumbnailURL(personID: person.id) {
+                    RemoteImage(url: url, targetPixelSize: 120)
+                        .frame(width: 48, height: 48)
+                        .clipShape(.circle)
                 }
                 Text(person.name.isEmpty ? "Unnamed" : person.name)
                     .foregroundStyle(.primary)

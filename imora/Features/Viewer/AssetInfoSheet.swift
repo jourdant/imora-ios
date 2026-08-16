@@ -581,13 +581,10 @@ struct AssetInfoPanel: View {
             }
         } label: {
             VStack(spacing: 6) {
-                if let client = session.client, !person.isPending {
-                    RemoteImage(
-                        url: client.personThumbnailURL(personID: person.id),
-                        targetPixelSize: 160
-                    )
-                    .frame(width: 72, height: 72)
-                    .clipShape(.circle)
+                if let url = session.personThumbnailURL(personID: person.id), !person.isPending {
+                    RemoteImage(url: url, targetPixelSize: 160)
+                        .frame(width: 72, height: 72)
+                        .clipShape(.circle)
                 } else {
                     Circle()
                         .fill(.quaternary)

@@ -17,6 +17,11 @@ final class ThumbnailPrefetcher {
     private let targetPixelSize: CGFloat
     private var remote: Set<URL> = []
     private var local: Set<String> = []
+    /// the asset range last warmed, with the `flatAssets` revision it was taken
+    /// from. a fling reports visible rows far more often than the window it
+    /// implies actually moves, and rebuilding it costs a url per asset.
+    private var window: Range<Int>?
+    private var windowVersion = -1
 
     init(targetPixelSize: CGFloat = 640) {
         self.targetPixelSize = targetPixelSize
@@ -34,8 +39,14 @@ final class ThumbnailPrefetcher {
         let upper = min(assets.count, anchor + Self.lookAhead)
         guard lower < upper else { return cancel() }
 
+        let version = model.flatAssetsVersion
+        guard window != lower..<upper || windowVersion != version else { return }
+        window = lower..<upper
+        windowVersion = version
+
         var remote: Set<URL> = []
         var local: Set<String> = []
+        remote.reserveCapacity(upper - lower)
         for asset in assets[lower..<upper] {
             // tiles render the device copy when one is paired, so warm the
             // same source the tile will actually ask for.
@@ -51,10 +62,12 @@ final class ThumbnailPrefetcher {
     /// warms an explicit window, for hosts that already know theirs: the
     /// viewer pages a flat list and picks its own thumbnail size.
     func warm(remote: Set<URL>, local: Set<String>) {
+        window = nil
         apply(remote: remote, local: local)
     }
 
     func cancel() {
+        window = nil
         apply(remote: [], local: [])
     }
 

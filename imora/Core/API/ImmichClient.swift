@@ -27,10 +27,19 @@ nonisolated final class ImmichClient: Sendable {
     let apiURL: URL
     let accessToken: String
     private let session: URLSession
+    /// `apiURL` with a trailing slash, so media urls are plain concatenation.
+    private let mediaBase: String
+    /// what `URL.appending(queryItems:)` actually escapes in a value. matched
+    /// exactly, because the thumbnail url is the image cache key.
+    private static let queryValueAllowed = CharacterSet.urlQueryAllowed
+        .subtracting(CharacterSet(charactersIn: "&="))
 
     init(apiURL: URL, accessToken: String) {
         self.apiURL = apiURL
         self.accessToken = accessToken
+        var base = apiURL.absoluteString
+        if !base.hasSuffix("/") { base += "/" }
+        mediaBase = base
         let config = URLSessionConfiguration.default
         config.httpAdditionalHeaders = [
             "Authorization": "Bearer \(accessToken)",
@@ -189,6 +198,12 @@ nonisolated final class ImmichClient: Sendable {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// concurrent, like every decode below it. default actor isolation is
+    /// MainActor here and approachable concurrency keeps a plain nonisolated
+    /// async body on the caller's actor, so without this a timeline bucket -
+    /// thousands of assets of columnar json - would be parsed on the main
+    /// thread, in the middle of the scroll that asked for it.
+    @concurrent
     private func send(
         path: String,
         method: String = "GET",
@@ -211,7 +226,8 @@ nonisolated final class ImmichClient: Sendable {
         return data
     }
 
-    private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+    @concurrent
+    private func get<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
         let data = try await send(path: path, query: query)
         do {
             return try JSONDecoder().decode(T.self, from: data)
@@ -220,7 +236,12 @@ nonisolated final class ImmichClient: Sendable {
         }
     }
 
-    private func request<T: Decodable, B: Encodable>(_ path: String, method: String, body: B) async throws -> T {
+    @concurrent
+    private func request<T: Decodable & Sendable, B: Encodable & Sendable>(
+        _ path: String,
+        method: String,
+        body: B
+    ) async throws -> T {
         let data = try await send(path: path, method: method, body: JSONEncoder().encode(body))
         do {
             return try JSONDecoder().decode(T.self, from: data)
@@ -256,6 +277,10 @@ nonisolated final class ImmichClient: Sendable {
         try await get("timeline/buckets", query: filter.queryItems)
     }
 
+    /// concurrent so the columnar expansion - one asset struct and one parsed
+    /// date per photo in the month - is unpacked off the main thread too,
+    /// alongside the decode that produced it.
+    @concurrent
     func timeBucket(_ bucket: String, filter: TimelineFilter) async throws -> [Asset] {
         var query = filter.queryItems
         query.append(URLQueryItem(name: "timeBucket", value: bucket))
@@ -333,15 +358,22 @@ nonisolated final class ImmichClient: Sendable {
     /// false to fetch the untouched picture, e.g. inside the editor.
     /// cacheKey is the thumbhash, the official cache-buster: it changes when
     /// derivatives are re-rendered, so edits invalidate stale cached thumbs.
+    /// assembled by hand rather than through urlcomponents: a fling asks for a
+    /// hundred of these a frame and `appending(queryItems:)` reparses the whole
+    /// url every call. the output is byte for byte what foundation produced, so
+    /// thumbnails already on disk still hit.
     func thumbnailURL(assetID: String, size: String = "thumbnail", edited: Bool = true, cacheKey: String? = nil) -> URL {
-        var query = [
-            URLQueryItem(name: "size", value: size),
-            URLQueryItem(name: "edited", value: edited ? "true" : "false"),
-        ]
+        var string = mediaBase
+        string += "assets/"
+        string += assetID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? assetID
+        string += "/thumbnail?size="
+        string += size
+        string += edited ? "&edited=true" : "&edited=false"
         if let cacheKey, !cacheKey.isEmpty {
-            query.append(URLQueryItem(name: "c", value: cacheKey))
+            string += "&c="
+            string += cacheKey.addingPercentEncoding(withAllowedCharacters: Self.queryValueAllowed) ?? cacheKey
         }
-        return apiURL.appending(path: "assets/\(assetID)/thumbnail").appending(queryItems: query)
+        return URL(string: string) ?? apiURL
     }
 
     /// raw original bytes. no edited param: backup dedup and download both
@@ -362,8 +394,12 @@ nonisolated final class ImmichClient: Sendable {
         apiURL.appending(path: "assets/\(assetID)/video/playback")
     }
 
-    func personThumbnailURL(personID: String) -> URL {
-        apiURL.appending(path: "people/\(personID)/thumbnail")
+    /// cacheKey busts the portrait a featured-photo change re-rendered; the
+    /// url is otherwise stable for the person's whole life.
+    func personThumbnailURL(personID: String, cacheKey: String? = nil) -> URL {
+        let url = apiURL.appending(path: "people/\(personID)/thumbnail")
+        guard let cacheKey, !cacheKey.isEmpty else { return url }
+        return url.appending(queryItems: [URLQueryItem(name: "c", value: cacheKey)])
     }
 
     func profileImageURL(userID: String) -> URL {
@@ -588,19 +624,23 @@ nonisolated final class ImmichClient: Sendable {
     }
 
     /// birthDate is date-only "yyyy-MM-dd"; pass .some(nil) to clear it on
-    /// the server, omit to leave it untouched.
+    /// the server, omit to leave it untouched. featureFaceAssetID names the
+    /// asset whose face becomes the portrait - the server then re-renders the
+    /// thumbnail in a job and announces it over the socket.
     func updatePerson(
         id: String,
         name: String? = nil,
         birthDate: String?? = nil,
         isHidden: Bool? = nil,
-        isFavorite: Bool? = nil
+        isFavorite: Bool? = nil,
+        featureFaceAssetID: String? = nil
     ) async throws {
         var body: [String: AnyEncodable] = [:]
         if let name { body["name"] = AnyEncodable(name) }
         if let birthDate { body["birthDate"] = AnyEncodable(birthDate) }
         if let isHidden { body["isHidden"] = AnyEncodable(isHidden) }
         if let isFavorite { body["isFavorite"] = AnyEncodable(isFavorite) }
+        if let featureFaceAssetID { body["featureFaceAssetId"] = AnyEncodable(featureFaceAssetID) }
         try await mutate("people/\(id)", method: "PUT", body: body)
     }
 

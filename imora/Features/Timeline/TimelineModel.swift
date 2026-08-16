@@ -287,6 +287,10 @@ final class TimelineModel {
     private(set) var isLoading = false
     private(set) var loadError: String?
     private(set) var flatAssets: [Asset] = []
+    /// bumped whenever `flatAssets` is replaced. lets the prefetcher tell a
+    /// window that merely slid from one whose contents moved underneath it,
+    /// without comparing the assets themselves on every scroll callback.
+    @ObservationIgnored private(set) var flatAssetsVersion = 0
 
     /// row tallies kept in sync by rebuildRows so screens can do o(1) height
     /// math instead of summing thousands of rows.
@@ -328,6 +332,7 @@ final class TimelineModel {
     private var rebuildTask: Task<Void, Never>?
     private var hasLoaded = false
     private var isViewerSuspended = false
+    private var isRebuildDeferred = false
     private var rebuildPending = false
     /// device assets paired with backup status, merged during row building.
     private var localItems: [LocalTimelineItem] = []
@@ -735,6 +740,7 @@ final class TimelineModel {
             if rebuildAssets {
                 self.flatAssets = flattened
                 self.flatAssetIndexByID = flattenedIndex
+                self.flatAssetsVersion &+= 1
             }
             self.titleBandCount = titleBands
             self.tileRowCount = tileRows
@@ -798,15 +804,32 @@ final class TimelineModel {
 
     private func scheduleRebuild() {
         rebuildPending = true
-        guard !isViewerSuspended, rebuildTask == nil else { return }
+        guard !isViewerSuspended, !isRebuildDeferred, rebuildTask == nil else { return }
         rebuildTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self else { return }
             self.rebuildTask = nil
-            guard !self.isViewerSuspended else { return }
+            guard !self.isViewerSuspended, !self.isRebuildDeferred else { return }
             self.rebuildPending = false
             self.rebuildRows(rebuildAssets: true)
         }
+    }
+
+    /// held for the length of a scrubber drag. buckets the drag passes still
+    /// load and keep their days, but reflowing the whole library every 250ms
+    /// under a finger that is about to be somewhere else is work nobody sees -
+    /// and the scrubber freezes its own month layout for the same reason.
+    func deferRebuilds() {
+        guard !isRebuildDeferred else { return }
+        isRebuildDeferred = true
+        rebuildTask?.cancel()
+        rebuildTask = nil
+    }
+
+    func resumeRebuilds() {
+        guard isRebuildDeferred else { return }
+        isRebuildDeferred = false
+        if rebuildPending { scheduleRebuild() }
     }
 
     func suspendForViewer() {
@@ -1436,20 +1459,23 @@ final class TimelineModel {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone(identifier: "UTC")!
         var groups: [DayGroup] = []
-        var currentKey = ""
+        var currentKey = Int.min
         var currentAssets: [Asset] = []
         var currentDate = Date()
 
         func flush() {
             guard !currentAssets.isEmpty else { return }
-            groups.append(DayGroup(id: currentKey, title: dayTitle(currentDate, calendar: calendar), assets: currentAssets))
+            groups.append(DayGroup(id: String(currentKey), title: dayTitle(currentDate, calendar: calendar), assets: currentAssets))
             currentAssets = []
         }
 
         for asset in assets {
             let local = byUploadDate ? asset.uploadLocalDate : asset.localDate
-            let components = calendar.dateComponents([.year, .month, .day], from: local)
-            let key = "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
+            // day index rather than calendar components: both of those dates
+            // are already shifted into utc space, where a day is exactly
+            // 86400 seconds, and asking the calendar per asset was most of
+            // what a bucket load cost.
+            let key = Int((local.timeIntervalSince1970 / 86_400).rounded(.down))
             if key != currentKey {
                 flush()
                 currentKey = key

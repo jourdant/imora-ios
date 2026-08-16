@@ -41,11 +41,14 @@ struct AlbumAddAssetsSheet: View {
                             .padding(.bottom, 8)
                     }
 
+                    // ids rather than indices: enumerating copied every asset
+                    // in the grid on every pass just to find the tail.
+                    let paginationIDs = Set(model.assets.suffix(12).lazy.map(\.id))
                     LazyVGrid(columns: columns, spacing: 2) {
-                        ForEach(Array(model.assets.enumerated()), id: \.element.id) { index, asset in
+                        ForEach(model.assets) { asset in
                             tile(asset)
                                 .onAppear {
-                                    if index >= model.assets.count - 12 {
+                                    if paginationIDs.contains(asset.id) {
                                         model.loadMore()
                                     }
                                 }

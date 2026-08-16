@@ -164,6 +164,16 @@ final class SessionStore {
         backup?.startIfIdle()
     }
 
+    /// portrait url for a person, carrying the cache-buster the socket handed
+    /// out when the server last re-rendered them. every avatar goes through
+    /// here so a new featured photo shows up everywhere at once.
+    func personThumbnailURL(personID: String) -> URL? {
+        client?.personThumbnailURL(
+            personID: personID,
+            cacheKey: realtime?.personThumbnailKeys[personID]
+        )
+    }
+
     func beginProfileImageMutation(data: Data) -> ProfileImageMutationToken? {
         guard !isProfileImageMutationInFlight else { return nil }
         let token = ProfileImageMutationToken(

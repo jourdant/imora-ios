@@ -220,6 +220,10 @@ struct TimelineScreen<Header: View>: View {
     /// Keeps AlbumDetail's metadata header in lockstep with direct grid
     /// removals without coupling this reusable screen to album state.
     var onAlbumAssetCountDelta: ((Int) -> Void)?
+    /// one-shot picker: while set, a tap hands the photo back instead of
+    /// opening it, and nothing else on a tile responds. person pages choose a
+    /// featured photo this way.
+    var onPickAsset: ((Asset) -> Void)?
     @Binding private var serverCommand: TimelineServerCommand?
     let header: Header
 
@@ -272,6 +276,7 @@ struct TimelineScreen<Header: View>: View {
         resyncTrigger: Int = 0,
         albumOwnerID: String? = nil,
         onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
+        onPickAsset: ((Asset) -> Void)? = nil,
         serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
@@ -284,10 +289,13 @@ struct TimelineScreen<Header: View>: View {
         self.resyncTrigger = resyncTrigger
         self.albumOwnerID = albumOwnerID
         self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
+        self.onPickAsset = onPickAsset
         _serverCommand = serverCommand
         self.header = header()
         _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
+
+    private var isPicking: Bool { onPickAsset != nil }
 
     private func tileSide(for width: CGFloat) -> CGFloat {
         AssetGridLayout.tileSide(viewportWidth: width, columns: columnCount)
@@ -502,7 +510,7 @@ struct TimelineScreen<Header: View>: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(showsLargeTitle ? .large : .inline)
         .toolbar {
-            if isSelecting {
+            if isSelecting, !isPicking {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { exitSelection() }
                         .disabled(isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs))
@@ -511,7 +519,7 @@ struct TimelineScreen<Header: View>: View {
         }
         .overlay { overlayState }
         .overlay(alignment: .bottom) {
-            if isSelecting {
+            if isSelecting, !isPicking {
                 SelectionActionBar(
                     count: selection.count,
                     filter: filter,
@@ -547,6 +555,10 @@ struct TimelineScreen<Header: View>: View {
         }
         .onChange(of: resyncTrigger) {
             model.requestResync()
+        }
+        // a selection made before the mode began would come back with it.
+        .onChange(of: isPicking) { _, picking in
+            if picking { exitSelection() }
         }
         .onChange(of: serverCommand) { _, command in
             guard let command else { return }
@@ -700,9 +712,14 @@ struct TimelineScreen<Header: View>: View {
     }
 
     @ViewBuilder private func tile(_ asset: Asset) -> some View {
+        // picking wants one photo and nothing else, so a tile carries neither
+        // the long-press menu nor a viewer of its own while the mode is on.
+        if let onPickAsset {
+            AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
+                .onTapGesture { onPickAsset(asset) }
         // selection mode keeps taps as the only gesture, like the system
         // photos app.
-        if isSelecting {
+        } else if isSelecting {
             AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
                 .overlay(alignment: .topLeading) {
                     if isSelectable(asset) {
@@ -1034,6 +1051,7 @@ struct TimelineScreen<Header: View>: View {
             session: session,
             sourceRegistry: tileRegistry,
             album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
+            personID: filter.personId,
             willPresent: { route in beginViewerPresentation(route) },
             didDismiss: { id in finishViewer(id) },
             onChange: { change in handleViewerChange(change) }

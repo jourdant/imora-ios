@@ -10,9 +10,6 @@ struct RemoteImage: View {
     var fallbackURL: URL?
     var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
-    /// reports loaded, fallback, placeholder or empty so hosts can expose the
-    /// state to ui tests without altering this view's accessibility tree.
-    var onPhaseChange: ((String) -> Void)?
 
     @State private var image: KeyedImage?
     @State private var placeholder: KeyedImage?
@@ -27,27 +24,36 @@ struct RemoteImage: View {
         ImageLoader.shared.requestKey(for: url, targetPixelSize: targetPixelSize)
     }
 
-    private var taskID: String {
-        "\(requestKey)|\(thumbhash ?? "")"
-    }
-
     private var fallbackPixelSize: CGFloat {
         fallbackTargetPixelSize ?? targetPixelSize
     }
 
+    /// walked in priority order and stopped at the first hit, so a tile already
+    /// holding its image never touches the pipeline cache: the lookup builds a
+    /// request and takes the cache's lock, and a grid runs it once per tile per
+    /// pass.
+    private func displayImage(key: String) -> UIImage? {
+        if let image, image.key == key { return image.image }
+        if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
+            return cached
+        }
+        if let fallbackImage, fallbackImage.key == key { return fallbackImage.image }
+        if let fallbackURL,
+           let cached = ImageLoader.shared.cachedImage(for: fallbackURL, targetPixelSize: fallbackPixelSize) {
+            return cached
+        }
+        if let placeholder, placeholder.key == key { return placeholder.image }
+        return nil
+    }
+
     var body: some View {
-        let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
-        let loaded = image?.key == requestKey ? image?.image : cached
-        let fallback = (fallbackImage?.key == requestKey ? fallbackImage?.image : nil)
-            ?? fallbackURL.flatMap {
-                ImageLoader.shared.cachedImage(for: $0, targetPixelSize: fallbackPixelSize)
-            }
-        let decodedPlaceholder = placeholder?.key == requestKey ? placeholder?.image : nil
-        let displayImage = loaded ?? fallback ?? decodedPlaceholder
-        let phase = loaded != nil ? "loaded" : fallback != nil ? "fallback" : decodedPlaceholder != nil ? "placeholder" : "empty"
+        // one string build per pass instead of the five the computed keys used
+        // to cost; a grid tile's key is a full url and this is its hot path.
+        let key = requestKey
+        let taskID = "\(key)|\(thumbhash ?? "")"
 
         ZStack {
-            if let displayImage {
+            if let displayImage = displayImage(key: key) {
                 Image(uiImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
@@ -58,9 +64,6 @@ struct RemoteImage: View {
             } else {
                 Color(.secondarySystemFill)
             }
-        }
-        .onChange(of: phase, initial: true) { _, newPhase in
-            onPhaseChange?(newPhase)
         }
         .task(id: taskID) {
             if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
@@ -125,7 +128,6 @@ struct LocalPhotoImage: View {
     /// instead of a placeholder while photokit produces the big one.
     var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
-    var onPhaseChange: ((String) -> Void)?
     /// photokit could not produce the asset - it was deleted from the library
     /// behind our back, or is an icloud original that will not download. hosts
     /// use this to fall back to the server copy instead of showing nothing.
@@ -151,8 +153,12 @@ struct LocalPhotoImage: View {
     }
 
     var body: some View {
-        let cached = LocalImageLoader.shared.cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize)
-        let display = (image?.key == requestKey ? image?.image : cached) ?? cachedFallback
+        let key = requestKey
+        // the photokit cache is only consulted when this view is not already
+        // holding the render, the same short circuit remoteimage takes.
+        let display = (image?.key == key ? image?.image : nil)
+            ?? LocalImageLoader.shared.cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize)
+            ?? cachedFallback
         ZStack {
             if let display {
                 Image(uiImage: display)
@@ -165,11 +171,7 @@ struct LocalPhotoImage: View {
                 Color(.secondarySystemFill)
             }
         }
-        .onChange(of: display == nil, initial: true) { _, isEmpty in
-            onPhaseChange?(isEmpty ? "empty" : "loaded")
-        }
-        .task(id: requestKey) {
-            let key = requestKey
+        .task(id: key) {
             guard image?.key != key else { return }
             let start = ContinuousClock.now
             let loaded = await LocalImageLoader.shared.image(
@@ -198,7 +200,6 @@ struct AssetTile: View {
     /// the main timeline shows these, matching the official client.
     var showsBackupBadge = false
 
-    @State private var thumbnailPhase = "empty"
     /// set when photokit cannot serve the paired device copy, so the tile
     /// stops asking and renders the server thumbnail instead.
     @State private var localUnavailable = false
@@ -218,15 +219,13 @@ struct AssetTile: View {
                 if let localId = deviceIdentifier {
                     LocalPhotoImage(
                         localIdentifier: localId,
-                        onPhaseChange: { thumbnailPhase = $0 },
                         onUnavailable: { localUnavailable = true }
                     )
                 } else if let client = session.client {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
                         targetPixelSize: 640,
-                        thumbhash: asset.thumbhash,
-                        onPhaseChange: { thumbnailPhase = $0 }
+                        thumbhash: asset.thumbhash
                     )
                 }
             }
@@ -268,14 +267,6 @@ struct AssetTile: View {
             .accessibilityLabel(accessibilitySummary)
             .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier("asset-tile")
-            // "assetid|phase" lets ui tests target one tile and observe its
-            // thumbnail state at the same time; badge grids append the badge
-            // state as a third segment.
-            .accessibilityValue(
-                showsBackupBadge
-                    ? "\(asset.id)|\(thumbnailPhase)|\(badgeToken)"
-                    : "\(asset.id)|\(thumbnailPhase)"
-            )
     }
 
     private var accessibilitySummary: String {
@@ -309,19 +300,6 @@ struct AssetTile: View {
     private var uploadState: LocalUploadState? {
         guard let localId = asset.localIdentifier else { return nil }
         return session.backup?.uploadStates[localId]
-    }
-
-    private var badgeToken: String {
-        switch uploadState {
-        case .uploading: "uploading"
-        case .failed: "error"
-        case nil:
-            if asset.isLocal {
-                asset.isLocalBackedUp ? "cloud-done" : "cloud-off"
-            } else {
-                session.backup?.backedUpRemoteIds.contains(asset.id) == true ? "cloud-done" : "cloud"
-            }
-        }
     }
 
     @ViewBuilder private var backupBadge: some View {

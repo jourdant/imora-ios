@@ -271,6 +271,9 @@ struct AssetViewerScreen: View {
     let isContextPreview: Bool
     /// set when the grid behind is an album, which adds removal to the menu.
     let album: AlbumContext?
+    /// set when the grid behind belongs to one person, which lets the photo on
+    /// screen become their portrait.
+    let personID: String?
 
     @State private var assets: [Asset]
     @State private var currentIndex: Int
@@ -322,6 +325,7 @@ struct AssetViewerScreen: View {
         zoomNamespace: Namespace.ID? = nil,
         isContextPreview: Bool = false,
         album: AlbumContext? = nil,
+        personID: String? = nil,
         onRequestDismissal: (() -> Void)? = nil,
         onSelectionChanged: @escaping (String) -> Void = { _ in },
         onPageZoomChanged: @escaping (Bool) -> Void = { _ in },
@@ -337,6 +341,7 @@ struct AssetViewerScreen: View {
         self.zoomNamespace = zoomNamespace
         self.isContextPreview = isContextPreview
         self.album = album
+        self.personID = personID
         self.onRequestDismissal = onRequestDismissal
         self.onSelectionChanged = onSelectionChanged
         self.onPageZoomChanged = onPageZoomChanged
@@ -370,6 +375,13 @@ struct AssetViewerScreen: View {
         guard let asset = current else { return false }
         guard let userID = session.user?.id else { return true }
         return asset.ownerId == userID
+    }
+
+    /// the portrait is cropped from a face the server already detected on the
+    /// photo, so this only stands up for the server copy of a live asset.
+    private var canSetFeaturedPhoto: Bool {
+        guard personID != nil, let asset = current else { return false }
+        return !asset.isLocal && !asset.isTrashed
     }
 
     /// the server takes a removal from the album's owner or from the owner of
@@ -1211,6 +1223,13 @@ struct AssetViewerScreen: View {
                             }
                             .accessibilityIdentifier("viewer-similar")
                         }
+                        if canSetFeaturedPhoto {
+                            Button { Task { await setFeaturedPhoto() } } label: {
+                                Label("Set as Featured Photo", systemImage: "person.crop.square")
+                            }
+                            .accessibilityIdentifier("viewer-featured-photo")
+                            .disabled(mutatingAssetIDs.contains(current.id))
+                        }
                         if current.isImage, ownsCurrent {
                             Button { showProfileCrop = true } label: {
                                 Label("Set as Profile Picture", systemImage: "person.crop.circle")
@@ -1587,6 +1606,21 @@ struct AssetViewerScreen: View {
         } catch {
             rollbackOptimisticRemoval(asset.id)
             ErrorToastCenter.shared.show("Couldn’t update the archive", error: error)
+        }
+    }
+
+    /// makes this photo the person's portrait. the server picks their face out
+    /// of it and re-renders the thumbnail in a job, announcing it over the
+    /// socket - which is what refreshes the avatars, not this call returning.
+    private func setFeaturedPhoto() async {
+        guard let client = session.client, let personID, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        do {
+            try await client.updatePerson(id: personID, featureFaceAssetID: asset.id)
+            toast = "Featured photo updated"
+        } catch {
+            ErrorToastCenter.shared.show("Couldn’t set the featured photo", error: error)
         }
     }
 

@@ -13,6 +13,10 @@ struct PersonScreen: View {
     @State private var showBirthDate = false
     @State private var showMerge = false
     @State private var mutationInFlight = false
+    /// the grid is standing in for a photo picker, so it shows no header, no
+    /// portrait and no way out other than cancelling.
+    @State private var isPickingFeatured = false
+    @State private var toast: String?
 
     init(person: Person) {
         _person = State(initialValue: person)
@@ -20,36 +24,52 @@ struct PersonScreen: View {
 
     var body: some View {
         TimelineScreen(
-            title: person.name.isEmpty ? "Unnamed" : person.name,
+            title: isPickingFeatured ? "Select Featured Photo" : (person.name.isEmpty ? "Unnamed" : person.name),
             filter: TimelineFilter(personId: person.id),
             emptyIcon: "person.crop.circle",
             emptyMessage: "No photos of this person",
             showsLargeTitle: false,
             resyncTrigger: resyncTrigger,
+            onPickAsset: isPickingFeatured ? { asset in Task { await setFeaturedPhoto(asset) } } : nil,
             header: {
-                PersonHeader(
-                    person: person,
-                    assetCount: assetCount,
-                    onEditName: {
-                        draftName = person.name
-                        showRename = true
-                    },
-                    onEditBirthDate: { showBirthDate = true }
-                )
+                if !isPickingFeatured {
+                    PersonHeader(
+                        person: person,
+                        assetCount: assetCount,
+                        onEditName: {
+                            draftName = person.name
+                            showRename = true
+                        },
+                        onEditBirthDate: { showBirthDate = true }
+                    )
+                }
             }
         )
         // a merge can hand the screen over to the surviving person, and the
         // grid's filter is frozen at init - fresh identity refetches it.
         .id(person.id)
+        // going back mid-pick would leave the person entirely, so cancelling
+        // is the only way out of the mode.
+        .navigationBarBackButtonHidden(isPickingFeatured)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    menuItems
-                } label: {
-                    Image(systemName: "ellipsis")
+                if isPickingFeatured {
+                    Button("Cancel") { isPickingFeatured = false }
+                        .accessibilityIdentifier("person-cancel-featured")
+                } else {
+                    Menu {
+                        menuItems
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .accessibilityLabel("More")
+                    .accessibilityIdentifier("person-menu")
                 }
-                .accessibilityLabel("More")
-                .accessibilityIdentifier("person-menu")
+            }
+        }
+        .overlay(alignment: .top) {
+            if let toast {
+                ToastBanner(text: toast) { self.toast = nil }
             }
         }
         .alert(person.name.isEmpty ? "Add a Name" : "Rename", isPresented: $showRename) {
@@ -100,6 +120,14 @@ struct PersonScreen: View {
             Label(isFavorite ? "Unfavorite" : "Favorite", systemImage: isFavorite ? "heart.slash" : "heart")
         }
         .disabled(mutationInFlight)
+
+        Button {
+            isPickingFeatured = true
+        } label: {
+            Label("Select Featured Photo", systemImage: "person.crop.square")
+        }
+        .disabled(mutationInFlight)
+        .accessibilityIdentifier("person-featured-photo")
 
         Button {
             showBirthDate = true
@@ -190,6 +218,27 @@ struct PersonScreen: View {
             apply: { $0.isHidden = value },
             request: { try await client.updatePerson(id: person.id, isHidden: value) }
         )
+    }
+
+    /// the portrait is re-rendered server side in a job, so the new face only
+    /// reaches the avatars once the socket says it is ready.
+    private func setFeaturedPhoto(_ asset: Asset) async {
+        // another edit is still going: keep the picker up rather than drop the
+        // tap on the floor.
+        guard !mutationInFlight else { return }
+        isPickingFeatured = false
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("Couldn’t set the featured photo. The server is not available.")
+            return
+        }
+        mutationInFlight = true
+        defer { mutationInFlight = false }
+        do {
+            try await client.updatePerson(id: person.id, featureFaceAssetID: asset.id)
+            toast = "Featured photo updated"
+        } catch {
+            ErrorToastCenter.shared.show("Couldn’t set the featured photo", error: error)
+        }
     }
 
     private func setBirthDate(_ value: String?) async {

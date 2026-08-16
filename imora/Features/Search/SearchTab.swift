@@ -321,18 +321,26 @@ struct SearchResultsGrid: View {
             )
             .padding(.top, 60)
         } else {
+            // the tail that pulls the next page, as ids: enumerating the
+            // results copied every asset in the grid on every pass, and the
+            // list only grows as it is scrolled.
+            let paginationIDs = Set(model.assets.suffix(12).lazy.map(\.id))
             LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(Array(model.assets.enumerated()), id: \.element.id) { index, asset in
+                ForEach(model.assets) { asset in
                     AssetTile(asset: asset)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
-                        .onTapGesture { onTap(index) }
+                        .onTapGesture {
+                            if let index = model.assets.firstIndex(where: { $0.id == asset.id }) {
+                                onTap(index)
+                            }
+                        }
                         .contextMenu {
                             assetMenu(for: asset)
                         } preview: {
                             contextPreview(for: asset)
                         }
                         .onAppear {
-                            if index >= model.assets.count - 12 {
+                            if paginationIDs.contains(asset.id) {
                                 model.loadMore()
                             }
                         }
