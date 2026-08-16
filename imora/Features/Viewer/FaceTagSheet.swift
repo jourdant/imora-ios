@@ -165,7 +165,7 @@ struct FaceTagSheet: View {
             selection = isSelected ? nil : person
         } label: {
             HStack(spacing: 12) {
-                if let url = session.personThumbnailURL(personID: person.id) {
+                if let url = session.personThumbnailURL(person) {
                     RemoteImage(url: url, targetPixelSize: 120)
                         .frame(width: 48, height: 48)
                         .clipShape(.circle)

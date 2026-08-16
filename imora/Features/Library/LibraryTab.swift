@@ -4,6 +4,7 @@ import SwiftUI
 
 struct LibraryTab: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
     @State private var people: [Person] = []
     @State private var peopleTotal = 0
     /// serializes the carousel quick actions per person.
@@ -89,6 +90,14 @@ struct LibraryTab: View {
             // returning from people screens picks up hides, merges and renames.
             .onAppear {
                 if !people.isEmpty {
+                    Task { await loadPeople() }
+                }
+            }
+            // coming back to the app does not re-appear this tab, so an edit
+            // made elsewhere meanwhile - a new featured photo - needs its own
+            // pass.
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active, !people.isEmpty {
                     Task { await loadPeople() }
                 }
             }

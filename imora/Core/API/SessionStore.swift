@@ -164,13 +164,15 @@ final class SessionStore {
         backup?.startIfIdle()
     }
 
-    /// portrait url for a person, carrying the cache-buster the socket handed
-    /// out when the server last re-rendered them. every avatar goes through
-    /// here so a new featured photo shows up everywhere at once.
-    func personThumbnailURL(personID: String) -> URL? {
+    /// portrait url for a person, carrying a cache-buster: the socket's key
+    /// when this session watched the server re-render them, otherwise the
+    /// person's own updatedAt, which is what catches a change made on another
+    /// device while imora was closed. every avatar goes through here so a new
+    /// featured photo shows up everywhere at once.
+    func personThumbnailURL(_ person: Person) -> URL? {
         client?.personThumbnailURL(
-            personID: personID,
-            cacheKey: realtime?.personThumbnailKeys[personID]
+            personID: person.id,
+            cacheKey: realtime?.personThumbnailKeys[person.id] ?? person.updatedAt
         )
     }
 

@@ -37,9 +37,11 @@ final class RealtimeHub {
     /// bumped after album events so album lists reload without a listener.
     private(set) var albumsGeneration = 0
     /// cache-buster per person, set once the server has re-rendered their
-    /// portrait. person thumbnail urls are otherwise stable forever, so
-    /// avatars would keep drawing the previous featured photo from the cache.
-    private(set) var personThumbnailKeys: [String: String] = [:]
+    /// portrait. it outranks the person's updatedAt because a re-render can
+    /// land after the row was already read back, and it is persisted because
+    /// the image cache those stale bytes sit in outlives the launch.
+    private(set) var personThumbnailKeys: [String: String] = UserDefaults.standard
+        .dictionary(forKey: RealtimeHub.personThumbnailKeysDefaultsKey) as? [String: String] ?? [:]
     private(set) var isConnected = false
     /// set when a connection drops or fails so the next successful connect
     /// broadcasts a catch-up resync.
@@ -71,6 +73,7 @@ final class RealtimeHub {
     /// background diff while connected, catching events the server never
     /// sends. one cheap buckets request per live grid when nothing changed.
     private static let safetyInterval: Duration = .seconds(120)
+    fileprivate static let personThumbnailKeysDefaultsKey = "imora.personThumbnailKeys"
 
     init(client: ImmichClient) {
         self.client = client
@@ -293,10 +296,10 @@ final class RealtimeHub {
             broadcast { $0.realtimeAlbumsChanged() }
 
         case "on_person_thumbnail":
-            // the payload is the bare person id. the key has to outlive a
-            // launch, since the image cache the stale bytes sit in does.
+            // the payload is the bare person id.
             guard let personID = payload as? String else { break }
             personThumbnailKeys[personID] = String(Int(Date().timeIntervalSince1970 * 1000))
+            UserDefaults.standard.set(personThumbnailKeys, forKey: Self.personThumbnailKeysDefaultsKey)
 
         case "on_notification":
             // the payload is the whole entry, so the inbox never has to refetch.

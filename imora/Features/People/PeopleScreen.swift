@@ -4,6 +4,7 @@ import SwiftUI
 /// favorites, merging and birth dates a long press away.
 struct PeopleScreen: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var people: [Person] = []
     @State private var isLoading = true
@@ -89,6 +90,13 @@ struct PeopleScreen: View {
         // returning from a person page picks up renames, merges and hides.
         .onAppear {
             if !people.isEmpty {
+                Task { await load() }
+            }
+        }
+        // coming back to the app does not re-appear this screen, so an edit
+        // made elsewhere meanwhile - a new featured photo - needs its own pass.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active, !people.isEmpty {
                 Task { await load() }
             }
         }

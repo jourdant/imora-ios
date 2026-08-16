@@ -52,7 +52,7 @@ struct PersonAvatar: View {
         Color.clear
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let url = session.personThumbnailURL(personID: person.id) {
+                if let url = session.personThumbnailURL(person) {
                     RemoteImage(url: url, targetPixelSize: targetPixelSize)
                 } else {
                     Rectangle()

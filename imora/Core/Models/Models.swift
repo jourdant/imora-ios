@@ -508,6 +508,10 @@ nonisolated struct Person: Codable, Identifiable, Hashable {
     /// date-only string, "yyyy-MM-dd".
     var birthDate: String?
     var isFavorite: Bool?
+    /// last server-side edit. the portrait url is stable for life, so this is
+    /// what busts it after a featured photo changed - on any device, which is
+    /// why it has to ride along with the person rather than be observed live.
+    var updatedAt: String?
 }
 
 nonisolated struct Tag: Codable, Identifiable, Hashable {

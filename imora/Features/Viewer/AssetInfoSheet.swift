@@ -581,7 +581,7 @@ struct AssetInfoPanel: View {
             }
         } label: {
             VStack(spacing: 6) {
-                if let url = session.personThumbnailURL(personID: person.id), !person.isPending {
+                if let url = session.personThumbnailURL(person), !person.isPending {
                     RemoteImage(url: url, targetPixelSize: 160)
                         .frame(width: 72, height: 72)
                         .clipShape(.circle)

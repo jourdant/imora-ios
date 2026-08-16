@@ -4,6 +4,7 @@ import SwiftUI
 /// naming, favorite, hide, birth date and merge management in the toolbar.
 struct PersonScreen: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var person: Person
     @State private var assetCount: Int?
@@ -100,6 +101,11 @@ struct PersonScreen: View {
             }
         }
         .task { await refresh() }
+        // the portrait may have been changed elsewhere while imora sat in the
+        // background, and returning to the app does not re-run the task.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { Task { await refresh() } }
+        }
     }
 
     @ViewBuilder private var menuItems: some View {

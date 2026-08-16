@@ -144,7 +144,10 @@ struct PeoplePickerSheet: View {
     let onApply: (SearchFilter) -> Void
 
     @State private var people: [Person] = []
-    @State private var selected: Set<Person> = []
+    /// by id: the people in the filter were captured whenever it was applied,
+    /// and any server-side edit since - a rename, a new portrait - makes the
+    /// refetched value compare unequal to the one held here.
+    @State private var selected: Set<String> = []
     @State private var searchText = ""
 
     private var visible: [Person] {
@@ -156,18 +159,18 @@ struct PeoplePickerSheet: View {
         FilterSheetScaffold(title: "Select People") {
             apply { $0.people = [] }
         } onApply: {
-            apply { $0.people = people.filter(selected.contains) }
+            apply { $0.people = people.filter { selected.contains($0.id) } }
         } content: {
             List(visible) { person in
                 Button {
-                    if selected.contains(person) {
-                        selected.remove(person)
+                    if selected.contains(person.id) {
+                        selected.remove(person.id)
                     } else {
-                        selected.insert(person)
+                        selected.insert(person.id)
                     }
                 } label: {
                     HStack(spacing: 12) {
-                        if let url = session.personThumbnailURL(personID: person.id) {
+                        if let url = session.personThumbnailURL(person) {
                             RemoteImage(url: url, targetPixelSize: 120)
                                 .frame(width: 48, height: 48)
                                 .clipShape(.circle)
@@ -175,7 +178,7 @@ struct PeoplePickerSheet: View {
                         Text(person.name.isEmpty ? "No Name" : person.name)
                             .foregroundStyle(.primary)
                         Spacer()
-                        if selected.contains(person) {
+                        if selected.contains(person.id) {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(Color.accentColor)
                         }
@@ -190,7 +193,7 @@ struct PeoplePickerSheet: View {
                 }
             }
             .task {
-                selected = Set(filter.people)
+                selected = Set(filter.people.map(\.id))
                 if let response = try? await session.client?.people() {
                     people = response.people.filter { !($0.isHidden ?? false) }
                 }
