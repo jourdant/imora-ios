@@ -17,6 +17,10 @@ final class SearchModel {
     private(set) var nextPage: Int? = 1
     private(set) var isLoading = false
     private(set) var hasActiveSearch = false
+    /// the last page request failed with nothing loaded. distinguishes a
+    /// timed-out search from a genuine zero-result answer, which used to
+    /// render the same confident "no results".
+    private(set) var loadFailed = false
 
     private var client: ImmichClient?
     private var searchTask: Task<Void, Never>?
@@ -27,6 +31,11 @@ final class SearchModel {
     func attach(_ client: ImmichClient) {
         guard self.client == nil else { return }
         self.client = client
+        // a filter applied while the session was still signing in silently
+        // no-opped; run it now that requests can actually go out.
+        if hasActiveSearch, assets.isEmpty, nextPage != nil {
+            loadMore()
+        }
     }
 
     /// applies a new filter: identical filters are a no-op, empty filters
@@ -42,15 +51,20 @@ final class SearchModel {
         searchTask?.cancel()
         assets = []
         nextPage = 1
-        isLoading = false
+        loadFailed = false
+        // set before the task runs, not inside it: the task body lands a
+        // runloop turn later, and the frame in between rendered a false
+        // "no results" flash on every submit.
+        isLoading = searchable
         hasActiveSearch = searchable
         guard hasActiveSearch else { return }
         let requested = generation
-        searchTask = Task { await loadNextPage(requested) }
+        searchTask = Task { await loadNextPage(requested, initial: true) }
     }
 
     func loadMore() {
         guard nextPage != nil, !isLoading else { return }
+        loadFailed = false
         let requested = generation
         searchTask = Task { await loadNextPage(requested) }
     }
@@ -63,6 +77,7 @@ final class SearchModel {
         assets = []
         nextPage = 1
         isLoading = false
+        loadFailed = false
         hasActiveSearch = false
     }
 
@@ -112,8 +127,19 @@ final class SearchModel {
         }
     }
 
-    private func loadNextPage(_ requested: Int) async {
-        guard let client, requested == generation, let page = nextPage, !isLoading else { return }
+    /// initial passes the isLoading gate apply() already raised for the
+    /// first page of a fresh search.
+    private func loadNextPage(_ requested: Int, initial: Bool = false) async {
+        guard let client, requested == generation, let page = nextPage, initial || !isLoading else {
+            // apply() raised the spinner before this task ran; a bail here -
+            // typically no client yet - must lower it again or it spins
+            // forever. attach() retries once the client lands.
+            if initial, requested == generation {
+                isLoading = false
+                loadFailed = self.client == nil
+            }
+            return
+        }
         isLoading = true
         defer {
             // a superseded load must not clear the successor's spinner.
@@ -123,6 +149,7 @@ final class SearchModel {
         do {
             let response = try await client.search(filter, page: page)
             guard requested == generation else { return }
+            loadFailed = false
             guard !response.assets.items.isEmpty else {
                 nextPage = nil
                 return
@@ -131,7 +158,11 @@ final class SearchModel {
             nextPage = response.assets.nextPage.flatMap { Int($0) }
         } catch {
             // pagination stays retryable, matching the flutter behavior of
-            // swallowing errors and letting the user scroll to retry.
+            // swallowing errors and letting the user scroll to retry. with
+            // nothing loaded there is no tail row to scroll back onto, so the
+            // grid offers an explicit retry through loadFailed instead.
+            guard requested == generation, !Task.isCancelled else { return }
+            loadFailed = true
         }
     }
 }

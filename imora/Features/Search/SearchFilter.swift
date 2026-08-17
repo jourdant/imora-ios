@@ -132,6 +132,8 @@ nonisolated struct SearchRequestBody: Encodable {
     let filter: SearchFilter
     let page: Int
 
+    private static let iso = ISO8601DateFormatter()
+
     private enum CodingKeys: String, CodingKey {
         case query, queryAssetId, language, originalFileName, description, ocr
         case country, state, city, make, model
@@ -164,12 +166,11 @@ nonisolated struct SearchRequestBody: Encodable {
         try container.encodeIfPresent(filter.make, forKey: .make)
         try container.encodeIfPresent(filter.model, forKey: .model)
 
-        let iso = ISO8601DateFormatter()
         if let takenAfter = filter.takenAfter {
-            try container.encode(iso.string(from: takenAfter), forKey: .takenAfter)
+            try container.encode(Self.iso.string(from: takenAfter), forKey: .takenAfter)
         }
         if let takenBefore = filter.takenBefore {
-            try container.encode(iso.string(from: takenBefore), forKey: .takenBefore)
+            try container.encode(Self.iso.string(from: takenBefore), forKey: .takenBefore)
         }
 
         try container.encode(filter.isArchive ? "archive" : "timeline", forKey: .visibility)

@@ -57,7 +57,9 @@ struct SearchTab: View {
                 scopeInitialized = true
                 searchScope = session.features?.smartSearch != false ? .context : .filename
             }
-            .task {
+            // keyed on client presence: a slow session start used to leave
+            // the model permanently detached and every search a silent no-op.
+            .task(id: session.client == nil) {
                 if let client = session.client { model.attach(client) }
             }
             .sheet(item: $activeSheet) { sheet in
@@ -313,6 +315,16 @@ struct SearchResultsGrid: View {
             ProgressView()
                 .frame(maxWidth: .infinity)
                 .padding(.top, 120)
+        } else if model.assets.isEmpty, model.loadFailed {
+            // a timed-out first page is not a zero-result answer, and with no
+            // tiles there is no tail row to scroll back onto for the retry.
+            ContentUnavailableView {
+                Label("Couldn't search", systemImage: "wifi.exclamationmark")
+            } actions: {
+                Button("Retry") { model.loadMore() }
+                    .buttonStyle(.glass)
+            }
+            .padding(.top, 60)
         } else if model.assets.isEmpty {
             ContentUnavailableView(
                 "No results",
@@ -349,6 +361,10 @@ struct SearchResultsGrid: View {
 
             if model.isLoading {
                 ProgressView()
+                    .padding(.vertical, 24)
+            } else if model.loadFailed {
+                Button("Couldn't load more. Retry") { model.loadMore() }
+                    .font(.subheadline)
                     .padding(.vertical, 24)
             } else if model.nextPage == nil {
                 Text("No more results")
@@ -651,7 +667,7 @@ struct SearchResultsScreen: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
-        .task {
+        .task(id: session.client == nil) {
             if let client = session.client { model.attach(client) }
             model.apply(baseFilter)
         }
@@ -737,7 +753,7 @@ struct PlaceScreen: View {
         .navigationDestination(isPresented: $showMap) {
             MapScreen(initialCoordinate: coordinate)
         }
-        .task {
+        .task(id: session.client == nil) {
             if let client = session.client { model.attach(client) }
             var filter = SearchFilter()
             filter.city = city

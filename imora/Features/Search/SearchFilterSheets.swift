@@ -149,6 +149,7 @@ struct PeoplePickerSheet: View {
     /// refetched value compare unequal to the one held here.
     @State private var selected: Set<String> = []
     @State private var searchText = ""
+    @State private var isLoadingPeople = true
 
     private var visible: [Person] {
         guard !searchText.isEmpty else { return people }
@@ -188,12 +189,17 @@ struct PeoplePickerSheet: View {
             .listStyle(.plain)
             .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Filter people")
             .overlay {
-                if people.isEmpty {
+                // keyed on the load, not on emptiness - a server with no
+                // recognized faces used to spin here forever.
+                if isLoadingPeople, people.isEmpty {
                     ProgressView()
+                } else if people.isEmpty {
+                    ContentUnavailableView("No people", systemImage: "person.2.slash")
                 }
             }
             .task {
                 selected = Set(filter.people.map(\.id))
+                defer { isLoadingPeople = false }
                 if let response = try? await session.client?.people() {
                     people = response.people.filter { !($0.isHidden ?? false) }
                 }
@@ -236,29 +242,32 @@ struct LocationPickerSheet: View {
             .onChange(of: country) {
                 state = nil
                 city = nil
-                Task { await loadSuggestions() }
             }
             .onChange(of: state) {
                 city = nil
-                Task { await loadSuggestions() }
             }
             .task {
                 country = filter.country
                 state = filter.state
                 city = filter.city
-                await loadSuggestions()
+                // the country list never depends on the selection; once.
+                guard let client = session.client else { return }
+                countries = (try? await client.searchSuggestions(type: "country")) ?? []
+            }
+            // task id cancellation replaces the unstructured tasks the
+            // onChange handlers used to spawn, whose slow responses could
+            // land out of order and leave country a's cities under country b.
+            .task(id: [country, state]) {
+                guard let client = session.client else { return }
+                async let statesTask = try? client.searchSuggestions(type: "state", country: country)
+                async let citiesTask = try? client.searchSuggestions(type: "city", country: country, state: state)
+                let states = (await statesTask) ?? []
+                let cities = (await citiesTask) ?? []
+                guard !Task.isCancelled else { return }
+                self.states = states
+                self.cities = cities
             }
         }
-    }
-
-    private func loadSuggestions() async {
-        guard let client = session.client else { return }
-        async let countriesTask = try? client.searchSuggestions(type: "country")
-        async let statesTask = try? client.searchSuggestions(type: "state", country: country)
-        async let citiesTask = try? client.searchSuggestions(type: "city", country: country, state: state)
-        countries = (await countriesTask) ?? []
-        states = (await statesTask) ?? []
-        cities = (await citiesTask) ?? []
     }
 
     private func apply(_ mutate: (inout SearchFilter) -> Void) {
@@ -303,22 +312,21 @@ struct CameraPickerSheet: View {
             }
             .onChange(of: make) {
                 model = nil
-                Task { await loadSuggestions() }
             }
             .task {
                 make = filter.make
                 model = filter.model
-                await loadSuggestions()
+                guard let client = session.client else { return }
+                makes = (try? await client.searchSuggestions(type: "camera-make")) ?? []
+            }
+            // same stale-response guard as the location sheet.
+            .task(id: make) {
+                guard let client = session.client else { return }
+                let models = (try? await client.searchSuggestions(type: "camera-model", make: make)) ?? []
+                guard !Task.isCancelled else { return }
+                self.models = models
             }
         }
-    }
-
-    private func loadSuggestions() async {
-        guard let client = session.client else { return }
-        async let makesTask = try? client.searchSuggestions(type: "camera-make")
-        async let modelsTask = try? client.searchSuggestions(type: "camera-model", make: make)
-        makes = (await makesTask) ?? []
-        models = (await modelsTask) ?? []
     }
 
     private func apply(_ mutate: (inout SearchFilter) -> Void) {
