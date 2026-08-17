@@ -220,7 +220,19 @@ final class RealtimeHub {
     /// one engine.io v4 + socket.io v4 session over a websocket. returns only
     /// when the socket closes or errors.
     private func connectOnce() async throws {
-        let task = SocketConnection.makeTask(apiURL: client.apiURL, headers: client.authHeaders, token: client.accessToken)
+        try await receiveLoop(
+            apiURL: client.apiURL,
+            headers: client.authHeaders,
+            token: client.accessToken
+        )
+    }
+
+    /// concurrent so frame parsing and event decoding stay off the main
+    /// thread - a bulk server job floods thousands of frames, and each used
+    /// to cost json work on main. only the typed results hop back.
+    @concurrent
+    private func receiveLoop(apiURL: URL, headers: [String: String], token: String) async throws {
+        let task = SocketConnection.makeTask(apiURL: apiURL, headers: headers, token: token)
         task.resume()
         defer { task.cancel(with: .goingAway, reason: nil) }
 
@@ -238,16 +250,11 @@ final class RealtimeHub {
             case .ping:
                 try await task.send(.string("3"))
             case .connected:
-                realtimeLog.info("socket connected")
-                isConnected = true
-                if resyncOnConnect {
-                    resyncOnConnect = false
-                    broadcastResyncNow()
-                }
+                await noteConnected()
             case .connectError(let detail):
                 throw ImmichError.http(401, detail)
-            case .event(let name, let payload):
-                handleEvent(name, payload: payload)
+            case .event(let event):
+                await handleEvent(event)
             case .close:
                 return
             case .ignored:
@@ -256,15 +263,25 @@ final class RealtimeHub {
         }
     }
 
+    private func noteConnected() {
+        realtimeLog.info("socket connected")
+        isConnected = true
+        if resyncOnConnect {
+            resyncOnConnect = false
+            broadcastResyncNow()
+        }
+    }
+
     // MARK: - events
 
     /// both the modern sync events and the legacy per-asset events are
-    /// registered; servers emit whichever set their version supports.
-    private func handleEvent(_ name: String, payload: Any?) {
+    /// registered; servers emit whichever set their version supports. the
+    /// payload arrives fully decoded from the receive loop.
+    private func handleEvent(_ event: RealtimeEventPayload) {
+        let name = event.name
         if !waiters.isEmpty {
-            let eventAssetIDs = Self.assetIDs(from: payload)
             for (id, waiter) in waiters where waiter.names.contains(name) {
-                if waiter.assetID == nil || eventAssetIDs.contains(waiter.assetID!) {
+                if waiter.assetID == nil || event.assetIDs.contains(waiter.assetID!) {
                     resolveWaiter(id, with: true)
                 }
             }
@@ -274,23 +291,20 @@ final class RealtimeHub {
         case "AssetEditReadyV1", "AssetEditReadyV2":
             // an edit anywhere - web, another phone - repaints the server copy,
             // so any device twin stops being a valid stand-in for it.
-            onRemoteEdit?(Self.assetIDs(from: payload))
+            onRemoteEdit?(event.assetIDs)
             scheduleResync()
 
         case "AssetUploadReadyV1", "AssetUploadReadyV2", "on_upload_success", "on_asset_restore":
             scheduleResync()
 
         case "on_asset_delete", "on_asset_trash", "on_asset_hidden":
-            let ids = Self.assetIDs(from: payload)
-            if !ids.isEmpty {
-                broadcast { $0.realtimeAssetsRemoved(ids) }
+            if !event.assetIDs.isEmpty {
+                broadcast { $0.realtimeAssetsRemoved(event.assetIDs) }
             }
             scheduleResync()
 
         case "on_asset_update":
-            if let payload,
-               let data = try? JSONSerialization.data(withJSONObject: payload),
-               let detail = try? JSONDecoder().decode(AssetDetail.self, from: data) {
+            if let detail = event.detail {
                 broadcast { $0.realtimeAssetUpdated(detail) }
             }
             scheduleResync()
@@ -310,7 +324,7 @@ final class RealtimeHub {
 
         case "on_person_thumbnail":
             // the payload is the bare person id.
-            guard let personID = payload as? String else { break }
+            guard let personID = event.personID else { break }
             personThumbnailKeys[personID] = String(Int(Date().timeIntervalSince1970 * 1000))
             // persisted after the burst settles - a face job emits thousands
             // of these, and each write serializes the whole dictionary.
@@ -328,9 +342,7 @@ final class RealtimeHub {
 
         case "on_notification":
             // the payload is the whole entry, so the inbox never has to refetch.
-            if let payload,
-               let data = try? JSONSerialization.data(withJSONObject: payload),
-               let notification = try? JSONDecoder().decode(ServerNotification.self, from: data) {
+            if let notification = event.notification {
                 broadcast { $0.realtimeNotification(notification) }
             }
 
@@ -338,25 +350,16 @@ final class RealtimeHub {
             break
         }
     }
+}
 
-    /// legacy events carry a bare id, an id array, or a wrapping object.
-    private static func assetIDs(from payload: Any?) -> Set<String> {
-        switch payload {
-        case let id as String:
-            return [id]
-        case let ids as [String]:
-            return Set(ids)
-        case let object as [String: Any]:
-            for key in ["assetIds", "ids", "assetId", "id", "asset"] {
-                if let ids = assetIDs(from: object[key]) as Set<String>?, !ids.isEmpty {
-                    return ids
-                }
-            }
-            return []
-        default:
-            return []
-        }
-    }
+/// one server event, decoded into sendable pieces off the main thread. only
+/// the fields the handler for that event name reads are populated.
+nonisolated struct RealtimeEventPayload: Sendable {
+    let name: String
+    var assetIDs: Set<String> = []
+    var detail: AssetDetail?
+    var notification: ServerNotification?
+    var personID: String?
 }
 
 // MARK: - wire protocol
@@ -365,12 +368,12 @@ final class RealtimeHub {
 /// immich server actually uses: text frames, websocket transport, default
 /// namespace.
 private nonisolated enum SocketConnection {
-    enum Packet {
+    enum Packet: Sendable {
         case open(pingInterval: Int, pingTimeout: Int)
         case ping
         case connected
         case connectError(String)
-        case event(String, Any?)
+        case event(RealtimeEventPayload)
         case close
         case ignored
     }
@@ -444,9 +447,51 @@ private nonisolated enum SocketConnection {
                   let array = (try? JSONSerialization.jsonObject(with: Data(body[start...].utf8))) as? [Any],
                   let name = array.first as? String
             else { return .ignored }
-            return .event(name, array.count > 1 ? array[1] : nil)
+            return .event(decodeEvent(name, payload: array.count > 1 ? array[1] : nil))
         default:
             return .ignored
+        }
+    }
+
+    /// all json work happens here, on whatever executor runs the receive
+    /// loop; the handler on the main actor only reads typed fields.
+    private static func decodeEvent(_ name: String, payload: Any?) -> RealtimeEventPayload {
+        var event = RealtimeEventPayload(name: name, assetIDs: assetIDs(from: payload))
+        switch name {
+        case "on_asset_update":
+            if let payload,
+               let data = try? JSONSerialization.data(withJSONObject: payload) {
+                event.detail = try? JSONDecoder().decode(AssetDetail.self, from: data)
+            }
+        case "on_notification":
+            if let payload,
+               let data = try? JSONSerialization.data(withJSONObject: payload) {
+                event.notification = try? JSONDecoder().decode(ServerNotification.self, from: data)
+            }
+        case "on_person_thumbnail":
+            event.personID = payload as? String
+        default:
+            break
+        }
+        return event
+    }
+
+    /// legacy events carry a bare id, an id array, or a wrapping object.
+    private static func assetIDs(from payload: Any?) -> Set<String> {
+        switch payload {
+        case let id as String:
+            return [id]
+        case let ids as [String]:
+            return Set(ids)
+        case let object as [String: Any]:
+            for key in ["assetIds", "ids", "assetId", "id", "asset"] {
+                if let ids = assetIDs(from: object[key]) as Set<String>?, !ids.isEmpty {
+                    return ids
+                }
+            }
+            return []
+        default:
+            return []
         }
     }
 }
