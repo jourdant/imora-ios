@@ -235,12 +235,6 @@ nonisolated struct TimelineSectionSpan: Hashable {
     let year: Int
     let titleBands: Int
     let tileRows: Int
-    /// this month's first row. the scrubber scrolls by row identity rather
-    /// than by pixel offset, which a lazy stack clamps against whatever
-    /// content height it currently believes in. the index is where the walk
-    /// into the month starts; the id validates it against the current rows.
-    let firstRowID: String
-    let firstRowIndex: Int
 }
 
 /// flat list element with a deterministic height. fixed heights are what keep
@@ -276,7 +270,13 @@ final class TimelineModel {
     /// grid with backup badges, google-photos style.
     let mergesLocal: Bool
     private(set) var sections: [TimelineSection] = []
-    private(set) var rows: [TimelineRow] = []
+    private(set) var rows: [TimelineRow] = [] {
+        didSet { rowsLayoutVersion &+= 1 }
+    }
+    /// bumped on every rows assignment so the screen's exact row-offset cache
+    /// knows to rebuild. ignored by observation - it is read from scroll
+    /// callbacks, never from a body.
+    @ObservationIgnored private(set) var rowsLayoutVersion = 0
     /// the month each row belongs to. the scrubber names its month from the
     /// row actually at the viewport top rather than from offset arithmetic,
     /// so the label is right even while unloaded months are still estimates.
@@ -714,9 +714,7 @@ final class TimelineModel {
                 title: section.monthTitle,
                 year: Self.year(for: section.id),
                 titleBands: sectionTitleBands,
-                tileRows: sectionTileRows,
-                firstRowID: result[sectionFirstRow].id,
-                firstRowIndex: sectionFirstRow
+                tileRows: sectionTileRows
             ))
             titleBands += sectionTitleBands
             tileRows += sectionTileRows

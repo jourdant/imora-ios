@@ -14,8 +14,6 @@ private struct ScrubberMonth {
     let year: Int
     let startY: CGFloat
     let height: CGFloat
-    let firstRowID: String
-    let firstRowIndex: Int
 }
 
 /// plain box written from scroll callbacks and read when a realtime rows
@@ -23,16 +21,113 @@ private struct ScrubberMonth {
 /// re-render anything.
 @MainActor
 private final class ScrollContext {
+    /// distance scrolled past the rest position, the space scrollTo(y:) takes.
     var offsetY: CGFloat = 0
     var firstVisibleRowID: String?
     /// the whole visible run, not just the first row: only tile rows anchor a
     /// prefetch window and the top row is usually a month header.
     var visibleRowIDs: [String] = []
+    /// same rows as indices, the cheap equality check behind the ids above.
+    var visibleRange: Range<Int> = 0..<0
     var isIdle = true
     var viewportWidth: CGFloat = 0
-    /// resting position in raw offset terms, the floor a compensating scroll
-    /// must not go below.
-    var insetTop: CGFloat = 0
+    var viewportHeight: CGFloat = 0
+}
+
+/// exact top offset of every row, in row space. deterministic row heights
+/// make this a plain prefix sum, rebuilt only when the rows or the tile side
+/// change.
+private struct RowLayout {
+    let version: Int
+    let side: CGFloat
+    let starts: [CGFloat]
+    let total: CGFloat
+
+    static let empty = RowLayout(version: -1, side: 0, starts: [], total: 0)
+
+    static func build(rows: [TimelineRow], side: CGFloat, version: Int) -> RowLayout {
+        var starts: [CGFloat] = []
+        starts.reserveCapacity(rows.count)
+        var y: CGFloat = 0
+        for row in rows {
+            starts.append(y)
+            y += row.height(tileSide: side)
+        }
+        return RowLayout(version: version, side: side, starts: starts, total: y)
+    }
+
+    /// index of the row whose span contains `y`, clamped to the ends.
+    func index(at y: CGFloat) -> Int {
+        var low = 0
+        var high = starts.count - 1
+        var best = 0
+        while low <= high {
+            let mid = (low + high) / 2
+            if starts[mid] <= y {
+                best = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return best
+    }
+}
+
+/// plain cache for the layout above; nothing observed, mutated freely from
+/// scroll callbacks and body alike.
+@MainActor
+private final class RowLayoutBox {
+    var layout = RowLayout.empty
+}
+
+/// the mounted row range of the virtual stack. observable so a window slide
+/// re-renders only the stack, never the screen.
+@Observable @MainActor
+private final class RowWindow {
+    var range: Range<Int> = 0..<0
+}
+
+/// how far past the viewport rows stay mounted, so a swipe reveals content
+/// that already exists and placeholder onAppear loads run ahead of arrival.
+private let rowWindowBuffer: CGFloat = 600
+
+/// the app's own lazy stack, replacing LazyVStack: every mounted row is
+/// placed at its exact offset inside a frame of exactly the layout's total
+/// height. immich-web does precisely this - its scroll container is styled to
+/// totalViewerHeight and each month is position:absolute at its computed top,
+/// with only intersecting months mounted.
+///
+/// LazyVStack could not be kept: it reports a contentSize INTERPOLATED from
+/// whichever rows it happens to have realized - measured 15% long at library
+/// scale on ios 27 - and it also POSITIONS unrealized rows in that estimated
+/// space, so pinning its frame to the true height strands the tail out of
+/// reach. with the stack owning both the height and every row position there
+/// is a single coordinate space: contentSize, scrollTo(y:), the scrubber rail
+/// and the realtime scroll compensation all agree by construction.
+private struct VirtualRowStack<Content: View>: View {
+    let rows: [TimelineRow]
+    let starts: [CGFloat]
+    let totalHeight: CGFloat
+    let window: RowWindow
+    @ViewBuilder let content: (TimelineRow) -> Content
+
+    var body: some View {
+        let count = min(rows.count, starts.count)
+        let range = window.range.clamped(to: 0..<count)
+        let items = range.map { (index: $0, row: rows[$0]) }
+        ZStack(alignment: .top) {
+            // top padding, not offset, so each row stays in layout at its true
+            // position and hit testing needs no transforms - the same trick the
+            // rows use horizontally.
+            ForEach(items, id: \.row.id) { item in
+                content(item.row)
+                    .padding(.top, starts[item.index])
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .frame(height: max(1, totalHeight), alignment: .top)
+    }
 }
 
 /// scroll-driven values live here instead of screen @state so per-frame
@@ -84,8 +179,8 @@ private final class ScrubberState {
     var liveMonths: [ScrubberMonth] = []
     /// total row height of `liveMonths`.
     var monthsHeight: CGFloat = 0
-    /// empty space padded past the last row so the final month can reach the
-    /// viewport top. scrollable content, so it counts toward the total.
+    /// empty space padded past the last row - the selection bar's clearance,
+    /// nothing else. scrollable content, so it counts toward the total.
     var tailPadding: CGFloat = 0
     /// held still for the length of a scrub, so a bucket landing mid-drag
     /// cannot spread the markers out under the finger.
@@ -94,12 +189,10 @@ private final class ScrubberState {
 
     var months: [ScrubberMonth] { frozenMonths ?? liveMonths }
 
-    /// the app's OWN layout height - header, rows, tail padding - never the
-    /// scroll view's reported contentSize. the rows are rendered from exactly
-    /// this layout, so a month's offset here is its true content offset, which
-    /// is what lets an absolute jump land on the month a marker names. immich
-    /// does the same: its scrubber segments and its month jumps are both
-    /// expressed in the timeline's own layout, not in scroll-view pixels.
+    /// the app's OWN layout height - header, rows, bottom padding. the
+    /// virtual stack places every row from exactly this layout, so it IS the
+    /// scroll view's contentSize and every value derived from it is a real
+    /// scroll offset. immich-web's totalViewerHeight, one to one.
     var contentTotal: CGFloat {
         frozenTotal ?? (headerHeight + monthsHeight + tailPadding)
     }
@@ -116,9 +209,17 @@ private final class ScrubberState {
         scrubFraction = nil
         isScrubbing = false
     }
-    /// month of the row actually at the viewport top. ground truth, so the
-    /// label never inherits the error in an unloaded month's estimated height.
-    var visibleMonth: String?
+
+    /// how much of the content the viewport top can actually reach, as a
+    /// fraction of the whole - immich-web's maxScrollPercent. the last
+    /// viewport-height of any timeline can never sit at the top, so the rail
+    /// spans the FULL content while a drag only ever asks for a reachable
+    /// offset. this is what the web uses instead of padding the end, and it is
+    /// why nothing can pin: an offset that is already inside the scrollable
+    /// range cannot be clamped short of itself.
+    var maxScrollPercent: CGFloat {
+        contentTotal > 0 ? scrollRange / contentTotal : 0
+    }
 
     var scrollRange: CGFloat { max(0, contentTotal - containerHeight) }
 
@@ -149,16 +250,35 @@ private final class ScrubberState {
         trackTop + fraction * (trackHeight - thumbHeight) + thumbHeight / 2
     }
 
-    /// where a marker for content at `offset` belongs: literally `thumbCenterY`
-    /// evaluated at that offset instead of the live one, so a marker and the
-    /// thumb cannot disagree - same track, same travel, same clamped thumb.
-    /// measuring markers against a snapshot of the layout while the thumb runs
-    /// on the live one is what put them out of step, since an unloaded month
-    /// is still an estimate and a pinch resizes every row underneath.
+    /// where a marker for content at `offset` belongs. the rail is laid out
+    /// over the WHOLE content - immich-web's segmentTop / totalHeight - while
+    /// the thumb rides offsetY / scrollRange, and the two meet exactly because
+    /// a drag scrolls to offset * maxScrollPercent. measuring markers against
+    /// the scroll range instead put the oldest month's chip at the very bottom
+    /// of the track and asked a drag there to place that month at the viewport
+    /// top, which only a viewport of padding can satisfy and which clamped
+    /// short whenever it did not - the grid pinned a year early while the thumb
+    /// kept travelling.
     func markerY(forContentOffset offset: CGFloat) -> CGFloat {
-        guard scrollRange > 0 else { return trackTop }
-        let progress = min(1, max(0, offset / scrollRange))
+        guard contentTotal > 0 else { return trackTop }
+        let progress = min(1, max(0, offset / contentTotal))
         return trackTop + progress * (trackHeight - thumbHeight) + thumbHeight / 2
+    }
+
+    /// content offset a drag at `fraction` scrolls to: immich-web's
+    /// (segmentTop + delta) * maxScrollPercent, reduced. always inside the
+    /// scrollable range, so nothing ever clamps or springs back.
+    func contentOffset(forFraction fraction: CGFloat) -> CGFloat {
+        min(1, max(0, fraction)) * scrollRange
+    }
+
+    /// month the RAIL points at, which is what the floating pill names while a
+    /// drag is on. the web reads its label from the same scaled walk that
+    /// places the markers, so pill and chip always agree; the month actually at
+    /// the viewport top can be up to a viewport newer near the end, which is
+    /// inherent to mapping a full timeline onto a shorter scrollable range.
+    func month(atFraction fraction: CGFloat) -> ScrubberMonth? {
+        month(at: min(1, max(0, fraction)) * contentTotal)
     }
 
     func update(with state: TimelineScrollState) {
@@ -200,16 +320,24 @@ private final class ScrubberState {
     /// the month it begins with in time - january - and not at the newest
     /// month the year happens to end on. the newest year therefore has no chip
     /// at the very top of the rail; its chip sits down where that year started.
-    /// the chip anchors to the top edge of that january rather than the web's
-    /// bottom edge, which is the one point of difference: it puts the mark on
-    /// the same content the pill names when the two meet.
+    ///
+    /// chips and dots anchor at the BOTTOM edge of their month's segment,
+    /// exactly like the web, whose label and dot divs are both absolute
+    /// bottom-0 inside the segment. the bottom edge is the month's start in
+    /// time - a january segment runs jan 31 at its top down to jan 1 at its
+    /// bottom - so the year chip sits on the year's very first photo.
+    /// anchoring at the top edge instead put every chip a whole january too
+    /// new. the anchor pulls in 2pt so the boundary pixel still resolves to
+    /// the month the mark names rather than to december of the year below,
+    /// mirroring how the web's boundary pixel belongs to the january div.
     ///
     /// immich-web's thresholds - 16pt between year labels, 8pt between dots,
-    /// months thinner than 5pt get no dot - are applied as a DROP rule rather
-    /// than the web's carry-forward. the web tracks the span since the last
-    /// label and lets a LATER month claim the year once the span is big
-    /// enough, which parks the chip months away from the year it names. here a
-    /// mark is either exactly on the boundary it names or absent.
+    /// months thinner than 5pt get no dot, the oldest month always gets both -
+    /// are applied as a DROP rule rather than the web's carry-forward. the web
+    /// tracks the span since the last label and lets a LATER month claim the
+    /// year once the span is big enough, which parks the chip months away from
+    /// the year it names. here a mark is either exactly on the boundary it
+    /// names or absent.
     func railMarks() -> [ScrubberRailMark] {
         let months = months
         let key = RailKey(
@@ -228,29 +356,31 @@ private final class ScrubberState {
         var marks: [ScrubberRailMark] = []
         if !months.isEmpty, trackHeight > 1, scrollRange > 0 {
             var previousYear: Int?
+            var isOldest = true
             // walking oldest first means positions climb the rail, so the
             // spacing rules compare against a value that decreases.
             var lastLabelY = CGFloat.greatestFiniteMagnitude
             var lastDotY = CGFloat.greatestFiniteMagnitude
             for month in months.reversed() {
                 let monthStart = headerHeight + month.startY
-                let startY = markerY(forContentOffset: monthStart)
-                let height = markerY(forContentOffset: monthStart + month.height) - startY
+                let markY = markerY(forContentOffset: monthStart + month.height - 2)
+                let height = markY - markerY(forContentOffset: monthStart)
                 let opensYear = previousYear != month.year
                 previousYear = month.year
 
                 var year: String?
-                if opensYear, lastLabelY - startY > 16 {
+                if opensYear, lastLabelY - markY > 16 {
                     year = String(month.year)
-                    lastLabelY = startY
+                    lastLabelY = markY
                 }
                 var hasDot = false
-                if height > 5, lastDotY - startY > 8 {
+                if isOldest || (height > 5 && lastDotY - markY > 8) {
                     hasDot = true
-                    lastDotY = startY
+                    lastDotY = markY
                 }
+                isOldest = false
                 if year != nil || hasDot {
-                    marks.append(ScrubberRailMark(id: month.id, y: startY, year: year, hasDot: hasDot))
+                    marks.append(ScrubberRailMark(id: month.id, y: markY, year: year, hasDot: hasDot))
                 }
             }
         }
@@ -319,16 +449,13 @@ struct TimelineScreen<Header: View>: View {
     @State private var isSelecting = false
     @State private var viewer = ViewerPresentation()
     @State private var indicatorHideTask: Task<Void, Never>?
-    /// last row a scrub jumped to, so a drag that stays inside one month does
-    /// not re-issue the same scroll every frame. the sentinel stands for the
-    /// very top, which is the header rather than any row.
-    @State private var scrubbedRowID: String?
     /// tracks `scrub.isScrubbing` but is written outside its animation, since
     /// this one decides which kind of tile the grid is built from.
     @State private var isScrubbingTiles = false
-    private let scrubTopSentinel = "\u{0}top"
     @State private var scrub = ScrubberState()
     @State private var scrollContext = ScrollContext()
+    @State private var rowWindow = RowWindow()
+    @State private var rowLayoutBox = RowLayoutBox()
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var pendingAlbumAssets: [String]?
     @State private var pendingEditAsset: Asset?
@@ -405,10 +532,9 @@ struct TimelineScreen<Header: View>: View {
             viewportWidth: viewportWidth,
             columns: target
         )
-        let contentHeight = scrub.headerHeight + model.contentHeight(tileSide: newSide)
-            + endPadding(side: newSide, viewportHeight: viewportHeight)
-        // raw contentOffset space, like every other scrollTo here.
-        let offset = preservedFraction * max(0, contentHeight - viewportHeight) - scrub.insetTop
+        let contentHeight = scrub.headerHeight + model.contentHeight(tileSide: newSide) + bottomPadding()
+        // distance past the rest position, the space scrollTo(y:) takes.
+        let offset = preservedFraction * max(0, contentHeight - viewportHeight)
         // Wait for the rebuilt rows to enter layout before restoring position.
         Task { @MainActor in
             var scrollTransaction = Transaction()
@@ -419,66 +545,110 @@ struct TimelineScreen<Header: View>: View {
         }
     }
 
-    /// pads the scroll bottom so the last month can reach the top of the
-    /// viewport. without it the final screenful is unreachable: the oldest
-    /// photos can never sit at the top, so the scrubber can never name them.
-    private func endPadding(side: CGFloat, viewportHeight: CGFloat) -> CGFloat {
-        guard scrub.headerHeight + model.contentHeight(tileSide: side) > viewportHeight else { return 0 }
-        let tail = model.sectionSpans.last.map {
-            CGFloat($0.titleBands) * 36 + CGFloat($0.tileRows) * (side + 2)
-        } ?? 0
-        return max(0, (viewportHeight - tail).rounded())
+    /// content is taller than the viewport, so there is a scrollbar to draw.
+    private func isScrollable(rowsHeight: CGFloat, viewportHeight: CGFloat) -> Bool {
+        scrub.headerHeight + rowsHeight > viewportHeight
+    }
+
+    /// the cached exact row offsets, rebuilt when the rows or the side moved.
+    private func rowLayout(side: CGFloat) -> RowLayout {
+        let box = rowLayoutBox
+        if box.layout.version != model.rowsLayoutVersion || box.layout.side != side {
+            box.layout = RowLayout.build(rows: model.rows, side: side, version: model.rowsLayoutVersion)
+        }
+        return box.layout
+    }
+
+    /// recomputes what the viewport sees and what the stack keeps mounted,
+    /// from the exact layout. runs on every scroll frame - two binary searches
+    /// and integer compares - and writes the observable window only when the
+    /// mounted range actually moves.
+    private func updateRowWindow() {
+        let context = scrollContext
+        guard context.viewportWidth > 0, context.viewportHeight > 0 else { return }
+        let layout = rowLayout(side: tileSide(for: context.viewportWidth))
+        let rows = model.rows
+        let count = min(rows.count, layout.starts.count)
+        guard count > 0 else {
+            if !rowWindow.range.isEmpty { rowWindow.range = 0..<0 }
+            return
+        }
+        let top = context.offsetY - scrub.headerHeight
+
+        let visibleLow = min(layout.index(at: top), count - 1)
+        let visibleHigh = min(layout.index(at: top + context.viewportHeight), count - 1) + 1
+        let visible = visibleLow..<visibleHigh
+        if visible != context.visibleRange {
+            context.visibleRange = visible
+            context.firstVisibleRowID = rows[visibleLow].id
+            context.visibleRowIDs = rows[visible].map(\.id)
+            // a scrub lands somewhere else every frame, and warming eighty
+            // tiles at each stop only queues work the next frame throws away.
+            // the window is rebuilt once the finger lifts.
+            if !scrub.isScrubbing {
+                prefetcher.update(
+                    visibleRowIDs: context.visibleRowIDs,
+                    model: model,
+                    client: session.client,
+                    backup: session.backup
+                )
+            }
+        }
+
+        let mountedLow = min(layout.index(at: top - rowWindowBuffer), count - 1)
+        let mountedHigh = min(layout.index(at: top + context.viewportHeight + rowWindowBuffer), count - 1) + 1
+        let mounted = mountedLow..<mountedHigh
+        if mounted != rowWindow.range { rowWindow.range = mounted }
+    }
+
+    /// everything padded past the last row, which is only the selection bar's
+    /// clearance. there is deliberately NO viewport-sized tail: padding the end
+    /// so the last month can reach the viewport top is what made a drag there
+    /// depend on a full screen of empty content being present to the pixel, and
+    /// it clamped short whenever the scroll view disagreed. immich-web pads
+    /// nothing and compresses the mapping instead - see maxScrollPercent - so
+    /// the end of the track is simply the end of the scroll.
+    private func bottomPadding() -> CGFloat {
+        isSelecting ? 90 : 0
     }
 
     var body: some View {
         GeometryReader { geometry in
             let side = tileSide(for: geometry.size.width)
-            let tailPadding = endPadding(side: side, viewportHeight: geometry.size.height)
+            let layout = rowLayout(side: side)
+            let scrollable = isScrollable(rowsHeight: layout.total, viewportHeight: geometry.size.height)
+            let tailPadding = bottomPadding()
 
             ScrollView {
-                // the header sits outside the lazy stack on purpose. every
-                // marker position is measured from where row space starts, and
-                // a header the lazy stack unmounts once it scrolls away stops
-                // reporting its height - which would shift the whole rail.
+                // the header sits above the virtual stack; every marker
+                // position is measured from where row space starts, so its
+                // height is measured rather than assumed.
                 VStack(spacing: 0) {
                     VStack(spacing: 0) { header }
                         .onGeometryChange(for: CGFloat.self) { proxy in
                             proxy.size.height.rounded()
                         } action: { height in
-                            if scrub.headerHeight != height { scrub.headerHeight = height }
+                            if scrub.headerHeight != height {
+                                scrub.headerHeight = height
+                                updateRowWindow()
+                            }
                         }
 
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.rows) { row in
-                            rowView(row, side: side)
-                                .id(row.id)
-                        }
+                    VirtualRowStack(
+                        rows: model.rows,
+                        starts: layout.starts,
+                        totalHeight: layout.total,
+                        window: rowWindow
+                    ) { row in
+                        rowView(row, side: side)
                     }
-                    .scrollTargetLayout()
                 }
-                .padding(.bottom, (isSelecting ? 90 : 0) + tailPadding)
+                .padding(.bottom, tailPadding)
             }
             .scrollPosition($scrollPosition)
             // the drawn indicator is the app's own, so the system one would
             // only double it up.
             .scrollIndicators(.hidden)
-            .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { rowIDs in
-                scrollContext.firstVisibleRowID = rowIDs.first
-                scrollContext.visibleRowIDs = rowIDs
-                // a scrub lands somewhere else every frame, and warming eighty
-                // tiles at each stop only queues work the next frame throws
-                // away. the window is rebuilt once the finger lifts.
-                if !scrub.isScrubbing {
-                    prefetcher.update(visibleRowIDs: rowIDs, model: model, client: session.client, backup: session.backup)
-                }
-                let month = rowIDs.first.flatMap { model.monthByRowID[$0] }
-                guard month != scrub.visibleMonth else { return }
-                // deferred one tick so the write never lands in the same
-                // frame as the scroll pass that produced it.
-                Task { @MainActor in
-                    if month != scrub.visibleMonth { scrub.visibleMonth = month }
-                }
-            }
             .simultaneousGesture(
                 pinchGesture(
                     viewportWidth: geometry.size.width,
@@ -496,14 +666,19 @@ struct TimelineScreen<Header: View>: View {
                 )
             } action: { _, state in
                 scrub.update(with: state)
-                scrollContext.insetTop = state.insetTop
             }
-            // precise offset for scroll compensation; the quantized fraction
-            // above is too coarse to re-anchor by. plain box write, no render.
+            // precise offset for scroll compensation and the row window; the
+            // quantized fraction above is too coarse for either. plain box
+            // write plus a window recompute that renders only on a real slide.
             .onScrollGeometryChange(for: CGFloat.self) { scroll in
-                scroll.contentOffset.y
+                scroll.contentOffset.y + scroll.contentInsets.top
             } action: { _, offset in
                 scrollContext.offsetY = offset
+                updateRowWindow()
+            }
+            .onChange(of: geometry.size.height, initial: true) { _, height in
+                scrollContext.viewportHeight = height
+                updateRowWindow()
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
                 scrollContext.viewportWidth = width
@@ -532,11 +707,14 @@ struct TimelineScreen<Header: View>: View {
                 )
             }
             // keyed on the row tallies, so any change of layout - a bucket
-            // filling in, a pinch, a month appearing - re-measures the months.
+            // filling in, a pinch, a month appearing - re-measures the months
+            // and re-windows the rows, which may have shifted under a fixed
+            // scroll offset.
             .onChange(of: ScrubberLayoutKey(model: model, side: side), initial: true) { _, _ in
                 let months = Self.scrubberMonths(spans: model.sectionSpans, side: side)
                 scrub.liveMonths = months
                 scrub.monthsHeight = months.last.map { $0.startY + $0.height } ?? 0
+                updateRowWindow()
             }
             .onChange(of: tailPadding, initial: true) { _, padding in
                 scrub.tailPadding = padding
@@ -549,32 +727,24 @@ struct TimelineScreen<Header: View>: View {
                     showIndicator()
                 }
             }
+            // the scrollbar is the app's own everywhere, so anything that
+            // scrolls at all gets one. gating it on a row count left short
+            // albums with no indicator of any kind, the system's being hidden.
             .overlay(alignment: .topTrailing) {
-                if model.rows.count > 30 && !viewer.isTransitioning {
+                if scrollable && !viewer.isTransitioning {
                     TimelineScrubber(
                         scrub: scrub,
-                        // scrolls by ROW identity. a pixel jump is clamped
-                        // against whatever content height the lazy stack
-                        // currently believes in, which is only exact for rows
-                        // it has already realized, so a jump to the far end
-                        // stops short of it. resolving down to the row rather
-                        // than the month keeps the drag continuous inside a
-                        // month, the way immich-web scrubs.
+                        // an absolute jump to the exact pixel, immich-web's
+                        // scrollToSegmentPercentage. the virtual stack owns
+                        // every row position, so the grid's layout IS the
+                        // scroll view's coordinate space and nothing can land
+                        // short or clamp - the drag is continuous within a
+                        // month, not snapped to it.
                         onScrub: { fraction in
                             var transaction = Transaction()
                             transaction.disablesAnimations = true
-                            guard let rowID = scrubTargetRow(fraction: fraction, side: side) else {
-                                // above the first month lies the header, so the
-                                // top of the drag means the top of the view.
-                                guard scrubbedRowID != scrubTopSentinel else { return }
-                                scrubbedRowID = scrubTopSentinel
-                                withTransaction(transaction) { scrollPosition.scrollTo(edge: .top) }
-                                return
-                            }
-                            guard rowID != scrubbedRowID else { return }
-                            scrubbedRowID = rowID
                             withTransaction(transaction) {
-                                scrollPosition.scrollTo(id: rowID, anchor: .top)
+                                scrollPosition.scrollTo(y: scrub.contentOffset(forFraction: fraction))
                             }
                         },
                         onScrubbingChanged: { scrubbing in
@@ -582,7 +752,6 @@ struct TimelineScreen<Header: View>: View {
                                 showIndicator()
                                 model.deferRebuilds()
                             } else {
-                                scrubbedRowID = nil
                                 scheduleIndicatorHide()
                                 model.resumeRebuilds()
                                 // the window went unwarmed for the length of
@@ -730,8 +899,9 @@ struct TimelineScreen<Header: View>: View {
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
                     apply()
+                    // 0 is the rest position in this space, and the floor.
                     position.wrappedValue.scrollTo(
-                        y: max(-context.insetTop, context.offsetY + newStart - oldStart)
+                        y: max(0, context.offsetY + newStart - oldStart)
                     )
                 }
                 return
@@ -1627,33 +1797,6 @@ struct TimelineScreen<Header: View>: View {
         if selection.isEmpty { exitSelection() }
     }
 
-    /// row the scrubber is pointing at, found by walking forward from its
-    /// month's first row - a handful of steps, since the month containing the
-    /// target is already known. nil means the drag is above the first month,
-    /// where only the header lives.
-    private func scrubTargetRow(fraction: CGFloat, side: CGFloat) -> String? {
-        let target = fraction * scrub.scrollRange
-        guard target >= scrub.headerHeight, let month = scrub.month(at: target) else { return nil }
-        let rows = model.rows
-        // the frozen month indexes the rows as they were when the drag began;
-        // if a rebuild has landed since, the month's own row is still right.
-        guard month.firstRowIndex < rows.count,
-              rows[month.firstRowIndex].id == month.firstRowID
-        else { return month.firstRowID }
-
-        var y = scrub.headerHeight + month.startY
-        var index = month.firstRowIndex
-        var rowID = month.firstRowID
-        while index < rows.count {
-            let height = rows[index].height(tileSide: side)
-            rowID = rows[index].id
-            if y + height > target { break }
-            y += height
-            index += 1
-        }
-        return rowID
-    }
-
     private static func scrubberMonths(spans: [TimelineSectionSpan], side: CGFloat) -> [ScrubberMonth] {
         var y: CGFloat = 0
         return spans.map { span in
@@ -1664,9 +1807,7 @@ struct TimelineScreen<Header: View>: View {
                 title: span.title,
                 year: span.year,
                 startY: y,
-                height: height,
-                firstRowID: span.firstRowID,
-                firstRowIndex: span.firstRowIndex
+                height: height
             )
         }
     }
@@ -2014,7 +2155,7 @@ private struct TimelineScrubber: View {
 
     private var scrubbedMonth: String? {
         guard scrub.scrollRange > 0 else { return nil }
-        return scrub.visibleMonth ?? scrub.month(at: scrub.offsetY)?.title
+        return scrub.month(atFraction: scrub.fraction)?.title
     }
 
     var body: some View {
