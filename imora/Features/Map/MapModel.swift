@@ -16,6 +16,9 @@ final class MapMarkerCache {
     private var entries: [MapMarkerOptions: Entry] = [:]
     private var inFlight: [MapMarkerOptions: Task<[MapMarker], Error>] = [:]
     private let lifetime: TimeInterval = 300
+    /// a full marker set can be tens of megabytes; combos beyond these are
+    /// dead weight from a settings sheet exploration.
+    private let entryLimit = 2
 
     func markers(client: ImmichClient, options: MapMarkerOptions) async throws -> [MapMarker] {
         if let entry = entries[options], Date().timeIntervalSince(entry.fetchedAt) < lifetime {
@@ -27,6 +30,12 @@ final class MapMarkerCache {
         inFlight[options] = task
         defer { inFlight[options] = nil }
         let markers = try await task.value
+        // evict on write: expired entries and all but the freshest combos.
+        entries = entries.filter { Date().timeIntervalSince($0.value.fetchedAt) < lifetime }
+        while entries.count >= entryLimit,
+              let oldest = entries.min(by: { $0.value.fetchedAt < $1.value.fetchedAt }) {
+            entries[oldest.key] = nil
+        }
         entries[options] = Entry(markers: markers, fetchedAt: Date())
         return markers
     }
@@ -53,18 +62,33 @@ final class MapModel {
     private let annotationLimit = 350
 
     private var clustersByZoom: [Int: [MapCluster]] = [:]
-    private var clusterTask: Task<Void, Never>?
     private var region: MKCoordinateRegion?
     private var viewportWidth: CGFloat = 0
+    /// zoom level currently being clustered off main, nil when idle. builds
+    /// are serialized: a pinch through six levels used to run six full-set
+    /// passes concurrently, five of them thrown away.
+    private var buildingZoom: Int?
+    /// bumped when the marker set is replaced, so a build snapshotted from
+    /// the old set can never land in the fresh cache.
+    private var markersVersion = 0
+    /// bumped per load so a slow superseded fetch cannot overwrite the newer
+    /// result - the cache task it awaits does not observe our cancellation.
+    private var loadGeneration = 0
 
     func load(client: ImmichClient, options: MapMarkerOptions) async {
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = true
         failure = nil
         do {
-            markers = try await MapMarkerCache.shared.markers(client: client, options: options)
+            let fetched = try await MapMarkerCache.shared.markers(client: client, options: options)
+            guard generation == loadGeneration else { return }
+            markers = fetched
+            markersVersion += 1
             clustersByZoom.removeAll()
-            rebuildClusters(force: true)
+            rebuildClusters()
         } catch {
+            guard generation == loadGeneration else { return }
             failure = error.localizedDescription
         }
         isLoading = false
@@ -75,13 +99,11 @@ final class MapModel {
     func cameraChanged(region: MKCoordinateRegion, viewportWidth: CGFloat) {
         self.region = region
         self.viewportWidth = viewportWidth
-        let level = MapClustering.zoomLevel(
+        zoom = MapClustering.zoomLevel(
             longitudeDelta: region.span.longitudeDelta,
             widthPoints: viewportWidth
         )
-        let changed = level != zoom
-        zoom = level
-        rebuildClusters(force: changed)
+        rebuildClusters()
     }
 
     var canZoomFurther: Bool { zoom < MapClustering.maxZoom - 2 }
@@ -91,7 +113,7 @@ final class MapModel {
         region.map { MapBoundingBox(region: $0) }
     }
 
-    private func rebuildClusters(force: Bool) {
+    private func rebuildClusters() {
         guard !markers.isEmpty else {
             visibleClusters = []
             visibleCount = 0
@@ -101,19 +123,39 @@ final class MapModel {
             publish(cached)
             return
         }
-        guard force || clusterTask == nil else { return }
-
-        clusterTask?.cancel()
+        guard buildingZoom == nil else { return }
         let snapshot = markers
         let level = zoom
-        clusterTask = Task { [weak self] in
+        let version = markersVersion
+        buildingZoom = level
+        Task { [weak self] in
             let built = await Task.detached(priority: .userInitiated) {
                 MapClustering.clusters(markers: snapshot, zoom: level)
             }.value
-            guard !Task.isCancelled, let self else { return }
-            clustersByZoom[level] = built
-            guard zoom == level else { return }
-            publish(built)
+            guard let self else { return }
+            self.buildingZoom = nil
+            // markers were replaced while this built; start over from them.
+            guard self.markersVersion == version else {
+                self.rebuildClusters()
+                return
+            }
+            self.clustersByZoom[level] = built
+            self.evictDistantZoomLevels(around: self.zoom)
+            if self.zoom == level {
+                self.publish(built)
+            } else if self.clustersByZoom[self.zoom] == nil {
+                // the camera moved on mid build; the finished work stays
+                // cached and the level now on screen builds next.
+                self.rebuildClusters()
+            }
+        }
+    }
+
+    /// levels far from the camera hold cluster sets sized like the library
+    /// itself at street zooms; keeping every level ever visited added up.
+    private func evictDistantZoomLevels(around level: Int) {
+        for key in clustersByZoom.keys where abs(key - level) > 2 {
+            clustersByZoom[key] = nil
         }
     }
 

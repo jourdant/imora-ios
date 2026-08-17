@@ -7,6 +7,7 @@ struct LibraryTab: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var people: [Person] = []
     @State private var peopleTotal = 0
+    @State private var isLoadingPeople = false
     /// serializes the carousel quick actions per person.
     @State private var mutatingPersonIDs = Set<String>()
 
@@ -86,13 +87,10 @@ struct LibraryTab: View {
             .navigationDestination(for: PlaceLink.self) { place in
                 PlaceScreen(city: place.city, coordinate: place.coordinate)
             }
+            // restarts on every re-appearance, so pop-backs from people
+            // screens pick up hides, merges and renames without a second
+            // onAppear fetch racing this one.
             .task { await loadPeople() }
-            // returning from people screens picks up hides, merges and renames.
-            .onAppear {
-                if !people.isEmpty {
-                    Task { await loadPeople() }
-                }
-            }
             // coming back to the app does not re-appear this tab, so an edit
             // made elsewhere meanwhile - a new featured photo - needs its own
             // pass.
@@ -172,9 +170,16 @@ struct LibraryTab: View {
     }
 
     private func loadPeople() async {
+        guard !isLoadingPeople else { return }
+        isLoadingPeople = true
+        defer { isLoadingPeople = false }
         guard let response = try? await session.client?.people() else { return }
-        people = response.people.filter { !($0.isHidden ?? false) }
-        peopleTotal = max(people.count, response.total - (response.hidden ?? 0))
+        // a refetch racing an in-flight optimistic mutation would resurrect
+        // the value it is busy removing.
+        guard mutatingPersonIDs.isEmpty else { return }
+        let fresh = response.people.filter { !($0.isHidden ?? false) }
+        if people != fresh { people = fresh }
+        peopleTotal = max(fresh.count, response.total - (response.hidden ?? 0))
     }
 
     private func setFavorite(_ person: Person, to value: Bool) async {
@@ -231,8 +236,14 @@ struct PlacesScreen: View {
 
     @State private var places: [(city: String, asset: AssetDetail)] = []
     @State private var isLoading = true
+    @State private var isLoadingMarkers = true
     @State private var searchText = ""
     @State private var markers: [MapMarker] = []
+    /// header dots and framing, clustered once off main when the markers
+    /// land. clustering the full set inside the header's init ran on every
+    /// body pass, on the main thread.
+    @State private var headerDots: [MapCluster] = []
+    @State private var headerFocus: MapBoundingBox?
     @State private var showMap = false
 
     private var visible: [(city: String, asset: AssetDetail)] {
@@ -241,7 +252,7 @@ struct PlacesScreen: View {
     }
 
     private var showsMapHeader: Bool {
-        searchText.isEmpty && !markers.isEmpty && session.features?.map != false
+        searchText.isEmpty && !headerDots.isEmpty && session.features?.map != false
     }
 
     var body: some View {
@@ -253,7 +264,7 @@ struct PlacesScreen: View {
                     } label: {
                         // the map inside refuses hits so it never eats the tap,
                         // which leaves the button with no shape of its own.
-                        PlacesMapHeader(markers: markers)
+                        PlacesMapHeader(dots: headerDots, focus: headerFocus)
                             .contentShape(.rect(cornerRadius: 20))
                     }
                     .buttonStyle(.plain)
@@ -295,28 +306,47 @@ struct PlacesScreen: View {
             MapScreen()
         }
         .overlay {
-            if isLoading {
+            // both fetches count: cities alone answering empty while the
+            // markers are still on the wire used to flash "no places".
+            if isLoading || isLoadingMarkers {
                 ProgressView()
             } else if places.isEmpty && markers.isEmpty {
                 ContentUnavailableView("No places", systemImage: "mappin.slash")
             }
         }
-        .task {
-            guard places.isEmpty, let client = session.client else { return }
+        // keyed on client presence so a slow session start retries instead of
+        // spinning forever behind a nil client.
+        .task(id: session.client == nil) {
+            guard places.isEmpty else { return }
+            defer { isLoading = false }
+            guard let client = session.client else { return }
             let assets = (try? await client.cities()) ?? []
             places = assets.compactMap { asset in
                 guard let city = asset.exifInfo?.city, !city.isEmpty else { return nil }
                 return (city: city, asset: asset)
             }
-            isLoading = false
         }
-        .task {
-            guard markers.isEmpty, session.features?.map != false, let client = session.client else { return }
+        .task(id: session.client == nil) {
+            guard markers.isEmpty else { return }
+            defer { isLoadingMarkers = false }
+            guard session.features?.map != false, let client = session.client else { return }
             // primes the cache the map screen reads, so opening it is instant.
-            markers = (try? await MapMarkerCache.shared.markers(
+            let fetched = (try? await MapMarkerCache.shared.markers(
                 client: client,
                 options: MapSettings.load().markerOptions
             )) ?? []
+            markers = fetched
+            guard !fetched.isEmpty else { return }
+            let built = await Task.detached(priority: .userInitiated) {
+                let clusters = MapClustering.clusters(markers: fetched, zoom: 4)
+                    .sorted { $0.count > $1.count }
+                return (
+                    dots: Array(clusters.prefix(60)),
+                    focus: MapClustering.focusBounds(of: clusters, coverage: 0.75)?.scaled(by: 1.5)
+                )
+            }.value
+            headerDots = built.dots
+            headerFocus = built.focus
         }
     }
 }
@@ -324,15 +354,8 @@ struct PlacesScreen: View {
 /// non-interactive preview of the photo map, coarse enough that it reads as a
 /// density plot rather than a pin soup.
 private struct PlacesMapHeader: View {
-    private let dots: [MapCluster]
-    private let focus: MapBoundingBox?
-
-    init(markers: [MapMarker]) {
-        let clusters = MapClustering.clusters(markers: markers, zoom: 4)
-            .sorted { $0.count > $1.count }
-        dots = Array(clusters.prefix(60))
-        focus = MapClustering.focusBounds(of: clusters, coverage: 0.75)?.scaled(by: 1.5)
-    }
+    let dots: [MapCluster]
+    let focus: MapBoundingBox?
 
     var body: some View {
         Map(initialPosition: focus.map { .rect($0.mapRect) } ?? .automatic, interactionModes: []) {

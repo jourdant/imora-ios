@@ -96,25 +96,22 @@ nonisolated struct MapBoundingBox: Hashable, Sendable {
 
 // MARK: - clusters
 
-/// a group of markers close enough to share one annotation at the current zoom.
+/// a group of markers close enough to share one annotation at the current
+/// zoom. deliberately holds no member array - only what the annotation and
+/// its tap need. carrying every member multiplied the whole marker set's
+/// memory by every zoom level ever visited.
 nonisolated struct MapCluster: Identifiable, Sendable {
     let id: String
     let latitude: Double
     let longitude: Double
-    let markers: [MapMarker]
+    let count: Int
+    /// the asset whose thumbnail stands for the whole group.
+    let representative: MapMarker
+    let placeName: String?
     let bounds: MapBoundingBox
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-    }
-
-    var count: Int { markers.count }
-
-    /// the asset whose thumbnail stands for the whole group.
-    var representative: MapMarker { markers[0] }
-
-    var placeName: String? {
-        markers.lazy.compactMap(\.placeName).first
     }
 
     /// every member sits on the same spot, so zooming cannot split the group.
@@ -189,11 +186,10 @@ nonisolated enum MapClustering {
             var north = south
             var latitudeSum = 0.0
             var longitudeSum = 0.0
-            var memberMarkers: [MapMarker] = []
-            memberMarkers.reserveCapacity(members.count)
+            var placeName: String?
             for index in members {
                 let marker = markers[index]
-                memberMarkers.append(marker)
+                if placeName == nil { placeName = marker.placeName }
                 west = min(west, marker.lon)
                 east = max(east, marker.lon)
                 south = min(south, marker.lat)
@@ -206,7 +202,9 @@ nonisolated enum MapClustering {
                 id: markers[seed].id,
                 latitude: latitudeSum / Double(members.count),
                 longitude: longitudeSum / Double(members.count),
-                markers: memberMarkers,
+                count: members.count,
+                representative: markers[seed],
+                placeName: placeName,
                 bounds: MapBoundingBox(west: west, south: south, east: east, north: north)
             ))
         }

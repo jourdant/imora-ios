@@ -104,7 +104,7 @@ struct MapScreen: View {
         .task(id: settings) {
             guard let client = session.client else { return }
             await model.load(client: client, options: settings.markerOptions)
-            frameMarkersIfNeeded()
+            await frameMarkersIfNeeded()
         }
         .onChange(of: settings) { _, updated in
             updated.save()
@@ -235,7 +235,7 @@ struct MapScreen: View {
         }
     }
 
-    private func frameMarkersIfNeeded() {
+    private func frameMarkersIfNeeded() async {
         guard !didFrameMarkers else { return }
         if let initialCoordinate {
             didFrameMarkers = true
@@ -246,10 +246,15 @@ struct MapScreen: View {
             return
         }
         // lands on the busiest part of the library instead of the outer extent,
-        // which for a globe-spanning library is mostly ocean.
-        let clusters = MapClustering.clusters(markers: model.markers, zoom: 4)
-        guard let bounds = MapClustering.focusBounds(of: clusters)
-            ?? MapClustering.bounds(of: model.markers) else { return }
+        // which for a globe-spanning library is mostly ocean. clustered off
+        // main - this used to freeze the screen right as it finished loading.
+        let snapshot = model.markers
+        guard !snapshot.isEmpty else { return }
+        let bounds = await Task.detached(priority: .userInitiated) {
+            let clusters = MapClustering.clusters(markers: snapshot, zoom: 4)
+            return MapClustering.focusBounds(of: clusters) ?? MapClustering.bounds(of: snapshot)
+        }.value
+        guard let bounds, !didFrameMarkers else { return }
         didFrameMarkers = true
         // fitting a rect into a tall screen already pads one axis generously.
         camera = .rect(bounds.scaled(by: 1.08).mapRect)
