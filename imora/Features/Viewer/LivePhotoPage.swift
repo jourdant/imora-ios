@@ -57,7 +57,11 @@ struct LivePhotoPage: View {
                 forceMuted: forcesMute,
                 seedDuration: nil,
                 autoPlays: false,
-                rewindsAtEnd: true
+                rewindsAtEnd: true,
+                // the clip loads on the first long press or transport tap.
+                // swiping a run of live photos used to fetch one motion video
+                // per page, nearly all of them thrown away.
+                defersItem: true
             ) {
                 await makeItem()
             }

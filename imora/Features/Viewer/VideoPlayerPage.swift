@@ -55,16 +55,23 @@ final class VideoPlayback {
     @ObservationIgnored private var wasPlayingBeforeScrub = false
     @ObservationIgnored private var isSeeking = false
     @ObservationIgnored private var pendingSeekSeconds: Double?
+    /// deferred item factory, held until the first engagement. live photos
+    /// claim on every page-on, and building the item eagerly fetched the
+    /// motion clip for clips that are almost never played.
+    @ObservationIgnored private var pendingItemMaker: (@MainActor () async -> AVPlayerItem?)?
 
     /// `autoPlays` is false for live photos: their page opens on the still and
-    /// only moves once the viewer asks it to.
+    /// only moves once the viewer asks it to. `defersItem` goes further and
+    /// waits for the first engagement before even creating the player item,
+    /// so paging across live photos costs no clip fetches at all.
     func claim(
         assetID: String,
         forceMuted: Bool,
         seedDuration: Double?,
         autoPlays: Bool = true,
         rewindsAtEnd: Bool = false,
-        makeItem: @MainActor () async -> AVPlayerItem?
+        defersItem: Bool = false,
+        makeItem: @escaping @MainActor () async -> AVPlayerItem?
     ) async {
         if ownerID == assetID {
             // the same page re-claims when its mute flag flips, e.g. a context
@@ -81,12 +88,23 @@ final class VideoPlayback {
         forcesMute = forceMuted
         self.rewindsAtEnd = rewindsAtEnd
         if let seedDuration { duration = seedDuration }
+        if defersItem, !autoPlays {
+            pendingItemMaker = makeItem
+            return
+        }
         let item = await makeItem()
         guard gen == generation, !Task.isCancelled else { return }
         guard let item else {
             ownerID = nil
             return
         }
+        install(item, generation: gen)
+        guard autoPlays else { return }
+        if !forceMuted, !isMuted { activatePlaybackAudioSession() }
+        player?.play()
+    }
+
+    private func install(_ item: AVPlayerItem, generation gen: Int) {
         let player = AVPlayer(playerItem: item)
         self.player = player
         applyMute()
@@ -98,9 +116,29 @@ final class VideoPlayback {
             guard let self, self.generation == gen else { return }
             self.frameInterval = interval
         }
-        guard autoPlays else { return }
-        if !forceMuted, !isMuted { activatePlaybackAudioSession() }
-        player.play()
+    }
+
+    /// builds the deferred item on first engagement. the still stays on
+    /// screen and the bar shows buffering until the clip is ready.
+    private func engagePendingItem(thenPlays: Bool) {
+        guard let maker = pendingItemMaker else { return }
+        pendingItemMaker = nil
+        isBuffering = true
+        let gen = generation
+        Task { [weak self] in
+            let item = await maker()
+            guard let self, self.generation == gen else { return }
+            self.isBuffering = false
+            guard let item else {
+                self.isFailed = true
+                return
+            }
+            self.install(item, generation: gen)
+            guard thenPlays else { return }
+            self.isEngaged = true
+            if !self.forcesMute, !self.isMuted { activatePlaybackAudioSession() }
+            self.player?.play()
+        }
     }
 
     func release(assetID: String) {
@@ -111,7 +149,11 @@ final class VideoPlayback {
     }
 
     func togglePlayPause() {
-        guard let player, !isFailed else { return }
+        guard !isFailed else { return }
+        guard let player else {
+            engagePendingItem(thenPlays: true)
+            return
+        }
         if isPlaying {
             player.pause()
         } else {
@@ -130,7 +172,14 @@ final class VideoPlayback {
     /// snaps to the next sync sample, which on a real clip skips several
     /// frames at a time. a zero-tolerance seek decodes to the exact time.
     func stepFrame(by count: Int) {
-        guard let player, duration > 0, !isFailed else { return }
+        guard !isFailed else { return }
+        // a deferred clip has no frames to step yet; load it parked so the
+        // controls come alive without playing.
+        guard player != nil else {
+            engagePendingItem(thenPlays: false)
+            return
+        }
+        guard let player, duration > 0 else { return }
         isEngaged = true
         player.pause()
         let target = min(max(currentTime + Double(count) * frameInterval, 0), duration)
@@ -251,6 +300,7 @@ final class VideoPlayback {
     }
 
     private func teardown() {
+        pendingItemMaker = nil
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
         statusObservation = nil
