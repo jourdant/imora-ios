@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// small json-on-disk store for offline copies of list screens, albums for
 /// now. lives in application support so the system does not purge it, and
@@ -35,6 +36,40 @@ nonisolated enum OfflineCache {
         // keys may nest, like asset-info/<id>.
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: file, options: .atomic)
+        pruneAssetInfoIfNeeded(storedKey: key)
+    }
+
+    // MARK: - pruning
+
+    /// asset-info accretes one file per photo ever inspected and nothing else
+    /// ever removes them. once per launch, when one is written, the oldest
+    /// entries beyond the cap go - system caches purge, application support
+    /// does not.
+    private static let assetInfoLimit = 500
+    private static let didPruneAssetInfo = OSAllocatedUnfairLock(initialState: false)
+
+    private static func pruneAssetInfoIfNeeded(storedKey: String) {
+        guard storedKey.hasPrefix("asset-info/") else { return }
+        let shouldPrune = didPruneAssetInfo.withLock { done in
+            if done { return false }
+            done = true
+            return true
+        }
+        guard shouldPrune else { return }
+        let directory = root.appending(path: "asset-info")
+        Task.detached(priority: .utility) {
+            let keys: Set<URLResourceKey> = [.contentModificationDateKey]
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: Array(keys)
+            ), files.count > assetInfoLimit else { return }
+            let dated = files.map { file in
+                (file, (try? file.resourceValues(forKeys: keys))?.contentModificationDate ?? .distantPast)
+            }
+            for (file, _) in dated.sorted(by: { $0.1 > $1.1 }).dropFirst(assetInfoLimit) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
     // MARK: - storage
