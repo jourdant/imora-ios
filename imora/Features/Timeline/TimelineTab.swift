@@ -55,8 +55,7 @@ struct ProfileAvatar: View {
 
     var body: some View {
         Group {
-            if let data = session.optimisticProfileImageData,
-               let image = UIImage(data: data) {
+            if let image = session.optimisticProfileImage {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()

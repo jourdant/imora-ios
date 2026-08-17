@@ -65,10 +65,15 @@ nonisolated enum TimelineCache {
     static func store(_ buckets: [TimeBucket], for filter: TimelineFilter, account: String) {
         guard let key = key(for: filter) else { return }
         memo.withLock { $0["\(account)|\(key)"] = buckets }
-        guard let data = try? JSONEncoder().encode(ListEntry(account: account, buckets: buckets)) else { return }
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try? data.write(to: listURL(key), options: .atomic)
-        pruneBucketAssets(keeping: Set(buckets.map(\.timeBucket)), filter: filter)
+        // resyncs call this from the main actor on every event flush; the
+        // memo above is what they need synchronously, the encode, write and
+        // prune walk are disk work that can land whenever.
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(ListEntry(account: account, buckets: buckets)) else { return }
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try? data.write(to: listURL(key), options: .atomic)
+            pruneBucketAssets(keeping: Set(buckets.map(\.timeBucket)), filter: filter)
+        }
     }
 
     // MARK: - bucket assets

@@ -46,6 +46,10 @@ nonisolated final class ImmichClient: Sendable {
             "Accept": "application/json",
         ]
         config.urlCache = nil
+        // the default 60s leaves every screen hanging when a server accepts
+        // connections but never answers. this is an idle timer - it resets as
+        // bytes arrive - so slow but live downloads are unaffected.
+        config.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: config)
     }
 
@@ -318,6 +322,7 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - asset edits, server-side non-destructive since v2.6
 
+    @concurrent
     func assetEdits(id: String) async throws -> [AssetEdit] {
         struct Envelope: Decodable { let edits: [AssetEdit] }
         let data = try await send(path: "assets/\(id)/edits")
@@ -423,7 +428,10 @@ nonisolated final class ImmichClient: Sendable {
     /// buckets costs one request per month, which is how the web client pays
     /// for it lazily. a metadata search scoped to the album answers a thousand
     /// at a time instead, and only the ids are decoded.
-    func albumAssetIDs(id: String) async throws -> Set<String> {
+    /// onPage streams each page's ids as it lands, so a huge album's picker
+    /// can lock members progressively instead of waiting out every round trip.
+    @discardableResult
+    func albumAssetIDs(id: String, onPage: ((Set<String>) -> Void)? = nil) async throws -> Set<String> {
         struct Page: Decodable {
             struct Assets: Decodable {
                 struct Item: Decodable { let id: String }
@@ -443,7 +451,9 @@ nonisolated final class ImmichClient: Sendable {
                 "page": AnyEncodable(page),
             ]
             let result: Page = try await request("search/metadata", method: "POST", body: body)
-            ids.formUnion(result.assets.items.map(\.id))
+            let pageIDs = Set(result.assets.items.map(\.id))
+            ids.formUnion(pageIDs)
+            onPage?(pageIDs)
             guard result.assets.nextPage != nil else { return ids }
             page += 1
         }
@@ -559,18 +569,31 @@ nonisolated final class ImmichClient: Sendable {
     }
 
     /// base for public share urls: the external domain when the admin set one,
-    /// else the api url with its /api suffix stripped.
+    /// else the api url with its /api suffix stripped. immutable per server,
+    /// so one successful lookup serves the whole session - callers await this
+    /// before showing share ui, and a fresh round trip each time doubled
+    /// their time to content.
     func serverWebURL() async -> URL {
-        if let config = try? await Self.publicConfig(apiURL: apiURL),
-           let domain = config.externalDomain, !domain.isEmpty,
+        if let cachedWebURL { return cachedWebURL }
+        let fallback = apiURL.lastPathComponent == "api"
+            ? apiURL.deletingLastPathComponent()
+            : apiURL
+        guard let config = try? await Self.publicConfig(apiURL: apiURL) else {
+            // a failed probe is not worth pinning; retry next time.
+            return fallback
+        }
+        let resolved: URL
+        if let domain = config.externalDomain, !domain.isEmpty,
            let url = URL(string: domain), url.host() != nil {
-            return url
+            resolved = url
+        } else {
+            resolved = fallback
         }
-        if apiURL.lastPathComponent == "api" {
-            return apiURL.deletingLastPathComponent()
-        }
-        return apiURL
+        cachedWebURL = resolved
+        return resolved
     }
+
+    private var cachedWebURL: URL?
 
     // MARK: - search
 
@@ -734,11 +757,15 @@ nonisolated final class ImmichClient: Sendable {
 
     // MARK: - memories
 
-    func memories(for date: Date) async throws -> [Memory] {
+    private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        return try await get("memories", query: [URLQueryItem(name: "for", value: formatter.string(from: date))])
+        return formatter
+    }()
+
+    func memories(for date: Date) async throws -> [Memory] {
+        try await get("memories", query: [URLQueryItem(name: "for", value: Self.dayFormatter.string(from: date))])
     }
 
     // MARK: - backup
@@ -764,6 +791,9 @@ nonisolated final class ImmichClient: Sendable {
 
     /// asks the server which checksums it already stores. only a
     /// reject/duplicate result with an asset id proves the bytes exist.
+    /// concurrent: a first backup runs one of these per hundred assets, and
+    /// the encode and decode were landing on the main thread each time.
+    @concurrent
     func bulkUploadCheck(_ items: [BulkUploadCheckItem]) async throws -> [BulkUploadCheckResult] {
         struct Envelope: Decodable { let results: [BulkUploadCheckResult] }
         let body = try JSONEncoder().encode(["assets": items])
@@ -780,18 +810,17 @@ nonisolated final class ImmichClient: Sendable {
     /// source file: it is deleted as soon as the request body is built, so peak
     /// disk usage stays near one file size. onProgress receives the sent
     /// fraction, and `account` routes a completion that outlives this process.
+    @concurrent
     func uploadAsset(
         _ upload: AssetUploadRequest,
         account: String,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> AssetUploadResult {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var fields: [(name: String, value: String)] = [
             ("deviceAssetId", upload.deviceAssetId),
             ("deviceId", upload.deviceId),
-            ("fileCreatedAt", iso.string(from: upload.fileCreatedAt)),
-            ("fileModifiedAt", iso.string(from: upload.fileModifiedAt)),
+            ("fileCreatedAt", APIDate.string(from: upload.fileCreatedAt)),
+            ("fileModifiedAt", APIDate.string(from: upload.fileModifiedAt)),
             ("isFavorite", upload.isFavorite ? "true" : "false"),
             ("duration", String(upload.durationMs)),
         ]

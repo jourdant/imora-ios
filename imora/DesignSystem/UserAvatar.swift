@@ -9,8 +9,7 @@ struct UserAvatar: View {
     var body: some View {
         Group {
             if user.id == session.user?.id,
-               let data = session.optimisticProfileImageData,
-               let image = UIImage(data: data) {
+               let image = session.optimisticProfileImage {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()

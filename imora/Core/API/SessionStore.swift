@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 
 nonisolated struct ProfileImageMutationToken {
     fileprivate let id: UUID
@@ -25,7 +26,14 @@ final class SessionStore {
     private(set) var preferences: UserPreferences?
     /// Keeps a newly selected avatar visible while the server accepts and
     /// re-caches the same bytes. A rejected upload restores the prior value.
-    var optimisticProfileImageData: Data?
+    var optimisticProfileImageData: Data? {
+        didSet {
+            optimisticProfileImage = optimisticProfileImageData.flatMap { UIImage(data: $0) }
+        }
+    }
+    /// decoded once when the bytes land. avatars used to rebuild a uiimage
+    /// from the raw picked photo on every body pass while an upload ran.
+    private(set) var optimisticProfileImage: UIImage?
     var profileImageCacheKey: String?
     private(set) var isProfileImageMutationInFlight = false
     @ObservationIgnored private var profileImageMutationID: UUID?

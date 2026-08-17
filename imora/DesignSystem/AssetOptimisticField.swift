@@ -117,10 +117,13 @@ final class AssetOptimisticField<Value: Equatable> {
                 reportFailure: reportFailure
             )
 
-            guard var channel = channels[assetID], channel.tailID == tailID else { return }
-            channel.tail = nil
-            channel.tailID = nil
-            channels[assetID] = channel
+            guard let channel = channels[assetID], channel.tailID == tailID else { return }
+            // the tail has settled, so the entry has nothing left to
+            // serialize. dropping it keeps the map from growing by one entry
+            // per asset ever mutated; the next load re-seeds the baseline
+            // through adoptServerValue, and a stale snapshot from before the
+            // drop fails its equality check, which only skips one adoption.
+            channels[assetID] = nil
             pendingAssetIDs.remove(assetID)
         }
 
