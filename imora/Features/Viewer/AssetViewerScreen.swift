@@ -201,6 +201,7 @@ private struct AssetInformationSheet: View {
 private struct AssetInformationPanel: View {
     let asset: Asset
     let serverAssetID: String?
+    let isRevealed: Bool
     let bottomContentInset: CGFloat
     let onDateAdjusted: (String, Date, Double) -> Void
     let onAlbumAdded: (String) -> Void
@@ -214,6 +215,7 @@ private struct AssetInformationPanel: View {
         AssetInfoPanel(
             asset: asset,
             showsHeader: false,
+            isRevealed: isRevealed,
             onDateAdjusted: onDateAdjusted,
             onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
             onOpenPerson: onOpenPerson,
@@ -276,6 +278,10 @@ struct AssetViewerScreen: View {
     let personID: String?
 
     @State private var assets: [Asset]
+    /// id to index, rebuilt only when membership changes. every swipe used to
+    /// pay several linear scans of the whole list, which shows at tens of
+    /// thousands of assets.
+    @State private var indexByAssetID: [String: Int]
     @State private var currentIndex: Int
     @State private var selectedAssetID: String?
     @State private var chromeVisible = true
@@ -335,6 +341,7 @@ struct AssetViewerScreen: View {
     ) {
         let safeIndex = assets.indices.contains(initialIndex) ? initialIndex : 0
         _assets = State(initialValue: assets)
+        _indexByAssetID = State(initialValue: Self.indexMap(for: assets))
         _currentIndex = State(initialValue: safeIndex)
         _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
         self.presentationID = presentationID
@@ -352,6 +359,17 @@ struct AssetViewerScreen: View {
 
     private var current: Asset? {
         assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
+    }
+
+    private static func indexMap(for assets: [Asset]) -> [String: Int] {
+        var map = [String: Int](minimumCapacity: assets.count)
+        for (index, asset) in assets.enumerated() { map[asset.id] = index }
+        return map
+    }
+
+    /// call after any mutation that changes membership or order.
+    private func rebuildIndexMap() {
+        indexByAssetID = Self.indexMap(for: assets)
     }
 
     private var serverAssetID: String? {
@@ -485,7 +503,7 @@ struct AssetViewerScreen: View {
             if let selectedAssetID { onSelectionChanged(selectedAssetID) }
         }
         .onChange(of: selectedAssetID) { _, id in
-            guard let id, let index = assets.firstIndex(where: { $0.id == id }) else { return }
+            guard let id, let index = indexByAssetID[id] else { return }
             currentIndex = index
             currentPageZoomed = false
             onSelectionChanged(id)
@@ -600,6 +618,10 @@ struct AssetViewerScreen: View {
                     AssetInformationPanel(
                         asset: current,
                         serverAssetID: serverAssetID,
+                        // the endpoint leaves .media the moment a drag starts
+                        // revealing information, so the load still begins
+                        // ahead of the panel actually settling on screen.
+                        isRevealed: showInfo || compactScrollEndpoint != .media,
                         bottomContentInset: layout.bottomSafeAreaInset + 80,
                         onDateAdjusted: applyDateAdjustment,
                         onAlbumAdded: { toast = $0 },
@@ -670,6 +692,7 @@ struct AssetViewerScreen: View {
 
             AssetPager(
                 assets: assets,
+                indexByID: indexByAssetID,
                 selection: $selectedAssetID,
                 followsCompactScroll: followsCompactScroll,
                 mutesVideo: isContextPreview,
@@ -733,8 +756,9 @@ struct AssetViewerScreen: View {
     // MARK: - prefetching
 
     /// downloads and decodes the pages around the current one so a swipe lands
-    /// on pixels instead of a placeholder. videos are skipped - their page
-    /// streams from the server and never asks for a still.
+    /// on pixels instead of a placeholder. device-paired videos are skipped -
+    /// they play locally - but a remote video page opens on exactly this
+    /// preview url as its poster, so it warms like a photo.
     private func warmNeighbours() {
         guard assets.indices.contains(currentIndex) else { return prefetcher.cancel() }
         let lower = max(0, currentIndex - Self.warmRadius)
@@ -742,9 +766,9 @@ struct AssetViewerScreen: View {
 
         var remote: Set<URL> = []
         var local: Set<String> = []
-        for asset in assets[lower...upper] where !asset.isVideo {
+        for asset in assets[lower...upper] {
             if let localIdentifier = asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id] {
-                local.insert(localIdentifier)
+                if !asset.isVideo { local.insert(localIdentifier) }
             } else if let client = session.client {
                 remote.insert(
                     client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash)
@@ -865,7 +889,7 @@ struct AssetViewerScreen: View {
     }
 
     private func applyDateAdjustment(_ assetID: String, _ fileCreatedAt: Date, _ offsetHours: Double) {
-        guard let index = assets.firstIndex(where: { $0.id == assetID }) else { return }
+        guard let index = indexByAssetID[assetID] else { return }
         assets[index].fileCreatedAt = fileCreatedAt
         assets[index].localOffsetHours = offsetHours
     }
@@ -1515,7 +1539,7 @@ struct AssetViewerScreen: View {
     private func apply(_ change: AssetChange) {
         switch change {
         case .favorite(let id, let value):
-            if let index = assets.firstIndex(where: { $0.id == id }) {
+            if let index = indexByAssetID[id] {
                 assets[index].isFavorite = value
             }
         case .favoriteCommitted:
@@ -1523,8 +1547,9 @@ struct AssetViewerScreen: View {
         case .albumMembershipProjected, .albumMembershipCommitted, .albumMembershipReverted:
             break
         case .optimisticRemoval(let id), .removed(let id):
-            if let index = assets.firstIndex(where: { $0.id == id }) {
+            if let index = indexByAssetID[id] {
                 assets.remove(at: index)
+                rebuildIndexMap()
                 let resolution = AssetViewerSelectionResolution.resolve(
                     remainingAssetIDs: assets.map(\.id),
                     selectedAssetID: selectedAssetID,
@@ -1541,7 +1566,7 @@ struct AssetViewerScreen: View {
         case .localDeleted:
             break
         case .edited(let id, let thumbhash):
-            if let index = assets.firstIndex(where: { $0.id == id }), let thumbhash {
+            if let index = indexByAssetID[id], let thumbhash {
                 assets[index].thumbhash = thumbhash
             }
             // the device copy is now the pre-edit original, so it stops
@@ -1563,7 +1588,7 @@ struct AssetViewerScreen: View {
     private func commitEdit(assetID: String, operationID: UUID, detail: AssetDetail?) {
         guard optimisticEdits[assetID]?.operationID == operationID else { return }
         editCacheKeys[assetID] = detail?.thumbhash ?? operationID.uuidString
-        if let index = assets.firstIndex(where: { $0.id == assetID }) {
+        if let index = indexByAssetID[assetID] {
             let projectedRatio = optimisticEdits[assetID]
                 .flatMap { UIImage(data: $0.imageData) }
                 .flatMap { image -> Double? in
@@ -1845,7 +1870,7 @@ struct AssetViewerScreen: View {
 
     private func beginOptimisticRemoval(_ asset: Asset) {
         guard optimisticRemovals[asset.id] == nil,
-              let index = assets.firstIndex(where: { $0.id == asset.id })
+              let index = indexByAssetID[asset.id]
         else { return }
         optimisticRemovals[asset.id] = ViewerRemoval(asset: asset, index: index)
         apply(.optimisticRemoval(asset.id))
@@ -1858,8 +1883,9 @@ struct AssetViewerScreen: View {
 
     private func rollbackOptimisticRemoval(_ id: String) {
         guard let removal = optimisticRemovals.removeValue(forKey: id) else { return }
-        if !assets.contains(where: { $0.id == id }) {
+        if indexByAssetID[id] == nil {
             assets.insert(removal.asset, at: min(removal.index, assets.count))
+            rebuildIndexMap()
             if selectedAssetID == nil || assets.count == 1 {
                 currentIndex = min(removal.index, assets.count - 1)
                 selectedAssetID = id
@@ -1872,6 +1898,7 @@ struct AssetViewerScreen: View {
         guard assets.indices.contains(currentIndex) else { return }
         let removedIndex = currentIndex
         assets.remove(at: removedIndex)
+        rebuildIndexMap()
         let resolution = AssetViewerSelectionResolution.resolve(
             remainingAssetIDs: assets.map(\.id),
             selectedAssetID: selectedAssetID,
@@ -1944,7 +1971,13 @@ private struct AirPlayRoutePicker: UIViewRepresentable {
 /// viewport, so opening and closing the viewer costs o(visible) instead of
 /// o(library) like the page style tabview, which froze the zoom transition.
 private struct AssetPager: View {
+    /// realized pages further than this from the current one give up their
+    /// heavy content. lazyhstack never destroys a realized page, so a long
+    /// browse session would otherwise pin every decoded bitmap it visited.
+    private static let retainRadius = 3
+
     let assets: [Asset]
+    let indexByID: [String: Int]
     @Binding var selection: String?
     let followsCompactScroll: Bool
     let mutesVideo: Bool
@@ -1965,6 +1998,7 @@ private struct AssetPager: View {
 
     init(
         assets: [Asset],
+        indexByID: [String: Int],
         selection: Binding<String?>,
         followsCompactScroll: Bool,
         mutesVideo: Bool,
@@ -1974,6 +2008,7 @@ private struct AssetPager: View {
         onZoomChanged: @escaping (String, Bool) -> Void
     ) {
         self.assets = assets
+        self.indexByID = indexByID
         _selection = selection
         self.followsCompactScroll = followsCompactScroll
         self.mutesVideo = mutesVideo
@@ -1992,12 +2027,14 @@ private struct AssetPager: View {
     }
 
     var body: some View {
+        let centreIndex = selection.flatMap { indexByID[$0] }
         ScrollView(.horizontal) {
             LazyHStack(spacing: 0) {
                 ForEach(assets) { asset in
                     AssetPage(
                         asset: asset,
                         isActive: asset.id == selection,
+                        isNearby: isNearby(asset.id, centre: centreIndex),
                         mutesVideo: mutesVideo,
                         playback: playback,
                         optimisticEdit: optimisticEdits[asset.id],
@@ -2029,9 +2066,7 @@ private struct AssetPager: View {
             position.scrollTo(id: initialSelection, anchor: .center)
         }
         .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.51) { visibleIDs in
-            guard let id = visibleIDs.first(where: { visibleID in
-                assets.contains(where: { $0.id == visibleID })
-            }) else { return }
+            guard let id = visibleIDs.first(where: { indexByID[$0] != nil }) else { return }
 
             // Ignore a transient page-zero report while the LazyHStack is
             // registering the immutable initial target. Retrying the pending
@@ -2049,11 +2084,18 @@ private struct AssetPager: View {
         }
         .onChange(of: selection) { _, id in
             guard let id,
-                  assets.contains(where: { $0.id == id }),
+                  indexByID[id] != nil,
                   id != visibleAssetID
             else { return }
             position.scrollTo(id: id, anchor: .center)
         }
+    }
+
+    /// unknown ids or an unknown centre stay heavy - a transient map mismatch
+    /// must never blank the page on screen.
+    private func isNearby(_ id: String, centre: Int?) -> Bool {
+        guard let centre, let index = indexByID[id] else { return true }
+        return abs(index - centre) <= Self.retainRadius
     }
 
     private func projectedAspectRatio(for asset: Asset) -> Double {
@@ -2071,6 +2113,10 @@ private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let isActive: Bool
+    /// far pages drop their heavy content - zoom scroll view, hosting
+    /// controller and decoded bitmaps - and become an empty frame. the swap
+    /// happens well offscreen, and returning rebuilds from the image caches.
+    let isNearby: Bool
     let mutesVideo: Bool
     let playback: VideoPlayback
     let optimisticEdit: AssetEditProjection?
@@ -2096,7 +2142,9 @@ private struct AssetPage: View {
         // still fades during drag dismiss.
         ZStack {
             Color.clear
-            pageContent
+            if isNearby {
+                pageContent
+            }
         }
     }
 
@@ -2324,10 +2372,13 @@ nonisolated struct SharedAssetFile: Transferable {
         for (key, value) in client.authHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // streamed to disk: buffering with data(for:) held the whole original
+        // in memory, which could jetsam the app on a large video.
+        let (tempURL, response) = try await URLSession.shared.download(for: request)
         guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
         guard (200..<300).contains(http.statusCode) else {
-            throw ImmichError.http(http.statusCode, ImmichClient.serverMessage(from: data))
+            try? FileManager.default.removeItem(at: tempURL)
+            throw ImmichError.http(http.statusCode, "")
         }
         var filename = "photo"
         if let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
@@ -2341,7 +2392,7 @@ nonisolated struct SharedAssetFile: Transferable {
         let directory = FileManager.default.temporaryDirectory.appending(path: "share")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let target = directory.appending(path: "\(UUID().uuidString)-\(filename)")
-        try data.write(to: target)
+        try FileManager.default.moveItem(at: tempURL, to: target)
         return target
     }
 

@@ -39,6 +39,11 @@ struct AssetInfoPanel: View {
     /// presentations can omit it because the surrounding viewer flow already
     /// establishes the information context and vertical space is at a premium.
     var showsHeader = true
+    /// compact viewers keep this panel mounted below the fold on every page.
+    /// false holds the network and disk work back until the user actually
+    /// pulls the information up - otherwise every swipe costs two requests,
+    /// a cache write and a map for a panel never seen.
+    var isRevealed = true
     /// Fires after an adjust-date save so the viewer can refresh its copy:
     /// UTC capture instant + photographer-local offset in hours.
     var onDateAdjusted: ((String, Date, Double) -> Void)? = nil
@@ -64,6 +69,8 @@ struct AssetInfoPanel: View {
     }
 
     @State private var loadState = LoadState.loading
+    /// details already fetched this session, so revisits paint instantly.
+    @State private var detailsByAsset: [String: AssetDetail] = [:]
     @State private var albumsByAsset: [String: [Album]] = [:]
     @State private var albumRevisions: [String: UInt64] = [:]
     @State private var albumMembershipRollbacks: [UUID: AlbumMembershipRollback] = [:]
@@ -151,7 +158,10 @@ struct AssetInfoPanel: View {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("asset-details")
-        .task(id: asset.id) { await load() }
+        .task(id: "\(asset.id)|\(isRevealed)") {
+            guard isRevealed else { return }
+            await load()
+        }
         .onDisappear {
             Task { await commitDescription() }
         }
@@ -1364,7 +1374,14 @@ struct AssetInfoPanel: View {
         if isNewAsset {
             draftAssetID = assetID
             descriptionDraft = captionsByAsset[assetID] ?? ""
-            loadState = .loading
+            // paging back to an asset already seen this session shows its
+            // detail immediately and revalidates behind it, instead of
+            // spinning through a whole refetch on a slow server.
+            if let known = detailsByAsset[assetID] {
+                loadState = .loaded(known)
+            } else {
+                loadState = .loading
+            }
         }
         loadGeneration &+= 1
         let generation = loadGeneration
@@ -1399,6 +1416,7 @@ struct AssetInfoPanel: View {
         do {
             let detail = try await client.assetDetail(id: assetID)
             guard draftAssetID == assetID, loadGeneration == generation else { return }
+            detailsByAsset[assetID] = detail
             loadState = .loaded(detail)
             adoptMetadata(
                 detail,
@@ -1425,12 +1443,20 @@ struct AssetInfoPanel: View {
             }
         } catch {
             // Offline: the last fetched copy still answers most questions.
+            // read off main - it is a per-asset file and the panel may be
+            // asking mid-swipe.
             guard draftAssetID == assetID, loadGeneration == generation else { return }
-            if let account,
-               let cached: CachedAssetInfo = OfflineCache.value(
-                   key: "asset-info/\(assetID)",
-                   account: account
-               ) {
+            let cachedInfo: CachedAssetInfo?
+            if let account {
+                cachedInfo = await Task.detached(priority: .userInitiated) {
+                    OfflineCache.value(CachedAssetInfo.self, key: "asset-info/\(assetID)", account: account)
+                }.value
+                guard draftAssetID == assetID, loadGeneration == generation else { return }
+            } else {
+                cachedInfo = nil
+            }
+            if let cached = cachedInfo {
+                detailsByAsset[assetID] = cached.detail
                 loadState = .loaded(cached.detail)
                 adoptMetadata(
                     cached.detail,
