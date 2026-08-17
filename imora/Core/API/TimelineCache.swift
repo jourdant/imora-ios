@@ -111,6 +111,35 @@ nonisolated enum TimelineCache {
         return restored
     }
 
+    /// same read, decoded across cores. a fully cached large library is
+    /// hundreds of per-bucket json files, and walking them serially held the
+    /// offline grid back by seconds on cold launch.
+    @concurrent
+    static func restoreBucketsConcurrently(
+        _ bucketIDs: [String],
+        filter: TimelineFilter,
+        account: String
+    ) async -> [String: [Asset]] {
+        let width = max(2, min(6, ProcessInfo.processInfo.activeProcessorCount - 2))
+        return await withTaskGroup(of: (String, [Asset])?.self) { group in
+            var iterator = bucketIDs.makeIterator()
+            func addNext() {
+                guard let id = iterator.next() else { return }
+                group.addTask {
+                    guard let assets = bucketAssets(id, filter: filter, account: account) else { return nil }
+                    return (id, assets)
+                }
+            }
+            for _ in 0..<width { addNext() }
+            var restored: [String: [Asset]] = [:]
+            while let result = await group.next() {
+                if let (id, assets) = result { restored[id] = assets }
+                addNext()
+            }
+            return restored
+        }
+    }
+
     /// drops asset files for buckets no longer in the list, e.g. a month whose
     /// last photos were deleted. called with every fresh list so the store
     /// tracks the library instead of growing forever.

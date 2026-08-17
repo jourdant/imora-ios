@@ -330,6 +330,7 @@ final class TimelineModel {
     private var prefetchTask: Task<Void, Never>?
     private var prefetchID: UUID?
     private var rebuildTask: Task<Void, Never>?
+    private var restoreTask: Task<Void, Never>?
     private var hasLoaded = false
     private var isViewerSuspended = false
     private var isRebuildDeferred = false
@@ -376,6 +377,7 @@ final class TimelineModel {
         rebuildTask?.cancel()
         resyncTask?.cancel()
         realtimeFlushTask?.cancel()
+        restoreTask?.cancel()
     }
 
     /// rows cover both server sections and merged device photos.
@@ -428,21 +430,48 @@ final class TimelineModel {
     /// fills placeholder sections with their last fetched assets from disk.
     /// restored buckets are marked stale so the next reachable pass refetches
     /// them, keeping freshness identical to an uncached launch.
+    ///
+    /// split in two so a huge cached library paints fast: the newest months -
+    /// what the first frame shows - decode and land before this returns, and
+    /// the long tail decodes across cores while the network load already
+    /// runs, applying in one debounced pass.
     private func restoreCachedBuckets(using client: ImmichClient) async {
         guard let account = account(for: client) else { return }
         let missing = sections.filter { $0.days == nil }.map(\.id)
         guard !missing.isEmpty else { return }
         let filter = filter
-        let restored = await Task.detached(priority: .userInitiated) {
-            TimelineCache.restoreBuckets(missing, filter: filter, account: account)
-        }.value
+
+        let head = Array(missing.prefix(6))
+        let restoredHead = await TimelineCache.restoreBucketsConcurrently(
+            head, filter: filter, account: account
+        )
+        applyRestoredBuckets(restoredHead)
+        if !restoredHead.isEmpty {
+            rebuildRows(rebuildAssets: true)
+        }
+
+        let tail = Array(missing.dropFirst(6))
+        guard !tail.isEmpty else { return }
+        restoreTask?.cancel()
+        restoreTask = Task { [weak self] in
+            let restored = await TimelineCache.restoreBucketsConcurrently(
+                tail, filter: filter, account: account
+            )
+            guard let self, !Task.isCancelled, !restored.isEmpty else { return }
+            self.applyRestoredBuckets(restored)
+            self.scheduleRebuild()
+        }
+    }
+
+    /// only fills placeholders, so a bucket the network answered while the
+    /// decode ran keeps its fresh days.
+    private func applyRestoredBuckets(_ restored: [String: [Asset]]) {
         guard !restored.isEmpty else { return }
         for index in sections.indices where sections[index].days == nil {
             guard let assets = restored[sections[index].id] else { continue }
             sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
             staleBucketIDs.insert(sections[index].id)
         }
-        rebuildRows(rebuildAssets: true)
     }
 
     /// persists a fetched bucket for offline browsing. fire and forget, off
