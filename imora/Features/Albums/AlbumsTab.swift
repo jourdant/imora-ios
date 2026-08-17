@@ -408,6 +408,19 @@ struct AlbumPickerSheet: View {
             }
             .task {
                 defer { isLoading = false }
+                // the albums tab's offline copy paints the owned subset
+                // instantly while the fresh list loads.
+                if albums.isEmpty, let client = session.client, let account = client.offlineAccountKey {
+                    let cached = await Task.detached(priority: .userInitiated) {
+                        OfflineCache.value([Album].self, key: "albums", account: account)
+                    }.value
+                    if let cached, albums.isEmpty {
+                        let ownerID = session.user?.id
+                        albums = cached
+                            .filter { !$0.isPending && (ownerID == nil || $0.owner?.id == ownerID) }
+                            .sorted { $0.updatedAt > $1.updatedAt }
+                    }
+                }
                 if let fetched = try? await session.client?.albums(isOwned: true) {
                     albums = fetched.sorted { $0.updatedAt > $1.updatedAt }
                 }

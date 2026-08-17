@@ -149,11 +149,25 @@ struct AddToAlbumSheet: View {
 
     private func load() async {
         guard let client = session.client else { return }
+        // the albums tab's offline copy paints the list instantly while the
+        // fresh one loads. membership ticks still wait for the server - a
+        // guessed tick invites a duplicate add.
+        if albums.isEmpty, let account = client.offlineAccountKey {
+            let cached = await Task.detached(priority: .userInitiated) {
+                OfflineCache.value([Album].self, key: "albums", account: account)
+            }.value
+            if let cached, albums.isEmpty {
+                albums = cached.filter { !$0.isPending }.sorted { $0.updatedAt > $1.updatedAt }
+            }
+        }
         async let allTask = try? client.albums()
         async let containingTask = try? client.albums(assetID: assetIDs.first ?? "")
-        let all = await allTask ?? []
+        let all = await allTask
         let containing = await containingTask ?? []
-        albums = all.sorted { $0.updatedAt > $1.updatedAt }
+        // a failed refresh keeps the cached list instead of blanking it.
+        if let all {
+            albums = all.sorted { $0.updatedAt > $1.updatedAt }
+        }
         containingIDs = Set(containing.map(\.id))
         isLoading = false
     }

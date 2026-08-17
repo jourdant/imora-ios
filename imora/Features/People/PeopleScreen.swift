@@ -205,6 +205,18 @@ struct PeopleScreen: View {
         guard !isReloading else { return }
         isReloading = true
         defer { isReloading = false }
+        let account = client.offlineAccountKey
+        // last session's list paints instantly, offline included; the fetch
+        // below reconciles it.
+        if people.isEmpty, let account {
+            let cached = await Task.detached(priority: .userInitiated) {
+                OfflineCache.value([Person].self, key: "people", account: account)
+            }.value
+            if let cached, people.isEmpty, mutatingIDs.isEmpty {
+                people = cached
+                isLoading = false
+            }
+        }
         // hidden people ride along so managing them needs no second fetch.
         // pages are 1-based and usually just one.
         var all: [Person] = []
@@ -223,6 +235,12 @@ struct PeopleScreen: View {
         // projection, and an identical list is not worth a full grid diff.
         guard mutatingIDs.isEmpty, all != people else { return }
         people = all
+        if let account {
+            let snapshot = all
+            Task.detached(priority: .utility) {
+                OfflineCache.store(snapshot, key: "people", account: account)
+            }
+        }
     }
 
     // MARK: - mutations

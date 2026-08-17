@@ -200,6 +200,15 @@ struct PeoplePickerSheet: View {
             .task {
                 selected = Set(filter.people.map(\.id))
                 defer { isLoadingPeople = false }
+                // the shared people cache paints instantly on a slow server.
+                if people.isEmpty, let account = session.client?.offlineAccountKey {
+                    let cached = await Task.detached(priority: .userInitiated) {
+                        OfflineCache.value([Person].self, key: "people", account: account)
+                    }.value
+                    if let cached, people.isEmpty {
+                        people = cached.filter { !($0.isHidden ?? false) }
+                    }
+                }
                 if let response = try? await session.client?.people() {
                     people = response.people.filter { !($0.isHidden ?? false) }
                 }

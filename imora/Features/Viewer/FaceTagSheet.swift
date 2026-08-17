@@ -196,6 +196,16 @@ struct FaceTagSheet: View {
     }
 
     private func loadPeople() async {
+        // the shared people cache paints the list instantly on a slow server.
+        if people.isEmpty, let account = session.client?.offlineAccountKey {
+            let cached = await Task.detached(priority: .userInitiated) {
+                OfflineCache.value([Person].self, key: "people", account: account)
+            }.value
+            if let cached, people.isEmpty {
+                people = cached.filter { !($0.isHidden ?? false) }
+                isLoading = false
+            }
+        }
         // already-tagged people stay listed: a person can legitimately get a
         // second face region on the same asset.
         if let response = try? await session.client?.people() {

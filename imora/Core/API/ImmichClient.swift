@@ -595,6 +595,11 @@ nonisolated final class ImmichClient: Sendable {
 
     private var cachedWebURL: URL?
 
+    /// account tag for offline caches, nil when the url has no host.
+    var offlineAccountKey: String? {
+        apiURL.host().map { SessionCache.accountKey(host: $0) }
+    }
+
     // MARK: - search
 
     /// routes to /search/smart when a context query is set, /search/metadata

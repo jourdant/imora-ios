@@ -173,6 +173,21 @@ struct LibraryTab: View {
         guard !isLoadingPeople else { return }
         isLoadingPeople = true
         defer { isLoadingPeople = false }
+        let account = session.client?.offlineAccountKey
+        // the shared people cache paints the carousel instantly, offline
+        // included; the fetch below reconciles it.
+        var cachedWasEmpty = true
+        if people.isEmpty, let account {
+            let cached = await Task.detached(priority: .userInitiated) {
+                OfflineCache.value([Person].self, key: "people", account: account)
+            }.value
+            cachedWasEmpty = cached == nil
+            if let cached, people.isEmpty, mutatingPersonIDs.isEmpty {
+                let visible = cached.filter { !($0.isHidden ?? false) }
+                people = visible
+                peopleTotal = max(peopleTotal, visible.count)
+            }
+        }
         guard let response = try? await session.client?.people() else { return }
         // a refetch racing an in-flight optimistic mutation would resurrect
         // the value it is busy removing.
@@ -180,6 +195,14 @@ struct LibraryTab: View {
         let fresh = response.people.filter { !($0.isHidden ?? false) }
         if people != fresh { people = fresh }
         peopleTotal = max(fresh.count, response.total - (response.hidden ?? 0))
+        // seed the cache only when the people screen has never written its
+        // full list - this response may be a single page.
+        if cachedWasEmpty, let account, !response.people.isEmpty {
+            let snapshot = response.people
+            Task.detached(priority: .utility) {
+                OfflineCache.store(snapshot, key: "people", account: account)
+            }
+        }
     }
 
     private func setFavorite(_ person: Person, to value: Bool) async {
