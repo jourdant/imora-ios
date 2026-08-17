@@ -13,6 +13,11 @@ struct AlbumsTab: View {
     @State private var filter: Filter = .all
     @State private var searchText = ""
     @State private var isLoading = false
+    /// distinguishes "nothing yet" from "the server says none", so the first
+    /// frame shows a spinner instead of flashing the empty state.
+    @State private var hasLoaded = false
+    @State private var loadFailed = false
+    @State private var loadTask: Task<Void, Never>?
     @State private var isCreating = false
     @State private var showCreate = false
     @State private var newAlbumName = ""
@@ -76,10 +81,19 @@ struct AlbumsTab: View {
                 }
             }
             .overlay {
-                if isLoading && albums.isEmpty {
-                    ProgressView()
-                } else if albums.isEmpty && !isLoading {
-                    ContentUnavailableView("No albums", systemImage: "rectangle.stack")
+                if albums.isEmpty {
+                    if !hasLoaded {
+                        ProgressView()
+                    } else if loadFailed {
+                        ContentUnavailableView {
+                            Label("Couldn't load albums", systemImage: "wifi.exclamationmark")
+                        } actions: {
+                            Button("Retry") { reload() }
+                                .buttonStyle(.glass)
+                        }
+                    } else {
+                        ContentUnavailableView("No albums", systemImage: "rectangle.stack")
+                    }
                 }
             }
             .task { await load() }
@@ -90,12 +104,12 @@ struct AlbumsTab: View {
             // been renamed or deleted. the initial load stays with .task.
             .onAppear {
                 if !albums.isEmpty {
-                    Task { await load() }
+                    reload()
                 }
             }
             // server-side album changes arrive over the realtime channel.
             .onChange(of: session.realtime?.albumsGeneration ?? 0) {
-                Task { await load() }
+                reload()
             }
             .alert("New Album", isPresented: $showCreate) {
                 TextField("Album name", text: $newAlbumName)
@@ -113,7 +127,10 @@ struct AlbumsTab: View {
             HStack(spacing: 8) {
                 ForEach(Filter.allCases, id: \.self) { item in
                     Button {
-                        withAnimation(.smooth(duration: 0.2)) { filter = item }
+                        // no withAnimation: it would animate the whole grid
+                        // diff of potentially thousands of cards. only the
+                        // chip styling below animates.
+                        filter = item
                     } label: {
                         Text(item.rawValue)
                             .font(.subheadline.weight(.medium))
@@ -126,11 +143,20 @@ struct AlbumsTab: View {
                         in: .capsule
                     )
                     .foregroundStyle(filter == item ? .white : .primary)
+                    .animation(.smooth(duration: 0.2), value: filter)
                 }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 2)
         }
+    }
+
+    /// restarts the fetch, cancelling the one in flight: a burst of realtime
+    /// album events or quick tab hops would otherwise stack whole-list
+    /// downloads whose results are thrown away by the gate anyway.
+    private func reload() {
+        loadTask?.cancel()
+        loadTask = Task { await load() }
     }
 
     private func load() async {
@@ -139,16 +165,22 @@ struct AlbumsTab: View {
         isLoading = true
         let account = client.apiURL.host().map { SessionCache.accountKey(host: $0) }
         // a fresh tab paints the last known list first, and keeps it when the
-        // server is unreachable.
-        if albums.isEmpty, let account,
-           let cached: [Album] = OfflineCache.value(key: "albums", account: account) {
+        // server is unreachable. read and decoded off main - with enough
+        // albums the file is megabytes and this used to hitch the tab open.
+        if albums.isEmpty, let account {
+            let cached = await Task.detached(priority: .userInitiated) {
+                OfflineCache.value([Album].self, key: "albums", account: account)
+            }.value
             // Pending rows are session projections. Persisting one could leave
             // a ghost album after the app is terminated mid-request.
-            albums = cached.filter { !$0.isPending }
+            if let cached, albums.isEmpty, albumLoadGate.accepts(ticket) {
+                albums = cached.filter { !$0.isPending }
+            }
         }
         let fetched = try? await client.albums()
         guard albumLoadGate.accepts(ticket) else { return }
         if let fetched {
+            loadFailed = false
             let pending = albums.filter(\.isPending)
             let currentByID = Dictionary(
                 albums.lazy.filter { !$0.isPending }.map { ($0.id, $0) },
@@ -161,15 +193,23 @@ struct AlbumsTab: View {
                     currentByID[fetched.id]?.reconcilingServerVersion(fetched) ?? fetched
                 }
                 .sorted { $0.updatedAt > $1.updatedAt }
-            albums = pending + reconciled
-            if let account {
-                let snapshot = albums.filter { !$0.isPending }
-                Task.detached(priority: .utility) {
-                    OfflineCache.store(snapshot, key: "albums", account: account)
+            let merged = pending + reconciled
+            // most reloads confirm what is already on screen; skipping the
+            // assignment spares a full grid diff over every album.
+            if albums != merged {
+                albums = merged
+                if let account {
+                    let snapshot = merged.filter { !$0.isPending }
+                    Task.detached(priority: .utility) {
+                        OfflineCache.store(snapshot, key: "albums", account: account)
+                    }
                 }
             }
+        } else if !Task.isCancelled {
+            loadFailed = true
         }
         isLoading = false
+        hasLoaded = true
     }
 
     private func createAlbum() async {
@@ -353,6 +393,14 @@ struct AlbumPickerSheet: View {
             }
             .navigationTitle("Add to Album")
             .navigationBarTitleDisplayMode(.inline)
+            // without this the sheet reads as "you have no albums" for the
+            // whole length of a slow fetch. no empty state on purpose - the
+            // new album row is the affordance and an overlay would cover it.
+            .overlay {
+                if isLoading && albums.isEmpty {
+                    ProgressView()
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }

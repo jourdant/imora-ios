@@ -82,8 +82,12 @@ struct NotificationsScreen: View {
         }
         .listStyle(.plain)
         .overlay {
-            if inbox.items.isEmpty, !inbox.isLoading {
-                empty
+            if inbox.items.isEmpty {
+                if inbox.hasLoaded, !inbox.isLoading {
+                    empty
+                } else if !inbox.hasLoaded {
+                    ProgressView()
+                }
             }
         }
         .refreshable { await inbox.load() }

@@ -251,8 +251,9 @@ struct ShareLinksSheet: View {
         guard let client = session.client, !hasMutationInFlight else { return }
         let ticket = linkLoadGate.begin()
         isLoading = true
-        let base = await client.serverWebURL()
-        guard linkLoadGate.accepts(ticket) else { return }
+        // both round trips run together - waiting the web base out before
+        // even asking for the links doubled time to content on a slow server.
+        async let baseFetch = client.serverWebURL()
         do {
             let fetched: [SharedLink]
             switch target {
@@ -268,11 +269,13 @@ struct ShareLinksSheet: View {
                     return wanted.isSubset(of: contained)
                 }
             }
+            let base = await baseFetch
             guard linkLoadGate.accepts(ticket) else { return }
             webBase = base
             links = fetched
             error = nil
         } catch {
+            let base = await baseFetch
             guard linkLoadGate.accepts(ticket) else { return }
             webBase = base
             self.error = error.localizedDescription

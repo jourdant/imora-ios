@@ -48,6 +48,9 @@ final class NotificationInbox: RealtimeListener {
     private(set) var items: [ServerNotification] = []
     private(set) var unreadCount = 0
     private(set) var isLoading = false
+    /// distinguishes "not fetched yet" from "the server says none", so the
+    /// inbox does not flash its empty state before the first load resolves.
+    private(set) var hasLoaded = false
 
     private enum Projection {
         case present(ServerNotification)
@@ -101,6 +104,7 @@ final class NotificationInbox: RealtimeListener {
         let context = loadContext()
         guard let fetched = try? await client.notifications(unreadOnly: false) else { return }
         guard lifecycleRevision == context.lifecycleRevision else { return }
+        hasLoaded = true
         mergeServerSnapshot(fetched, preservingChangesSince: context)
         sync()
     }

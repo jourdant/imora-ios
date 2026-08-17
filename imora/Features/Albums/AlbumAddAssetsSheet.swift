@@ -31,6 +31,21 @@ struct AlbumAddAssetsSheet: View {
                     ProgressView()
                         .frame(maxWidth: .infinity)
                         .padding(.top, 120)
+                } else if model.assets.isEmpty {
+                    // an empty library or a failed page otherwise rendered a
+                    // silent blank sheet.
+                    if model.loadFailed {
+                        ContentUnavailableView {
+                            Label("Couldn't load photos", systemImage: "wifi.exclamationmark")
+                        } actions: {
+                            Button("Retry") { model.loadMore() }
+                                .buttonStyle(.glass)
+                        }
+                        .padding(.top, 60)
+                    } else {
+                        ContentUnavailableView("No photos to add", systemImage: "photo.on.rectangle")
+                            .padding(.top, 60)
+                    }
                 } else {
                     if membershipFailed {
                         Label("Couldn't check what's already in this album", systemImage: "exclamationmark.triangle")
@@ -81,10 +96,14 @@ struct AlbumAddAssetsSheet: View {
                 model.attach(client)
                 model.apply(SearchFilter(), allowEmpty: true)
                 do {
-                    let members = try await client.albumAssetIDs(id: album.id)
-                    existingIDs = members
-                    // anything ticked before the album answered is already in it.
-                    selection.subtract(members)
+                    // pages stream in, so members lock as each one answers
+                    // instead of after a huge album's full pagination walk.
+                    // anything ticked before its page answered is already in
+                    // the album and unticks then.
+                    try await client.albumAssetIDs(id: album.id) { pageIDs in
+                        existingIDs.formUnion(pageIDs)
+                        selection.subtract(pageIDs)
+                    }
                 } catch {
                     // saying so beats a grid that silently claims the album is
                     // empty; adding still works, the server rejects duplicates.

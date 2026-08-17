@@ -20,8 +20,10 @@ struct StorageScreen: View {
         .navigationTitle("Storage")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            serverStorage = try? await session.client?.serverStorage()
+            // local sizes first - they are instant and must not sit behind a
+            // slow server round trip showing zero kb.
             await refreshLocalSizes()
+            serverStorage = try? await session.client?.serverStorage()
         }
     }
 

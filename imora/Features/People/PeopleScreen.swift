@@ -8,6 +8,9 @@ struct PeopleScreen: View {
 
     @State private var people: [Person] = []
     @State private var isLoading = true
+    /// one full-list fetch at a time - appear and scene activation can fire
+    /// together and each is a whole pagination walk.
+    @State private var isReloading = false
     @State private var showHidden = false
     @State private var searchText = ""
     @State private var renamingPerson: Person?
@@ -36,18 +39,22 @@ struct PeopleScreen: View {
     }
 
     var body: some View {
+        // computed once per pass: the same locale-aware filter used to run up
+        // to six times per keystroke through the body and its overlay.
+        let visible = visiblePeople
+        let hidden = hiddenPeople
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
-                if !visiblePeople.isEmpty {
-                    grid(visiblePeople)
+                if !visible.isEmpty {
+                    grid(visible)
                 }
 
-                if showHidden, !hiddenPeople.isEmpty {
+                if showHidden, !hidden.isEmpty {
                     VStack(alignment: .leading, spacing: 12) {
                         Label("Hidden", systemImage: "eye.slash")
                             .font(.headline)
                             .foregroundStyle(.secondary)
-                        grid(hiddenPeople)
+                        grid(hidden)
                     }
                 }
             }
@@ -74,7 +81,7 @@ struct PeopleScreen: View {
         .overlay {
             if isLoading && people.isEmpty {
                 ProgressView()
-            } else if visiblePeople.isEmpty && (!showHidden || hiddenPeople.isEmpty) {
+            } else if visible.isEmpty && (!showHidden || hidden.isEmpty) {
                 if !searchText.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
@@ -195,6 +202,9 @@ struct PeopleScreen: View {
             isLoading = false
             return
         }
+        guard !isReloading else { return }
+        isReloading = true
+        defer { isReloading = false }
         // hidden people ride along so managing them needs no second fetch.
         // pages are 1-based and usually just one.
         var all: [Person] = []
@@ -208,8 +218,11 @@ struct PeopleScreen: View {
             guard response.hasNextPage == true else { break }
             page += 1
         }
-        people = all
         isLoading = false
+        // a refetch that raced an optimistic mutation must not clobber the
+        // projection, and an identical list is not worth a full grid diff.
+        guard mutatingIDs.isEmpty, all != people else { return }
+        people = all
     }
 
     // MARK: - mutations
