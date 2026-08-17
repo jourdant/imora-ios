@@ -342,6 +342,12 @@ final class TimelineModel {
     private var mutationOverlay = TimelineMutationOverlay()
     private var externalFavoriteRollbacks: [String: TimelineFavoriteMutation] = [:]
     private var externalRemovalRollbacks: [String: TimelineRemoval] = [:]
+    /// realtime events buffered per asset, applied in one walk. a bulk action
+    /// from another client arrives as hundreds of single-asset events, and
+    /// paying a full row rebuild for each froze large libraries.
+    private var pendingRealtimeDetails: [String: AssetDetail] = [:]
+    private var pendingRealtimeRemovals: Set<String> = []
+    private var realtimeFlushTask: Task<Void, Never>?
 
     init(filter: TimelineFilter, mergesLocal: Bool = false) {
         self.filter = filter
@@ -369,6 +375,7 @@ final class TimelineModel {
         prefetchTask?.cancel()
         rebuildTask?.cancel()
         resyncTask?.cancel()
+        realtimeFlushTask?.cancel()
     }
 
     /// rows cover both server sections and merged device photos.
@@ -1101,26 +1108,35 @@ final class TimelineModel {
 
     // MARK: - mutations
 
-    /// applies an in-place mutation, used after favorite actions.
+    /// applies an in-place mutation, used after favorite actions. one walk
+    /// collects the touched buckets, and a mutation that changes nothing -
+    /// like the realtime echo of an action already applied locally - skips
+    /// the full row rebuild it used to pay.
     func updateAssets(ids: Set<String>, _ transform: (inout Asset) -> Void) {
-        mutationOverlay.rejectFetchesStartedBeforeNextRequest(
-            bucketIDs: bucketIDs(containing: ids)
-        )
+        var changedBucketIDs = Set<String>()
         for s in sections.indices {
             guard var days = sections[s].days else { continue }
+            var sectionChanged = false
             for d in days.indices {
                 var assets = days[d].assets
-                var changed = false
+                var dayChanged = false
                 for a in assets.indices where ids.contains(assets[a].id) {
+                    let before = assets[a]
                     transform(&assets[a])
-                    changed = true
+                    if assets[a] != before { dayChanged = true }
                 }
-                if changed {
+                if dayChanged {
                     days[d] = DayGroup(id: days[d].id, title: days[d].title, assets: assets)
+                    sectionChanged = true
                 }
             }
-            sections[s].days = days
+            if sectionChanged {
+                sections[s].days = days
+                changedBucketIDs.insert(sections[s].id)
+            }
         }
+        guard !changedBucketIDs.isEmpty else { return }
+        mutationOverlay.rejectFetchesStartedBeforeNextRequest(bucketIDs: changedBucketIDs)
         rebuildRows(rebuildAssets: true)
     }
 
@@ -1521,21 +1537,55 @@ final class TimelineModel {
 
 extension TimelineModel: RealtimeListener {
     func realtimeAssetsRemoved(_ ids: Set<String>) {
-        guard ids.contains(where: { flatAssetIndex(for: $0) != nil }) else { return }
-        removeAssets(ids: ids)
+        let present = ids.filter { flatAssetIndex(for: $0) != nil }
+        guard !present.isEmpty else { return }
+        pendingRealtimeRemovals.formUnion(present)
+        scheduleRealtimeFlush()
     }
 
     func realtimeAssetUpdated(_ detail: AssetDetail) {
         guard flatAssetIndex(for: detail.id) != nil else { return }
-        let fresh = detail.asAsset()
-        let projectedFavorite = mutationOverlay.favoriteValue(for: detail.id)
-        updateAssets(ids: [detail.id]) { asset in
-            asset.isFavorite = projectedFavorite ?? fresh.isFavorite
-            asset.isTrashed = fresh.isTrashed
-            asset.visibility = fresh.visibility
-        }
+        pendingRealtimeDetails[detail.id] = detail
+        scheduleRealtimeFlush()
         // membership changes, like unfavoriting on the favorites grid,
         // resolve through the resync that follows the same event.
+    }
+
+    /// short buffer, then one walk applies everything that arrived. the delay
+    /// is invisible next to the network but turns an event storm into a
+    /// single rebuild.
+    private func scheduleRealtimeFlush() {
+        guard realtimeFlushTask == nil else { return }
+        realtimeFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard let self, !Task.isCancelled else { return }
+            self.realtimeFlushTask = nil
+            self.flushRealtimeChanges()
+        }
+    }
+
+    private func flushRealtimeChanges() {
+        let removals = pendingRealtimeRemovals
+        pendingRealtimeRemovals = []
+        var details = pendingRealtimeDetails
+        pendingRealtimeDetails = [:]
+        if !removals.isEmpty {
+            for id in removals { details[id] = nil }
+            removeAssets(ids: removals)
+        }
+        guard !details.isEmpty else { return }
+        var fresh: [String: Asset] = [:]
+        var projected: [String: Bool] = [:]
+        for (id, detail) in details {
+            fresh[id] = detail.asAsset()
+            projected[id] = mutationOverlay.favoriteValue(for: id)
+        }
+        updateAssets(ids: Set(details.keys)) { asset in
+            guard let value = fresh[asset.id] else { return }
+            asset.isFavorite = projected[asset.id] ?? value.isFavorite
+            asset.isTrashed = value.isTrashed
+            asset.visibility = value.visibility
+        }
     }
 
     func realtimeResync() {

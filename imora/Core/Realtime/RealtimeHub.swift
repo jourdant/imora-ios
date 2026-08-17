@@ -63,6 +63,8 @@ final class RealtimeHub {
     private var resyncDebounce: Task<Void, Never>?
     private var lastResyncFlush: Date = .distantPast
     private var localDebounce: Task<Void, Never>?
+    private var albumsDebounce: Task<Void, Never>?
+    private var personKeysPersist: Task<Void, Never>?
     private var safetyTick: Task<Void, Never>?
     private var waiters: [UUID: EventWaiter] = [:]
 
@@ -110,6 +112,8 @@ final class RealtimeHub {
     func shutdown() {
         setActive(false)
         localDebounce?.cancel()
+        albumsDebounce?.cancel()
+        personKeysPersist?.cancel()
         listeners.removeAll()
     }
 
@@ -292,14 +296,35 @@ final class RealtimeHub {
             scheduleResync()
 
         case "on_album_update":
-            albumsGeneration += 1
-            broadcast { $0.realtimeAlbumsChanged() }
+            // coalesced like resyncs: a bulk add emits one event per album
+            // touched, and each generation bump costs a full albums refetch.
+            if albumsDebounce == nil {
+                albumsDebounce = Task { [weak self] in
+                    try? await Task.sleep(for: Self.resyncDelay)
+                    guard let self, !Task.isCancelled else { return }
+                    self.albumsDebounce = nil
+                    self.albumsGeneration += 1
+                    self.broadcast { $0.realtimeAlbumsChanged() }
+                }
+            }
 
         case "on_person_thumbnail":
             // the payload is the bare person id.
             guard let personID = payload as? String else { break }
             personThumbnailKeys[personID] = String(Int(Date().timeIntervalSince1970 * 1000))
-            UserDefaults.standard.set(personThumbnailKeys, forKey: Self.personThumbnailKeysDefaultsKey)
+            // persisted after the burst settles - a face job emits thousands
+            // of these, and each write serializes the whole dictionary.
+            if personKeysPersist == nil {
+                personKeysPersist = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(1))
+                    guard let self, !Task.isCancelled else { return }
+                    self.personKeysPersist = nil
+                    UserDefaults.standard.set(
+                        self.personThumbnailKeys,
+                        forKey: Self.personThumbnailKeysDefaultsKey
+                    )
+                }
+            }
 
         case "on_notification":
             // the payload is the whole entry, so the inbox never has to refetch.

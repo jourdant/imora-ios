@@ -133,6 +133,7 @@ final class BackupManager {
     private let client: ImmichClient
     private let index: BackupIndex
     private var runTask: Task<Void, Never>?
+    private var localChangedTask: Task<Void, Never>?
     /// whether the current or next run may upload. false makes the run a
     /// passive reconcile - scan, hash and bulk-check only - which rebuilds
     /// the index quietly and ends back at idle.
@@ -167,6 +168,8 @@ final class BackupManager {
     func shutdown() {
         runTask?.cancel()
         runTask = nil
+        localChangedTask?.cancel()
+        localChangedTask = nil
         BackgroundUploader.shared.setOrphanHandler(nil)
         BackgroundUploader.shared.setEventsFinishedHandler(nil)
         // transfers outlive the process, so signing out has to stop them
@@ -258,10 +261,15 @@ final class BackupManager {
     // MARK: - local timeline support
 
     /// refreshes the badge snapshot and tells the hub the device library or
-    /// index changed.
+    /// index changed. coalesced: a run completes uploads several times a
+    /// second, and rebuilding four full index maps per upload starved the
+    /// main actor on large libraries.
     private func localChanged() {
-        Task { [weak self] in
-            guard let self else { return }
+        guard localChangedTask == nil else { return }
+        localChangedTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self, !Task.isCancelled else { return }
+            self.localChangedTask = nil
             await self.refreshLocalSnapshots()
         }
     }
