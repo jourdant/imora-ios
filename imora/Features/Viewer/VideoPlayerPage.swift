@@ -59,6 +59,10 @@ final class VideoPlayback {
     /// claim on every page-on, and building the item eagerly fetched the
     /// motion clip for clips that are almost never played.
     @ObservationIgnored private var pendingItemMaker: (@MainActor () async -> AVPlayerItem?)?
+    /// a release keeps the player alive for a moment so a transient page
+    /// bounce can reclaim it in place instead of restarting the clip.
+    @ObservationIgnored private var releaseTask: Task<Void, Never>?
+    @ObservationIgnored private var resumesOnReclaim = false
 
     /// `autoPlays` is false for live photos: their page opens on the still and
     /// only moves once the viewer asks it to. `defersItem` goes further and
@@ -75,10 +79,20 @@ final class VideoPlayback {
     ) async {
         if ownerID == assetID {
             // the same page re-claims when its mute flag flips, e.g. a context
-            // preview committing to the full viewer.
+            // preview committing to the full viewer, or right after a resize
+            // bounced it out of the lazy viewport and released transiently.
+            releaseTask?.cancel()
+            releaseTask = nil
             forcesMute = forceMuted
             applyMute()
-            if !forceMuted, !isMuted, isPlaying { activatePlaybackAudioSession() }
+            let resumes = resumesOnReclaim
+            resumesOnReclaim = false
+            if resumes, !isPlaying {
+                if !forceMuted, !isMuted { activatePlaybackAudioSession() }
+                player?.play()
+            } else if !forceMuted, !isMuted, isPlaying {
+                activatePlaybackAudioSession()
+            }
             return
         }
         generation &+= 1
@@ -141,11 +155,27 @@ final class VideoPlayback {
         }
     }
 
+    /// a rotation resize can bounce the active page out of the lazy
+    /// container's viewport for a frame, and tearing down there is what used
+    /// to restart a playing video. pause right away so a real departure never
+    /// leaks audio, then keep the player briefly so the same page reclaiming
+    /// resumes where it was.
     func release(assetID: String) {
         guard ownerID == assetID else { return }
-        generation &+= 1
-        teardown()
-        ownerID = nil
+        resumesOnReclaim = resumesOnReclaim || isPlaying
+        player?.pause()
+        releaseTask?.cancel()
+        let gen = generation
+        releaseTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard let self, !Task.isCancelled,
+                  generation == gen, ownerID == assetID
+            else { return }
+            releaseTask = nil
+            generation &+= 1
+            teardown()
+            ownerID = nil
+        }
     }
 
     func togglePlayPause() {
@@ -300,6 +330,9 @@ final class VideoPlayback {
     }
 
     private func teardown() {
+        releaseTask?.cancel()
+        releaseTask = nil
+        resumesOnReclaim = false
         pendingItemMaker = nil
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil

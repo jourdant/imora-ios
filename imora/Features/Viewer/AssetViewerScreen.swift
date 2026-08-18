@@ -1996,6 +1996,13 @@ private struct AssetPager: View {
     @State private var visibleAssetID: String?
     @State private var initialPositionResolved = false
 
+    /// a container resize preserves the raw horizontal offset, not the page.
+    /// user scrolling degrades the position to that offset, so a rotation
+    /// would land misaligned or on a neighbouring asset. the pager pins the
+    /// asset it was showing until the new geometry settles.
+    @State private var resizeTargetID: String?
+    @State private var resizeSettleTask: Task<Void, Never>?
+
     init(
         assets: [Asset],
         indexByID: [String: Int],
@@ -2079,6 +2086,19 @@ private struct AssetPager: View {
             }
 
             initialPositionResolved = true
+
+            // reports inside a resize settle window describe whichever page
+            // the stale offset uncovered. they must not steal selection, only
+            // trigger another correction toward the pinned asset.
+            if let target = resizeTargetID {
+                if indexByID[target] == nil || id == target {
+                    resizeTargetID = nil
+                } else {
+                    position.scrollTo(id: target, anchor: .center)
+                    return
+                }
+            }
+
             visibleAssetID = id
             if selection != id { selection = id }
         }
@@ -2087,7 +2107,36 @@ private struct AssetPager: View {
                   indexByID[id] != nil,
                   id != visibleAssetID
             else { return }
+            // an external selection change mid resize wins over the pin.
+            if resizeTargetID != nil { resizeTargetID = id }
             position.scrollTo(id: id, anchor: .center)
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { geometry in
+            geometry.containerSize.width
+        } action: { oldWidth, newWidth in
+            guard oldWidth > 0, oldWidth != newWidth,
+                  let target = resizeTargetID ?? selection ?? visibleAssetID,
+                  indexByID[target] != nil
+            else { return }
+            resizeTargetID = target
+            position.scrollTo(id: target, anchor: .center)
+            // paging only aligns on drag release, so a resize needs one more
+            // correction with settled metrics. the pin expires on a short
+            // timer because a quiet resize never reports the pinned id back -
+            // and it must outlive the whole rotation pass, since a heavy page
+            // can delay the stale visibility report past any yield-based
+            // window and let it steal selection for a frame.
+            resizeSettleTask?.cancel()
+            resizeSettleTask = Task { @MainActor in
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                if resizeTargetID == target, indexByID[target] != nil {
+                    position.scrollTo(id: target, anchor: .center)
+                }
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled else { return }
+                resizeTargetID = nil
+            }
         }
     }
 
