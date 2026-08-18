@@ -42,10 +42,18 @@ private enum AssetViewerScrollEndpoint: Equatable {
 /// continuous scroll, which avoids the relayout resets caused by view-aligned
 /// targets when asynchronously loaded details change the content height.
 private nonisolated struct AssetInformationScrollTargetBehavior: ScrollTargetBehavior {
+    /// the finger-down offset tracked by the scroll phase handler. the
+    /// context's originalTarget is the landing target that was in flight when
+    /// the gesture began - for a flick interrupting a deceleration or one of
+    /// the viewer's own settle animations that is nowhere near the finger,
+    /// and intent resolved from it threw fast successive scrolls to an
+    /// arbitrary endpoint.
+    let dragStartOffset: CGFloat
+
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
         let layout = AssetViewerPageLayout(viewport: context.containerSize)
         let settled = layout.settledOffset(
-            startOffset: context.originalTarget.rect.minY,
+            startOffset: dragStartOffset,
             proposedOffset: target.rect.minY,
             velocity: context.velocity.dy
         )
@@ -293,7 +301,9 @@ struct AssetViewerScreen: View {
     @State private var compactScrollIsActive = false
     @State private var compactSettledOffset: CGFloat = 0
     /// where the finger's current drag began, so its release can be resolved
-    /// against the endpoint it left rather than wherever it let go.
+    /// against the endpoint it left rather than wherever it let go. also fed
+    /// to the scroll target behavior each body update - the tracking phase
+    /// writes it before any release can ask the behavior to settle.
     @State private var compactDragStartOffset: CGFloat = 0
     @State private var viewportRetargetTask: Task<Void, Never>?
     /// full-bleed viewport mirrored from the media stage geometry.
@@ -635,7 +645,9 @@ struct AssetViewerScreen: View {
             }
         }
         .scrollPosition($viewerScrollPosition)
-        .scrollTargetBehavior(AssetInformationScrollTargetBehavior())
+        .scrollTargetBehavior(
+            AssetInformationScrollTargetBehavior(dragStartOffset: compactDragStartOffset)
+        )
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .scrollDisabled(currentPageZoomed || isContextPreview)

@@ -200,10 +200,13 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
             return reveal
         }
 
-        // Scrolling back from deeper metadata pauses at the information stop;
-        // a subsequent downward swipe performs the close. This prevents one
-        // high-velocity gesture from throwing the media past its useful stop.
-        if start > reveal + endpointTolerance, proposed < reveal { return reveal }
+        // a gesture from deeper metadata is ordinary reading and stays
+        // native. scrolling back into the transition pauses at the
+        // information stop - a subsequent swipe performs the close - so one
+        // high-velocity gesture cannot throw the media past its useful stop.
+        if start > reveal + endpointTolerance {
+            return proposed < reveal ? reveal : proposed
+        }
 
         // An interrupted gesture between endpoints resolves according to its
         // direction, falling back to the nearest stable endpoint.
