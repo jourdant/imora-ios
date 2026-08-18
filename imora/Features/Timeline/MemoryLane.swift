@@ -41,6 +41,7 @@ struct MemoryLane: View {
             .fullScreenCover(item: $viewer.route) { route in
                 AssetViewerScreen(
                     assets: route.assets,
+                    indexByAssetID: route.indexByAssetID,
                     initialIndex: route.initialIndex,
                     presentationID: route.id,
                     zoomNamespace: zoomNamespace,

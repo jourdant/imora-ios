@@ -381,6 +381,7 @@ private struct AssetViewerHostRoot: View {
     @ViewBuilder var body: some View {
         AssetViewerScreen(
             assets: route.assets,
+            indexByAssetID: route.indexByAssetID,
             initialIndex: route.initialIndex,
             presentationID: route.id,
             isContextPreview: displayState.mode == .contextPreview,

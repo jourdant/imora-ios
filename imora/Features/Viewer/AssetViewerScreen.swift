@@ -336,6 +336,7 @@ struct AssetViewerScreen: View {
 
     init(
         assets: [Asset],
+        indexByAssetID: [String: Int]? = nil,
         initialIndex: Int,
         presentationID: UUID,
         zoomNamespace: Namespace.ID? = nil,
@@ -351,7 +352,7 @@ struct AssetViewerScreen: View {
     ) {
         let safeIndex = assets.indices.contains(initialIndex) ? initialIndex : 0
         _assets = State(initialValue: assets)
-        _indexByAssetID = State(initialValue: Self.indexMap(for: assets))
+        _indexByAssetID = State(initialValue: indexByAssetID ?? Self.indexMap(for: assets))
         _currentIndex = State(initialValue: safeIndex)
         _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
         self.presentationID = presentationID

@@ -4,6 +4,7 @@ import Observation
 nonisolated struct ViewerRoute: Identifiable, Hashable {
     let id: UUID
     let assets: [Asset]
+    let indexByAssetID: [String: Int]
     let initialIndex: Int
     let sourceAssetID: String
 
@@ -48,11 +49,16 @@ final class ViewerPresentation {
 
     var isTransitioning: Bool { activeID != nil }
 
-    func makeRoute(assets: [Asset], initialIndex: Int) -> ViewerRoute? {
+    func makeRoute(
+        assets: [Asset],
+        initialIndex: Int,
+        indexByAssetID: [String: Int]? = nil
+    ) -> ViewerRoute? {
         guard assets.indices.contains(initialIndex) else { return nil }
         return ViewerRoute(
             id: UUID(),
             assets: assets,
+            indexByAssetID: indexByAssetID ?? Self.indexMap(for: assets),
             initialIndex: initialIndex,
             sourceAssetID: assets[initialIndex].id
         )
@@ -79,9 +85,25 @@ final class ViewerPresentation {
     /// the old one is ignored by complete(). Refusing here made rapid taps
     /// feel dead. Only an already visible route blocks a new one.
     @discardableResult
-    func present(assets: [Asset], initialIndex: Int) -> Bool {
-        guard let route = makeRoute(assets: assets, initialIndex: initialIndex) else { return false }
+    func present(
+        assets: [Asset],
+        initialIndex: Int,
+        indexByAssetID: [String: Int]? = nil
+    ) -> Bool {
+        guard let route = makeRoute(
+            assets: assets,
+            initialIndex: initialIndex,
+            indexByAssetID: indexByAssetID
+        ) else { return false }
         return activate(route, presentsCover: true, replacesSettlingPresentation: true)
+    }
+
+    private static func indexMap(for assets: [Asset]) -> [String: Int] {
+        var result = [String: Int](minimumCapacity: assets.count)
+        for (index, asset) in assets.enumerated() {
+            result[asset.id] = index
+        }
+        return result
     }
 
     func complete(_ id: UUID) {
