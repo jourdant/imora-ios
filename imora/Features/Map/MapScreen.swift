@@ -134,6 +134,7 @@ struct MapScreen: View {
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
+                onRequestDismissal: { viewer.complete(route.id) },
                 onDismissed: { viewer.complete(route.id) }
             ) { _ in
                 MapMarkerCache.shared.invalidate()

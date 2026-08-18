@@ -45,6 +45,7 @@ struct MemoryLane: View {
                     initialIndex: route.initialIndex,
                     presentationID: route.id,
                     zoomNamespace: zoomNamespace,
+                    onRequestDismissal: { viewer.complete(route.id) },
                     onDismissed: { viewer.complete(route.id) }
                 ) { _ in }
             }

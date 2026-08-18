@@ -16,9 +16,11 @@ final class AssetTileRegistry {
     }
 
     private var tiles: [String: WeakTile] = [:]
+    private var suppressedInteractionIDs: Set<String> = []
 
     func register(_ view: UIView, for assetID: String) {
         tiles[assetID] = WeakTile(view)
+        view.isUserInteractionEnabled = !suppressedInteractionIDs.contains(assetID)
     }
 
     func unregister(_ view: UIView, for assetID: String) {
@@ -37,6 +39,16 @@ final class AssetTileRegistry {
               view.convert(view.bounds, to: window).intersects(window.bounds)
         else { return nil }
         return view
+    }
+
+    func suppressInteraction(for assetID: String) {
+        suppressedInteractionIDs.insert(assetID)
+        tiles[assetID]?.view?.isUserInteractionEnabled = false
+    }
+
+    func restoreInteraction(for assetID: String) {
+        suppressedInteractionIDs.remove(assetID)
+        tiles[assetID]?.view?.isUserInteractionEnabled = true
     }
 }
 
@@ -91,11 +103,13 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     private let willPresent: (ViewerRoute) -> Bool
     private let didDismiss: (UUID) -> Void
     private let dismissalRelay: AssetViewerDismissalRelay
+    private weak var sourceRegistry: AssetTileRegistry?
     private var contextPreviewController: UIHostingController<AnyView>?
     private var phase = Phase.idle
     private var isTrackingDismissalTransition = false
     private var contextAttachmentAttempts = 0
     private var pendingDismissal = false
+    private var isWaitingToDismiss = false
 
     init(
         route: ViewerRoute,
@@ -120,6 +134,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         self.willPresent = willPresent
         self.didDismiss = didDismiss
         self.dismissalRelay = relay
+        self.sourceRegistry = sourceRegistry
 
         let root = AssetViewerHostRoot(
             route: route,
@@ -139,9 +154,13 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         let options = UIViewController.Transition.ZoomOptions()
         // An upward pan opens information and its sheet owns subsequent pans.
         // Only a downward pull on unobstructed, unzoomed media can dismiss.
-        options.interactiveDismissShouldBegin = { [weak state] context in
-            guard context.willBegin, let state else { return false }
-            return !state.currentPageZoomed && state.mediaAtTop && context.velocity.dy > 0
+        options.interactiveDismissShouldBegin = { [weak relay, weak state] context in
+            guard context.willBegin, let controller = relay?.controller, let state else { return false }
+            let velocity = context.velocity
+            guard velocity.dy > 0, abs(velocity.dy) > abs(velocity.dx) else { return false }
+            return !state.currentPageZoomed
+                && state.mediaAtTop
+                && !controller.isTouchingControl(at: context.location)
         }
         preferredTransition = .zoom(options: options) { [weak state, weak sourceRegistry] _ in
             guard let assetID = state?.currentAssetID else { return nil }
@@ -229,18 +248,34 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     }
 
     func requestDismissal() {
-        if phase == .committingPreview || phase == .presenting {
-            pendingDismissal = true
+        guard phase != .dismissing, phase != .finished else { return }
+        pendingDismissal = true
+        view.isUserInteractionEnabled = false
+        attemptPendingDismissal()
+    }
+
+    private func attemptPendingDismissal() {
+        guard pendingDismissal, phase == .presented else { return }
+        guard let presenter = presentingViewController else {
+            finish()
             return
         }
-        guard phase == .presented else { return }
+        if let coordinator = transitionCoordinator ?? presenter.transitionCoordinator {
+            waitToDismiss(until: coordinator)
+            return
+        }
+
         phase = .dismissing
-        dismiss(animated: true) { [weak self] in
+        suppressSourceInteraction()
+        presenter.dismiss(animated: true) { [weak self] in
             guard let self else { return }
             if self.presentingViewController == nil {
                 self.finish()
             } else if self.phase == .dismissing {
                 self.phase = .presented
+                self.restoreViewerInteraction()
+                self.restoreSourceInteraction()
+                self.retryPendingDismissal()
             }
         }
     }
@@ -253,6 +288,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             // An interactive dismissal that returned to the viewer.
             phase = .presented
             isTrackingDismissalTransition = false
+            restoreViewerInteraction()
+            restoreSourceInteraction()
+            retryPendingDismissal()
         }
     }
 
@@ -263,6 +301,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         // not a viewer dismissal and must leave Timeline suspended.
         guard phase == .dismissing || (phase == .presented && isBeingDismissed) else { return }
         if phase == .presented { phase = .dismissing }
+        suppressSourceInteraction()
         trackDismissal(using: transitionCoordinator)
     }
 
@@ -287,6 +326,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         guard phase == .dismissing else { return }
         phase = .presented
         isTrackingDismissalTransition = false
+        restoreViewerInteraction()
+        restoreSourceInteraction()
+        retryPendingDismissal()
     }
 
     private func beginPresentation() -> Bool {
@@ -303,8 +345,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         phase = .presented
         presentationController?.delegate = self
         if pendingDismissal {
-            pendingDismissal = false
-            requestDismissal()
+            retryPendingDismissal()
         }
     }
 
@@ -353,6 +394,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             self.isTrackingDismissalTransition = false
             if context.isCancelled {
                 self.phase = .presented
+                self.restoreViewerInteraction()
+                self.restoreSourceInteraction()
+                self.retryPendingDismissal()
             } else {
                 self.finish()
             }
@@ -363,9 +407,63 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         guard phase != .idle, phase != .finished else { return }
         phase = .finished
         pendingDismissal = false
+        isWaitingToDismiss = false
         removeContextPreview()
         displayState.currentPageZoomed = false
+        restoreSourceInteractionAfterSettling()
         didDismiss(route.id)
+    }
+
+    private func suppressSourceInteraction() {
+        sourceRegistry?.suppressInteraction(for: displayState.currentAssetID)
+    }
+
+    private func restoreSourceInteraction() {
+        sourceRegistry?.restoreInteraction(for: displayState.currentAssetID)
+    }
+
+    private func restoreViewerInteraction() {
+        view.isUserInteractionEnabled = true
+    }
+
+    private func isTouchingControl(at location: CGPoint) -> Bool {
+        var candidate = view.hitTest(location, with: nil)
+        while let current = candidate {
+            if current is UIControl { return true }
+            guard current !== view else { return false }
+            candidate = current.superview
+        }
+        return false
+    }
+
+    private func restoreSourceInteractionAfterSettling() {
+        let assetID = displayState.currentAssetID
+        Task { @MainActor [weak sourceRegistry] in
+            try? await Task.sleep(for: .milliseconds(120))
+            sourceRegistry?.restoreInteraction(for: assetID)
+        }
+    }
+
+    private func waitToDismiss(
+        until coordinator: any UIViewControllerTransitionCoordinator
+    ) {
+        guard !isWaitingToDismiss else { return }
+        isWaitingToDismiss = true
+        let registered = coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.isWaitingToDismiss = false
+            self?.retryPendingDismissal()
+        }
+        if !registered {
+            isWaitingToDismiss = false
+            retryPendingDismissal()
+        }
+    }
+
+    private func retryPendingDismissal() {
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.attemptPendingDismissal()
+        }
     }
 }
 

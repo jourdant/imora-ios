@@ -79,6 +79,7 @@ struct SearchTab: View {
                     initialIndex: route.initialIndex,
                     presentationID: route.id,
                     zoomNamespace: zoomNamespace,
+                    onRequestDismissal: { viewer.complete(route.id) },
                     onDismissed: { viewer.complete(route.id) }
                 ) { change in
                     switch change {
@@ -693,6 +694,7 @@ struct SearchResultsScreen: View {
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
+                onRequestDismissal: { viewer.complete(route.id) },
                 onDismissed: { viewer.complete(route.id) }
             ) { change in
                 switch change {
@@ -782,6 +784,7 @@ struct PlaceScreen: View {
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
+                onRequestDismissal: { viewer.complete(route.id) },
                 onDismissed: { viewer.complete(route.id) }
             ) { change in
                 switch change {
