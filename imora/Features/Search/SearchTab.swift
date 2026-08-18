@@ -75,6 +75,7 @@ struct SearchTab: View {
             .fullScreenCover(item: $viewer.route) { route in
                 AssetViewerScreen(
                     assets: route.assets,
+                    indexByAssetID: route.indexByAssetID,
                     initialIndex: route.initialIndex,
                     presentationID: route.id,
                     zoomNamespace: zoomNamespace,
@@ -272,6 +273,7 @@ nonisolated enum QuickLink: String, Hashable {
 /// flat paged grid shared by the search tab and canned searches like videos.
 struct SearchResultsGrid: View {
     @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(SessionStore.self) private var session
 
     let model: SearchModel
@@ -340,6 +342,7 @@ struct SearchResultsGrid: View {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(model.assets) { asset in
                     AssetTile(asset: asset)
+                        .transition(.opacity)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
                         .onTapGesture {
                             if let index = model.assets.firstIndex(where: { $0.id == asset.id }) {
@@ -517,14 +520,14 @@ struct SearchResultsGrid: View {
             errorMessage: "Couldn’t update the favorite",
             apply: {
                 if leavesFavoriteFilter {
-                    removal = model.removeAssetsForOptimisticAction(ids: [asset.id])
+                    removal = removeOptimistically(asset.id)
                 } else {
                     model.updateAssets(ids: [asset.id]) { $0.isFavorite = newValue }
                 }
             },
             rollback: {
                 if let removal {
-                    model.restore(removal)
+                    restoreOptimistically(removal)
                 } else {
                     model.updateAssets(ids: [asset.id]) { current in
                         guard current.isFavorite == newValue else { return }
@@ -548,8 +551,8 @@ struct SearchResultsGrid: View {
         var removal: SearchRemoval?
         let _: Void? = await OptimisticAction.perform(
             errorMessage: visibility == .archive ? "Couldn’t archive" : "Couldn’t unarchive",
-            apply: { removal = model.removeAssetsForOptimisticAction(ids: [asset.id]) },
-            rollback: { if let removal { model.restore(removal) } },
+            apply: { removal = removeOptimistically(asset.id) },
+            rollback: { if let removal { restoreOptimistically(removal) } },
             request: { try await client.setVisibility(ids: [asset.id], visibility) }
         )
     }
@@ -616,10 +619,22 @@ struct SearchResultsGrid: View {
         var removal: SearchRemoval?
         let _: Void? = await OptimisticAction.perform(
             errorMessage: errorMessage,
-            apply: { removal = model.removeAssetsForOptimisticAction(ids: [asset.id]) },
-            rollback: { if let removal { model.restore(removal) } },
+            apply: { removal = removeOptimistically(asset.id) },
+            rollback: { if let removal { restoreOptimistically(removal) } },
             request: { try await client.trashAssets(ids: [asset.id]) }
         )
+    }
+
+    private func removeOptimistically(_ id: String) -> SearchRemoval {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.12)) {
+            model.removeAssetsForOptimisticAction(ids: [id])
+        }
+    }
+
+    private func restoreOptimistically(_ removal: SearchRemoval) {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.12)) {
+            model.restore(removal)
+        }
     }
 
     private func openInBrowser(_ asset: Asset) async {
@@ -674,6 +689,7 @@ struct SearchResultsScreen: View {
         .fullScreenCover(item: $viewer.route) { route in
             AssetViewerScreen(
                 assets: route.assets,
+                indexByAssetID: route.indexByAssetID,
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
@@ -762,6 +778,7 @@ struct PlaceScreen: View {
         .fullScreenCover(item: $viewer.route) { route in
             AssetViewerScreen(
                 assets: route.assets,
+                indexByAssetID: route.indexByAssetID,
                 initialIndex: route.initialIndex,
                 presentationID: route.id,
                 zoomNamespace: zoomNamespace,
