@@ -50,7 +50,7 @@ nonisolated enum SingleAssetBackupError: LocalizedError {
 }
 
 /// device asset paired with what the backup index knows about it.
-nonisolated struct LocalTimelineItem: Sendable {
+nonisolated struct LocalTimelineItem: Equatable, Sendable {
     let device: DeviceAsset
     let remoteId: String?
     let backedUp: Bool

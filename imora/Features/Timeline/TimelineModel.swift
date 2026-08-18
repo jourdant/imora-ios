@@ -265,17 +265,42 @@ nonisolated enum TimelineRow: Identifiable, Hashable {
 /// drives any bucketed grid screen: main timeline, favorites, archive, trash, person, album.
 @Observable
 final class TimelineModel {
+    private struct SectionProjection {
+        let source: TimelineSection
+        let columns: Int
+        let placeholderRatio: Double?
+        let rows: [TimelineRow]
+        let firstAssetIDByRowID: [String: String]
+        let span: TimelineSectionSpan?
+        let titleBandCount: Int
+        let tileRowCount: Int
+        let assetCount: Int
+        let dayCount: Int
+
+        func canReuse(
+            for section: TimelineSection,
+            columns: Int,
+            placeholderRatio: Double
+        ) -> Bool {
+            guard self.columns == columns,
+                  source.id == section.id,
+                  source.monthTitle == section.monthTitle
+            else { return false }
+            if source.isLoaded, section.isLoaded {
+                return source.days == section.days
+            }
+            return source == section && self.placeholderRatio == placeholderRatio
+        }
+    }
+
     let filter: TimelineFilter
     /// main timeline only: device photos not yet on the server appear in the
     /// grid with backup badges, google-photos style.
     let mergesLocal: Bool
     private(set) var sections: [TimelineSection] = []
-    private(set) var rows: [TimelineRow] = [] {
-        didSet { rowsLayoutVersion &+= 1 }
-    }
-    /// bumped on every rows assignment so the screen's exact row-offset cache
-    /// knows to rebuild. ignored by observation - it is read from scroll
-    /// callbacks, never from a body.
+    private(set) var rows: [TimelineRow] = []
+    /// bumped when row geometry changes so the screen's exact row-offset cache
+    /// knows to rebuild. metadata patches keep the existing offsets.
     @ObservationIgnored private(set) var rowsLayoutVersion = 0
     /// the month each row belongs to. the scrubber names its month from the
     /// row actually at the viewport top rather than from offset arithmetic,
@@ -287,9 +312,9 @@ final class TimelineModel {
     private(set) var isLoading = false
     private(set) var loadError: String?
     private(set) var flatAssets: [Asset] = []
-    /// bumped whenever `flatAssets` is replaced. lets the prefetcher tell a
-    /// window that merely slid from one whose contents moved underneath it,
-    /// without comparing the assets themselves on every scroll callback.
+    private(set) var projectedRemovalIDs = Set<String>()
+    /// bumped when flat asset ordering changes. metadata patches keep the
+    /// prefetch window valid without comparing every asset.
     @ObservationIgnored private(set) var flatAssetsVersion = 0
 
     /// row tallies kept in sync by rebuildRows so screens can do o(1) height
@@ -327,6 +352,9 @@ final class TimelineModel {
     /// complete online prefetch pass.
     private var hasSwept = false
     private var flatAssetIndexByID: [String: Int] = [:]
+    private var bucketIDByAssetID: [String: String] = [:]
+    private var rowAssetLocationByID: [String: TimelineAssetProjection.Location] = [:]
+    private var sectionProjectionByID: [String: SectionProjection] = [:]
     private var prefetchTask: Task<Void, Never>?
     private var prefetchID: UUID?
     private var rebuildTask: Task<Void, Never>?
@@ -335,6 +363,7 @@ final class TimelineModel {
     private var isViewerSuspended = false
     private var isRebuildDeferred = false
     private var rebuildPending = false
+    private var pendingRebuildAnimated = false
     /// device assets paired with backup status, merged during row building.
     private var localItems: [LocalTimelineItem] = []
     private var resyncTask: Task<Void, Never>?
@@ -385,6 +414,10 @@ final class TimelineModel {
 
     func flatAssetIndex(for id: String) -> Int? {
         flatAssetIndexByID[id]
+    }
+
+    var viewerAssetIndexByID: [String: Int] {
+        flatAssetIndexByID
     }
 
     func attach(_ client: ImmichClient, backup: BackupManager? = nil, hub: RealtimeHub? = nil) {
@@ -525,9 +558,12 @@ final class TimelineModel {
                 ))
             }
         }
+        let changed = sections != fresh
         sections = fresh
         staleBucketIDs.formIntersection(buckets.map(\.timeBucket))
-        rebuildRows(rebuildAssets: true)
+        if changed {
+            rebuildRows(rebuildAssets: true)
+        }
         // the first bucket lands before the prefetch, and it is what calibrates
         // the estimate for every month still unloaded.
         if let first = sections.first { await loadBucket(first.id) }
@@ -552,13 +588,16 @@ final class TimelineModel {
             else { return }
             guard let resolution = mutationOverlay.resolve(assets, for: fetch) else { return }
             staleBucketIDs.remove(id)
-            sections[current].days = Self.groupByDay(
+            let days = Self.groupByDay(
                 resolution.assets,
                 byUploadDate: filter.groupsByUploadDate
             )
+            let changed = sections[current].days != days
+            sections[current].days = days
             if resolution.isAuthoritative {
                 cacheBucket(id, assets: resolution.assets)
             }
+            guard changed else { return }
             if immediateRows {
                 rebuildRows(rebuildAssets: true)
             } else {
@@ -623,8 +662,9 @@ final class TimelineModel {
                 )
             }
             guard !Task.isCancelled, !self.isViewerSuspended else { return }
-            self.rebuildPending = false
-            self.rebuildRows(rebuildAssets: true)
+            if self.rebuildPending {
+                self.rebuildRows(rebuildAssets: true)
+            }
             // cleared here rather than left to the defer so the sweep sees a
             // finished pass; the defer then has nothing left to reset.
             if self.prefetchID == id {
@@ -654,12 +694,19 @@ final class TimelineModel {
     // MARK: - rows
 
     private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false) {
+        if rebuildAssets {
+            rebuildTask?.cancel()
+            rebuildTask = nil
+            rebuildPending = false
+            pendingRebuildAnimated = false
+        }
         var result: [TimelineRow] = []
         var spans: [TimelineSectionSpan] = []
         var monthByRowID: [String: String] = [:]
         var firstAssetIDByRowID: [String: String] = [:]
         var flattened: [Asset] = []
         var flattenedIndex: [String: Int] = [:]
+        var bucketByAssetID: [String: String] = [:]
         result.reserveCapacity(rows.count + 16)
         if rebuildAssets {
             flattened.reserveCapacity(sections.reduce(0) { $0 + $1.count })
@@ -674,86 +721,44 @@ final class TimelineModel {
         var dayTally = 0
         var ratio = assetsPerDay
 
-        for section in mergedSections() {
-            var sectionTitleBands = 0
-            var sectionTileRows = 0
-            let sectionFirstRow = result.count
+        var nextSectionProjectionByID: [String: SectionProjection] = [:]
+        let projectedSections = mergedSections()
+        nextSectionProjectionByID.reserveCapacity(projectedSections.count)
 
-            if let days = section.days {
-                if rebuildAssets {
-                    for day in days {
-                        for asset in day.assets {
-                            flattenedIndex[asset.id] = flattened.count
-                            flattened.append(asset)
-                        }
-                    }
-                }
-
-                // days flow side by side when they fit; bands never cross a
-                // month boundary so bucket loads only reflow their own month.
-                for band in TimelineFlowLayout.pack(counts: days.map(\.assets.count), columns: columns) {
-                    guard let firstBlock = band.blocks.first else { continue }
-                    let firstDay = days[firstBlock.dayIndex]
-                    let bandID = "b-\(section.id)-\(firstDay.id)"
-                    let segments = band.blocks.map { block in
-                        let day = days[block.dayIndex]
-                        // select-all only targets server assets; local tiles
-                        // are outside selection until they are backed up.
-                        return TitleSegment(
-                            dayID: day.id,
-                            title: day.title,
-                            colStart: block.colStart,
-                            colWidth: block.colWidth,
-                            selectableIDs: day.assets.filter { !$0.isLocal }.map(\.id)
-                        )
-                    }
-                    result.append(.titleBand(bandID, segments))
-                    monthByRowID[bandID] = section.monthTitle
-                    sectionTitleBands += 1
-
-                    for rowIndex in 0..<band.rowCount {
-                        var runs: [TileRun] = []
-                        for block in band.blocks where rowIndex < block.rowCount {
-                            let assets = days[block.dayIndex].assets
-                            let start = rowIndex * block.colWidth
-                            guard start < assets.count else { continue }
-                            let end = min(start + block.colWidth, assets.count)
-                            runs.append(TileRun(colStart: block.colStart, assets: Array(assets[start..<end])))
-                        }
-                        guard let firstRun = runs.first else { continue }
-                        let tileID = "t-\(section.id)-\(firstDay.id)-\(rowIndex)"
-                        result.append(.tiles(tileID, runs))
-                        monthByRowID[tileID] = section.monthTitle
-                        firstAssetIDByRowID[tileID] = firstRun.assets[0].id
-                        sectionTileRows += 1
-                    }
-                }
-                assetTally += days.reduce(0) { $0 + $1.assets.count }
-                dayTally += days.count
-                if dayTally > 0 { ratio = Double(assetTally) / Double(dayTally) }
+        for section in projectedSections {
+            let projection: SectionProjection
+            if let cached = sectionProjectionByID[section.id],
+               cached.canReuse(for: section, columns: columns, placeholderRatio: ratio) {
+                projection = cached
             } else {
-                let estimate = Self.placeholderEstimate(
-                    count: section.count,
-                    columns: columns,
-                    assetsPerDay: ratio
-                )
-                let placeholderID = "p-\(section.id)"
-                result.append(.placeholder(placeholderID, section.id, estimate.tileRows, estimate.titleBands))
-                monthByRowID[placeholderID] = section.monthTitle
-                sectionTitleBands += estimate.titleBands
-                sectionTileRows += estimate.tileRows
+                projection = makeSectionProjection(section, placeholderRatio: ratio)
+            }
+            nextSectionProjectionByID[section.id] = projection
+
+            result.append(contentsOf: projection.rows)
+            for row in projection.rows {
+                monthByRowID[row.id] = section.monthTitle
+            }
+            firstAssetIDByRowID.merge(projection.firstAssetIDByRowID) { _, new in new }
+            if let span = projection.span {
+                spans.append(span)
+            }
+            titleBands += projection.titleBandCount
+            tileRows += projection.tileRowCount
+
+            if rebuildAssets, let days = section.days {
+                for day in days {
+                    for asset in day.assets {
+                        flattenedIndex[asset.id] = flattened.count
+                        bucketByAssetID[asset.id] = section.id
+                        flattened.append(asset)
+                    }
+                }
             }
 
-            guard result.count > sectionFirstRow else { continue }
-            spans.append(TimelineSectionSpan(
-                id: section.id,
-                title: section.monthTitle,
-                year: Self.year(for: section.id),
-                titleBands: sectionTitleBands,
-                tileRows: sectionTileRows
-            ))
-            titleBands += sectionTitleBands
-            tileRows += sectionTileRows
+            assetTally += projection.assetCount
+            dayTally += projection.dayCount
+            if dayTally > 0 { ratio = Double(assetTally) / Double(dayTally) }
         }
 
         if dayTally > 0, assetTally > 0 {
@@ -768,12 +773,17 @@ final class TimelineModel {
 
         let commit = {
             self.rows = result
+            self.rowsLayoutVersion &+= 1
+            self.rowAssetLocationByID = TimelineAssetProjection.locations(in: result)
+            self.sectionProjectionByID = nextSectionProjectionByID
             self.sectionSpans = spans
             self.monthByRowID = monthByRowID
             self.firstAssetIDByRowID = firstAssetIDByRowID
             if rebuildAssets {
                 self.flatAssets = flattened
                 self.flatAssetIndexByID = flattenedIndex
+                self.bucketIDByAssetID = bucketByAssetID
+                self.projectedRemovalIDs.formIntersection(flattenedIndex.keys)
                 self.flatAssetsVersion &+= 1
             }
             self.titleBandCount = titleBands
@@ -784,6 +794,93 @@ final class TimelineModel {
         } else {
             commit()
         }
+    }
+
+    private func makeSectionProjection(
+        _ section: TimelineSection,
+        placeholderRatio: Double
+    ) -> SectionProjection {
+        var rows: [TimelineRow] = []
+        var firstAssetIDByRowID: [String: String] = [:]
+        var titleBands = 0
+        var tileRows = 0
+        var assetCount = 0
+        var dayCount = 0
+
+        if let days = section.days {
+            assetCount = days.reduce(0) { $0 + $1.assets.count }
+            dayCount = days.count
+            for band in TimelineFlowLayout.pack(counts: days.map(\.assets.count), columns: columns) {
+                guard let firstBlock = band.blocks.first else { continue }
+                let firstDay = days[firstBlock.dayIndex]
+                let bandID = "b-\(section.id)-\(firstDay.id)"
+                let segments = band.blocks.map { block in
+                    let day = days[block.dayIndex]
+                    return TitleSegment(
+                        dayID: day.id,
+                        title: day.title,
+                        colStart: block.colStart,
+                        colWidth: block.colWidth,
+                        selectableIDs: day.assets.filter { !$0.isLocal }.map(\.id)
+                    )
+                }
+                rows.append(.titleBand(bandID, segments))
+                titleBands += 1
+
+                for rowIndex in 0..<band.rowCount {
+                    var runs: [TileRun] = []
+                    for block in band.blocks where rowIndex < block.rowCount {
+                        let assets = days[block.dayIndex].assets
+                        let start = rowIndex * block.colWidth
+                        guard start < assets.count else { continue }
+                        let end = min(start + block.colWidth, assets.count)
+                        runs.append(TileRun(
+                            colStart: block.colStart,
+                            assets: Array(assets[start..<end])
+                        ))
+                    }
+                    guard let firstRun = runs.first else { continue }
+                    let tileID = "t-\(section.id)-\(firstDay.id)-\(rowIndex)"
+                    rows.append(.tiles(tileID, runs))
+                    firstAssetIDByRowID[tileID] = firstRun.assets[0].id
+                    tileRows += 1
+                }
+            }
+        } else {
+            let estimate = Self.placeholderEstimate(
+                count: section.count,
+                columns: columns,
+                assetsPerDay: placeholderRatio
+            )
+            rows.append(.placeholder(
+                "p-\(section.id)",
+                section.id,
+                estimate.tileRows,
+                estimate.titleBands
+            ))
+            titleBands = estimate.titleBands
+            tileRows = estimate.tileRows
+        }
+
+        let span = rows.isEmpty ? nil : TimelineSectionSpan(
+            id: section.id,
+            title: section.monthTitle,
+            year: Self.year(for: section.id),
+            titleBands: titleBands,
+            tileRows: tileRows
+        )
+        return SectionProjection(
+            source: section,
+            columns: columns,
+            placeholderRatio: section.isLoaded ? nil : placeholderRatio,
+            rows: rows,
+            firstAssetIDByRowID: firstAssetIDByRowID,
+            span: span,
+            titleBandCount: titleBands,
+            tileRowCount: tileRows,
+            assetCount: assetCount,
+            dayCount: dayCount
+        )
     }
 
     /// how tall an unloaded month renders, in the row units the real layout
@@ -836,17 +933,37 @@ final class TimelineModel {
             + CGFloat(tileRowCount) * (tileSide + 2)
     }
 
-    private func scheduleRebuild() {
+    private func scheduleRebuild(
+        animated: Bool = false,
+        after delay: Duration = .milliseconds(250),
+        replacesPending: Bool = false
+    ) {
         rebuildPending = true
-        guard !isViewerSuspended, !isRebuildDeferred, rebuildTask == nil else { return }
+        pendingRebuildAnimated = pendingRebuildAnimated || animated
+        guard !isViewerSuspended, !isRebuildDeferred else { return }
+        if replacesPending {
+            rebuildTask?.cancel()
+            rebuildTask = nil
+        }
+        guard rebuildTask == nil else { return }
         rebuildTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
             self.rebuildTask = nil
             guard !self.isViewerSuspended, !self.isRebuildDeferred else { return }
             self.rebuildPending = false
-            self.rebuildRows(rebuildAssets: true)
+            let animated = self.pendingRebuildAnimated
+            self.pendingRebuildAnimated = false
+            self.rebuildRows(rebuildAssets: true, animated: animated)
         }
+    }
+
+    private func scheduleOptimisticRebuild() {
+        scheduleRebuild(
+            animated: true,
+            after: .milliseconds(140),
+            replacesPending: true
+        )
     }
 
     /// held for the length of a scrubber drag. buckets the drag passes still
@@ -971,6 +1088,7 @@ final class TimelineModel {
                 }
             }
             guard dirty else { return }
+            var projectionChanged = sections != fresh
             sections = fresh
             for id in toFetch {
                 guard !isViewerSuspended else {
@@ -982,17 +1100,24 @@ final class TimelineModel {
                    let resolution = mutationOverlay.resolve(assets, for: fetch),
                    let index = sections.firstIndex(where: { $0.id == id }) {
                     staleBucketIDs.remove(id)
-                    sections[index].days = Self.groupByDay(
+                    let days = Self.groupByDay(
                         resolution.assets,
                         byUploadDate: filter.groupsByUploadDate
                     )
+                    projectionChanged = projectionChanged || sections[index].days != days
+                    sections[index].days = days
                     if resolution.isAuthoritative {
                         cacheBucket(id, assets: resolution.assets)
                     }
                 }
             }
-            rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
-            await refreshLocalItems()
+            projectionChanged = await updateLocalItems() || projectionChanged
+            guard projectionChanged else { return }
+            guard !isViewerSuspended else {
+                rebuildPending = true
+                return
+            }
+            rebuildRows(rebuildAssets: true, animated: true)
         } catch {
             // stale is fine; the next event, tick or foreground pass retries.
         }
@@ -1002,14 +1127,21 @@ final class TimelineModel {
 
     /// re-reads device assets and their backup status, then rebuilds rows.
     func refreshLocalItems() async {
-        guard mergesLocal, let backup else { return }
-        let items = await backup.localTimelineAssets()
-        localItems = items
+        guard await updateLocalItems() else { return }
         if isViewerSuspended {
             rebuildPending = true
         } else {
             rebuildRows(rebuildAssets: true, animated: true)
         }
+    }
+
+    @discardableResult
+    private func updateLocalItems() async -> Bool {
+        guard mergesLocal, let backup else { return false }
+        let items = await backup.localTimelineAssets()
+        guard items != localItems else { return false }
+        localItems = items
+        return true
     }
 
     private static let utcCalendar: Calendar = {
@@ -1137,13 +1269,12 @@ final class TimelineModel {
 
     // MARK: - mutations
 
-    /// applies an in-place mutation, used after favorite actions. one walk
-    /// collects the touched buckets, and a mutation that changes nothing -
-    /// like the realtime echo of an action already applied locally - skips
-    /// the full row rebuild it used to pay.
+    /// applies metadata without rebuilding row geometry or the viewer index.
     func updateAssets(ids: Set<String>, _ transform: (inout Asset) -> Void) {
+        let targetBucketIDs = bucketIDs(containing: ids)
         var changedBucketIDs = Set<String>()
-        for s in sections.indices {
+        var changedAssets: [String: Asset] = [:]
+        for s in sections.indices where targetBucketIDs.contains(sections[s].id) {
             guard var days = sections[s].days else { continue }
             var sectionChanged = false
             for d in days.indices {
@@ -1152,7 +1283,10 @@ final class TimelineModel {
                 for a in assets.indices where ids.contains(assets[a].id) {
                     let before = assets[a]
                     transform(&assets[a])
-                    if assets[a] != before { dayChanged = true }
+                    if assets[a] != before {
+                        changedAssets[assets[a].id] = assets[a]
+                        dayChanged = true
+                    }
                 }
                 if dayChanged {
                     days[d] = DayGroup(id: days[d].id, title: days[d].title, assets: assets)
@@ -1166,7 +1300,16 @@ final class TimelineModel {
         }
         guard !changedBucketIDs.isEmpty else { return }
         mutationOverlay.rejectFetchesStartedBeforeNextRequest(bucketIDs: changedBucketIDs)
-        rebuildRows(rebuildAssets: true)
+        TimelineAssetProjection.patchRows(
+            &rows,
+            assetsByID: changedAssets,
+            locations: rowAssetLocationByID
+        )
+        TimelineAssetProjection.patchFlatAssets(
+            &flatAssets,
+            assetsByID: changedAssets,
+            indicesByID: flatAssetIndexByID
+        )
     }
 
     func setFavoriteForOptimisticAction(
@@ -1176,7 +1319,8 @@ final class TimelineModel {
         let operationID = UUID()
         var previousValues: [String: Bool] = [:]
         var bucketsByAssetID: [String: String] = [:]
-        for section in sections {
+        let targetBucketIDs = bucketIDs(containing: ids)
+        for section in sections where targetBucketIDs.contains(section.id) {
             for day in section.days ?? [] {
                 for asset in day.assets where ids.contains(asset.id) {
                     previousValues[asset.id] = asset.isFavorite
@@ -1326,11 +1470,13 @@ final class TimelineModel {
     }
 
     private func removeAssetsNow(ids: Set<String>, operationID: UUID?) -> TimelineRemoval {
+        let targetBucketIDs = bucketIDs(containing: ids)
         mutationOverlay.rejectFetchesStartedBeforeNextRequest(
-            bucketIDs: bucketIDs(containing: ids)
+            bucketIDs: targetBucketIDs
         )
         var placements: [TimelineRemoval.Placement] = []
-        for (sectionIndex, section) in sections.enumerated() {
+        for (sectionIndex, section) in sections.enumerated()
+        where targetBucketIDs.contains(section.id) {
             guard let days = section.days else { continue }
             for (dayIndex, day) in days.enumerated() {
                 for (assetIndex, asset) in day.assets.enumerated() where ids.contains(asset.id) {
@@ -1346,12 +1492,13 @@ final class TimelineModel {
             }
         }
         if let operationID {
+            projectedRemovalIDs.formUnion(placements.map(\.asset.id))
             let sources = Dictionary(uniqueKeysWithValues: placements.map {
                 ($0.asset.id, TimelineProjectionSource(bucketID: $0.section.id, asset: $0.asset))
             })
             mutationOverlay.beginRemoval(operationID: operationID, sourcesByAssetID: sources)
         }
-        for s in sections.indices {
+        for s in sections.indices where targetBucketIDs.contains(sections[s].id) {
             guard let days = sections[s].days else { continue }
             let filtered = days.compactMap { day -> DayGroup? in
                 let remaining = day.assets.filter { !ids.contains($0.id) }
@@ -1359,8 +1506,15 @@ final class TimelineModel {
             }
             sections[s].days = filtered
         }
+        for id in placements.map(\.asset.id) {
+            bucketIDByAssetID[id] = nil
+        }
         sections.removeAll { $0.isLoaded && ($0.days?.isEmpty ?? false) }
-        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+        if operationID == nil {
+            rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+        } else {
+            scheduleOptimisticRebuild()
+        }
         return TimelineRemoval(operationID: operationID, placements: placements)
     }
 
@@ -1419,8 +1573,10 @@ final class TimelineModel {
                 assets: assets
             )
             sections[sectionIndex].days = days
+            bucketIDByAssetID[placement.asset.id] = placement.section.id
         }
-        rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
+        projectedRemovalIDs.subtract(wanted)
+        scheduleOptimisticRebuild()
     }
 
     private func projectionSources(in sections: [TimelineSection]) -> [String: TimelineProjectionSource] {
@@ -1442,12 +1598,7 @@ final class TimelineModel {
     }
 
     private func bucketIDs(containing assetIDs: Set<String>) -> Set<String> {
-        Set(sections.compactMap { section in
-            let containsAsset = section.days?.contains { day in
-                day.assets.contains { assetIDs.contains($0.id) }
-            } ?? false
-            return containsAsset ? section.id : nil
-        })
+        Set(assetIDs.compactMap { bucketIDByAssetID[$0] })
     }
 
     private func containsAsset(_ id: String) -> Bool {

@@ -933,13 +933,20 @@ struct TimelineScreen<Header: View>: View {
                 ForEach(runs, id: \.colStart) { run in
                     HStack(spacing: 2) {
                         ForEach(run.assets) { asset in
+                            let isProjectedRemoved = model.projectedRemovalIDs.contains(asset.id)
                             tile(asset)
                                 .frame(width: side, height: side)
+                                .opacity(isProjectedRemoved ? 0 : 1)
+                                .allowsHitTesting(!isProjectedRemoved)
                                 // plain crossfade: an uploaded photo swaps its
                                 // local tile for the server twin with identical
                                 // pixels, and any scale effect would read as a
                                 // pulse.
                                 .transition(.opacity)
+                                .animation(
+                                    reduceMotion ? nil : .easeOut(duration: 0.12),
+                                    value: isProjectedRemoved
+                                )
                         }
                     }
                     .padding(.leading, CGFloat(run.colStart) * (side + 2))
@@ -1330,7 +1337,11 @@ struct TimelineScreen<Header: View>: View {
         previewBounds: CGSize
     ) -> AssetViewerHostingController? {
         guard let index = model.flatAssetIndex(for: asset.id) else { return nil }
-        guard let route = viewer.makeRoute(assets: model.flatAssets, initialIndex: index) else { return nil }
+        guard let route = viewer.makeRoute(
+            assets: model.flatAssets,
+            initialIndex: index,
+            indexByAssetID: model.viewerAssetIndexByID
+        ) else { return nil }
 
         return AssetViewerHostingController(
             route: route,

@@ -22,7 +22,7 @@ nonisolated enum PhotoLibraryError: LocalizedError {
 }
 
 /// sendable snapshot of the phasset fields backup cares about.
-nonisolated struct DeviceAsset: Sendable {
+nonisolated struct DeviceAsset: Equatable, Sendable {
     let localIdentifier: String
     let isVideo: Bool
     let isLivePhoto: Bool
