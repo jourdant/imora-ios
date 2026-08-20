@@ -46,8 +46,12 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         return asset
     }
 
-    private func key(_ localIdentifier: String, _ size: CGFloat) -> NSString {
-        "\(localIdentifier)#\(Int(size))" as NSString
+    private func key(
+        _ localIdentifier: String,
+        _ size: CGFloat,
+        _ contentMode: PHImageContentMode
+    ) -> NSString {
+        "\(localIdentifier)#\(Int(size))#\(contentMode.rawValue)" as NSString
     }
 
     /// the caching manager only serves a prefetched thumbnail when the request
@@ -61,8 +65,12 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         return options
     }
 
-    func cachedImage(localIdentifier: String, targetPixelSize: CGFloat) -> UIImage? {
-        cache.object(forKey: key(localIdentifier, targetPixelSize))
+    func cachedImage(
+        localIdentifier: String,
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode = .aspectFill
+    ) -> UIImage? {
+        cache.object(forKey: key(localIdentifier, targetPixelSize, contentMode))
     }
 
     /// concurrent so the photokit fetch never runs inline on the caller. under
@@ -70,51 +78,86 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     /// caller's actor, which put a synchronous library query on the main
     /// thread every time a page or tile asked for its image.
     @concurrent
-    func image(localIdentifier: String, targetPixelSize: CGFloat) async -> UIImage? {
-        if let cached = cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize) {
+    func image(
+        localIdentifier: String,
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode = .aspectFill
+    ) async -> UIImage? {
+        if let cached = cachedImage(
+            localIdentifier: localIdentifier,
+            targetPixelSize: targetPixelSize,
+            contentMode: contentMode
+        ) {
             return cached
         }
         guard let asset = fetchAsset(localIdentifier) else { return nil }
         let size = CGSize(width: targetPixelSize, height: targetPixelSize)
         let image = await withCheckedContinuation { continuation in
             manager.requestImage(
-                for: asset, targetSize: size, contentMode: .aspectFill, options: Self.requestOptions()
+                for: asset, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
             ) { image, _ in
                 continuation.resume(returning: image)
             }
         }
         if let image {
             let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
-            cache.setObject(image, forKey: key(localIdentifier, targetPixelSize), cost: cost)
+            cache.setObject(
+                image,
+                forKey: key(localIdentifier, targetPixelSize, contentMode),
+                cost: cost
+            )
         }
         return image
     }
 
     // MARK: - prefetching
 
-    func startCaching(localIdentifiers: [String], targetPixelSize: CGFloat) {
+    func startCaching(
+        localIdentifiers: [String],
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode = .aspectFill
+    ) {
         cachingQueue.async { [self] in
-            setCaching(true, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+            setCaching(
+                true,
+                localIdentifiers: localIdentifiers,
+                targetPixelSize: targetPixelSize,
+                contentMode: contentMode
+            )
         }
     }
 
-    func stopCaching(localIdentifiers: [String], targetPixelSize: CGFloat) {
+    func stopCaching(
+        localIdentifiers: [String],
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode = .aspectFill
+    ) {
         cachingQueue.async { [self] in
-            setCaching(false, localIdentifiers: localIdentifiers, targetPixelSize: targetPixelSize)
+            setCaching(
+                false,
+                localIdentifiers: localIdentifiers,
+                targetPixelSize: targetPixelSize,
+                contentMode: contentMode
+            )
         }
     }
 
-    private func setCaching(_ caching: Bool, localIdentifiers: [String], targetPixelSize: CGFloat) {
+    private func setCaching(
+        _ caching: Bool,
+        localIdentifiers: [String],
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode
+    ) {
         let assets = localIdentifiers.compactMap(fetchAsset)
         guard !assets.isEmpty else { return }
         let size = CGSize(width: targetPixelSize, height: targetPixelSize)
         if caching {
             manager.startCachingImages(
-                for: assets, targetSize: size, contentMode: .aspectFill, options: Self.requestOptions()
+                for: assets, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
             )
         } else {
             manager.stopCachingImages(
-                for: assets, targetSize: size, contentMode: .aspectFill, options: Self.requestOptions()
+                for: assets, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
             )
         }
     }

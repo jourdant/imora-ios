@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 
 /// keeps a rolling window of grid thumbnails warm around what is on screen, so
 /// a fling lands on decoded tiles instead of placeholders. each grid owns one,
@@ -15,6 +16,7 @@ final class ThumbnailPrefetcher {
     private static let lookBehind = 20
 
     private let targetPixelSize: CGFloat
+    private let localContentMode: PHImageContentMode
     private var remote: Set<URL> = []
     private var local: Set<String> = []
     /// the asset range last warmed, with the `flatAssets` revision it was taken
@@ -23,8 +25,12 @@ final class ThumbnailPrefetcher {
     private var window: Range<Int>?
     private var windowVersion = -1
 
-    init(targetPixelSize: CGFloat = 640) {
+    init(
+        targetPixelSize: CGFloat = 640,
+        localContentMode: PHImageContentMode = .aspectFill
+    ) {
         self.targetPixelSize = targetPixelSize
+        self.localContentMode = localContentMode
     }
 
     /// anchors on the first visible tile row and warms the assets around it.
@@ -88,10 +94,18 @@ final class ThumbnailPrefetcher {
             let added = local.subtracting(self.local)
             let dropped = self.local.subtracting(local)
             if !added.isEmpty {
-                LocalImageLoader.shared.startCaching(localIdentifiers: Array(added), targetPixelSize: targetPixelSize)
+                LocalImageLoader.shared.startCaching(
+                    localIdentifiers: Array(added),
+                    targetPixelSize: targetPixelSize,
+                    contentMode: localContentMode
+                )
             }
             if !dropped.isEmpty {
-                LocalImageLoader.shared.stopCaching(localIdentifiers: Array(dropped), targetPixelSize: targetPixelSize)
+                LocalImageLoader.shared.stopCaching(
+                    localIdentifiers: Array(dropped),
+                    targetPixelSize: targetPixelSize,
+                    contentMode: localContentMode
+                )
             }
             self.local = local
         }

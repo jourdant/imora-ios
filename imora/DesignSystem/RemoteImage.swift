@@ -1,3 +1,4 @@
+import Photos
 import SwiftUI
 
 /// async image with thumbhash placeholder and downsampled decoding.
@@ -10,6 +11,7 @@ struct RemoteImage: View {
     var fallbackURL: URL?
     var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
+    var onReady: (() -> Void)?
 
     @State private var image: KeyedImage?
     @State private var placeholder: KeyedImage?
@@ -32,7 +34,7 @@ struct RemoteImage: View {
     /// holding its image never touches the pipeline cache: the lookup builds a
     /// request and takes the cache's lock, and a grid runs it once per tile per
     /// pass.
-    private func displayImage(key: String) -> UIImage? {
+    private func readyImage(key: String) -> UIImage? {
         if let image, image.key == key { return image.image }
         if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
             return cached
@@ -42,6 +44,11 @@ struct RemoteImage: View {
            let cached = ImageLoader.shared.cachedImage(for: fallbackURL, targetPixelSize: fallbackPixelSize) {
             return cached
         }
+        return nil
+    }
+
+    private func displayImage(key: String) -> UIImage? {
+        if let ready = readyImage(key: key) { return ready }
         if let placeholder, placeholder.key == key { return placeholder.image }
         return nil
     }
@@ -65,9 +72,13 @@ struct RemoteImage: View {
                 Color(.secondarySystemFill)
             }
         }
+        .onAppear {
+            if readyImage(key: key) != nil { onReady?() }
+        }
         .task(id: taskID) {
             if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
                 image = KeyedImage(key: requestKey, image: cached)
+                onReady?()
                 return
             }
 
@@ -99,6 +110,7 @@ struct RemoteImage: View {
             } else {
                 withAnimation(.easeIn(duration: 0.15)) { image = keyed }
             }
+            onReady?()
         }
         // the smaller render of the same photo - the one the grid showed - is
         // usually a disk cache hit, so it paints the view while the full size
@@ -115,6 +127,7 @@ struct RemoteImage: View {
             )
             guard !Task.isCancelled, let loaded, image?.key != key else { return }
             fallbackImage = KeyedImage(key: key, image: loaded)
+            onReady?()
         }
     }
 }
@@ -127,13 +140,18 @@ struct LocalPhotoImage: View {
     /// points it at the grid's size so a page opens on the tile's pixels
     /// instead of a placeholder while photokit produces the big one.
     var fallbackTargetPixelSize: CGFloat?
+    var fallbackRequestContentMode: PHImageContentMode = .aspectFill
+    var loadsFallbackIfNeeded = false
+    var requestContentMode: PHImageContentMode = .aspectFill
     var contentMode: ContentMode = .fill
     /// photokit could not produce the asset - it was deleted from the library
     /// behind our back, or is an icloud original that will not download. hosts
     /// use this to fall back to the server copy instead of showing nothing.
     var onUnavailable: (() -> Void)?
+    var onReady: (() -> Void)?
 
     @State private var image: KeyedImage?
+    @State private var fallbackImage: KeyedImage?
 
     private struct KeyedImage {
         let key: String
@@ -141,14 +159,20 @@ struct LocalPhotoImage: View {
     }
 
     private var requestKey: String {
-        "\(localIdentifier)#\(Int(targetPixelSize))"
+        "\(localIdentifier)#\(Int(targetPixelSize))#\(requestContentMode.rawValue)"
+    }
+
+    private var fallbackKey: String? {
+        guard let fallbackTargetPixelSize else { return nil }
+        return "\(localIdentifier)#\(Int(fallbackTargetPixelSize))#\(fallbackRequestContentMode.rawValue)"
     }
 
     private var cachedFallback: UIImage? {
         guard let fallbackTargetPixelSize else { return nil }
         return LocalImageLoader.shared.cachedImage(
             localIdentifier: localIdentifier,
-            targetPixelSize: fallbackTargetPixelSize
+            targetPixelSize: fallbackTargetPixelSize,
+            contentMode: fallbackRequestContentMode
         )
     }
 
@@ -157,7 +181,12 @@ struct LocalPhotoImage: View {
         // the photokit cache is only consulted when this view is not already
         // holding the render, the same short circuit remoteimage takes.
         let display = (image?.key == key ? image?.image : nil)
-            ?? LocalImageLoader.shared.cachedImage(localIdentifier: localIdentifier, targetPixelSize: targetPixelSize)
+            ?? LocalImageLoader.shared.cachedImage(
+                localIdentifier: localIdentifier,
+                targetPixelSize: targetPixelSize,
+                contentMode: requestContentMode
+            )
+            ?? (fallbackImage?.key == fallbackKey ? fallbackImage?.image : nil)
             ?? cachedFallback
         ZStack {
             if let display {
@@ -171,12 +200,16 @@ struct LocalPhotoImage: View {
                 Color(.secondarySystemFill)
             }
         }
+        .onAppear {
+            if display != nil { onReady?() }
+        }
         .task(id: key) {
             guard image?.key != key else { return }
             let start = ContinuousClock.now
             let loaded = await LocalImageLoader.shared.image(
                 localIdentifier: localIdentifier,
-                targetPixelSize: targetPixelSize
+                targetPixelSize: targetPixelSize,
+                contentMode: requestContentMode
             )
             guard !Task.isCancelled else { return }
             guard let loaded else { return onUnavailable?() ?? () }
@@ -188,6 +221,33 @@ struct LocalPhotoImage: View {
             } else {
                 withAnimation(.easeIn(duration: 0.15)) { image = keyed }
             }
+            onReady?()
+        }
+        .task(id: fallbackKey) {
+            guard loadsFallbackIfNeeded,
+                  let fallbackTargetPixelSize,
+                  let fallbackKey,
+                  image?.key != key,
+                  fallbackImage?.key != fallbackKey,
+                  LocalImageLoader.shared.cachedImage(
+                      localIdentifier: localIdentifier,
+                      targetPixelSize: targetPixelSize,
+                      contentMode: requestContentMode
+                  ) == nil,
+                  LocalImageLoader.shared.cachedImage(
+                      localIdentifier: localIdentifier,
+                      targetPixelSize: fallbackTargetPixelSize,
+                      contentMode: fallbackRequestContentMode
+                  ) == nil
+            else { return }
+            let loaded = await LocalImageLoader.shared.image(
+                localIdentifier: localIdentifier,
+                targetPixelSize: fallbackTargetPixelSize,
+                contentMode: fallbackRequestContentMode
+            )
+            guard !Task.isCancelled, let loaded, image?.key != key else { return }
+            fallbackImage = KeyedImage(key: fallbackKey, image: loaded)
+            onReady?()
         }
     }
 }
