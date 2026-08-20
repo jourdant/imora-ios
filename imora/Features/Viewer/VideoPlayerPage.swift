@@ -4,10 +4,38 @@ import SwiftUI
 /// the app's default ambient audio session is silenced by the ring switch.
 /// claiming playback before audible video makes sound play regardless, like
 /// the system photos app.
+private final class ViewerAudioSession: @unchecked Sendable {
+    static let shared = ViewerAudioSession()
+
+    private let queue = DispatchQueue(
+        label: "com.vexcited.imora.viewer-audio-session",
+        qos: .userInitiated
+    )
+    private var isPlaybackCategoryConfigured = false
+
+    func activateForPlayback() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let audioSession = AVAudioSession.sharedInstance()
+            if !self.isPlaybackCategoryConfigured {
+                do {
+                    try audioSession.setCategory(.playback, mode: .moviePlayback)
+                    self.isPlaybackCategoryConfigured = true
+                } catch {
+                    return
+                }
+            }
+            if #available(iOS 27.0, *) {
+                audioSession.activate(options: []) { _, _ in }
+            } else {
+                try? audioSession.setActive(true, options: [])
+            }
+        }
+    }
+}
+
 private func activatePlaybackAudioSession() {
-    let audioSession = AVAudioSession.sharedInstance()
-    try? audioSession.setCategory(.playback, mode: .moviePlayback)
-    try? audioSession.setActive(true)
+    ViewerAudioSession.shared.activateForPlayback()
 }
 
 /// single playback engine for the viewer. the active video page claims it and
