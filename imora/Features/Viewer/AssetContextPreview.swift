@@ -1,4 +1,5 @@
 import AVFoundation
+import Photos
 import SwiftUI
 
 /// Floating media shown while an asset context menu is up. The grid's smaller
@@ -21,7 +22,9 @@ struct AssetContextPreview: View {
                 LocalPhotoImage(
                     localIdentifier: localId,
                     targetPixelSize: 1280,
-                    fallbackTargetPixelSize: 640
+                    fallbackTargetPixelSize: 640,
+                    fallbackRequestContentMode: .aspectFit,
+                    requestContentMode: .aspectFit
                 )
             } else if let client = session.client {
                 RemoteImage(

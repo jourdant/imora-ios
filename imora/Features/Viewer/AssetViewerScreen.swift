@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import Photos
 
 nonisolated enum AssetChange {
     case favorite(String, Bool)
@@ -27,6 +28,109 @@ private struct ViewerRemoval {
 private nonisolated struct ViewerViewport: Equatable, Sendable {
     var size = CGSize.zero
     var bottomInset: CGFloat = 0
+}
+
+private struct ViewerPhysicalSafeAreaReader: UIViewRepresentable {
+    let onChange: (UIEdgeInsets) -> Void
+
+    func makeUIView(context: Context) -> ReaderView {
+        let view = ReaderView()
+        view.onChange = onChange
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: ReaderView, context: Context) {
+        view.onChange = onChange
+        view.reportIfNeeded()
+    }
+
+    final class ReaderView: UIView {
+        var onChange: ((UIEdgeInsets) -> Void)?
+        private var lastInsets: UIEdgeInsets?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            reportIfNeeded()
+        }
+
+        override func safeAreaInsetsDidChange() {
+            super.safeAreaInsetsDidChange()
+            reportIfNeeded()
+        }
+
+        func reportIfNeeded() {
+            guard let window else { return }
+            let insets = window.safeAreaInsets
+            guard insets != lastInsets else { return }
+            lastInsets = insets
+            DispatchQueue.main.async { [weak self] in
+                self?.onChange?(insets)
+            }
+        }
+    }
+}
+
+private struct AssetViewerMediaFrameAnchor: UIViewRepresentable {
+    let assetID: String
+    let aspectRatio: Double
+    let onRegistrationChanged: (String, UIView, Double, Bool) -> Void
+
+    func makeUIView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: AnchorView, context: Context) {
+        view.update(
+            assetID: assetID,
+            aspectRatio: aspectRatio,
+            onRegistrationChanged: onRegistrationChanged
+        )
+    }
+
+    static func dismantleUIView(_ view: AnchorView, coordinator: ()) {
+        view.unregister()
+    }
+
+    final class AnchorView: UIView {
+        private var assetID = ""
+        private var aspectRatio = 1.0
+        private var onRegistrationChanged: ((String, UIView, Double, Bool) -> Void)?
+        private var isRegistered = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            window == nil ? unregister() : register()
+        }
+
+        func update(
+            assetID: String,
+            aspectRatio: Double,
+            onRegistrationChanged: @escaping (String, UIView, Double, Bool) -> Void
+        ) {
+            let identityChanged = self.assetID != assetID
+            if identityChanged { unregister() }
+            self.assetID = assetID
+            self.aspectRatio = aspectRatio
+            self.onRegistrationChanged = onRegistrationChanged
+            guard window != nil else { return }
+            register()
+        }
+
+        func unregister() {
+            guard isRegistered else { return }
+            isRegistered = false
+            onRegistrationChanged?(assetID, self, aspectRatio, false)
+        }
+
+        private func register() {
+            guard !assetID.isEmpty else { return }
+            isRegistered = true
+            onRegistrationChanged?(assetID, self, aspectRatio, true)
+        }
+    }
 }
 
 /// Coarse scroll regions are the only vertical state published into SwiftUI.
@@ -66,27 +170,30 @@ private nonisolated struct AssetInformationScrollTargetBehavior: ScrollTargetBeh
 /// compositor reads the live frame directly, avoiding a one-frame @State lag
 /// and leaving the scroll view's layout and target geometry untouched.
 private struct AssetViewerMediaScrollEffect: ViewModifier {
-    let isEnabled: Bool
+    let followsCompactScroll: Bool
     let aspectRatio: Double
+    let showsChrome: Bool
+    let topSafeAreaInset: CGFloat
+    let bottomSafeAreaInset: CGFloat
+    let reservesTransportControls: Bool
 
-    @ViewBuilder func body(content: Content) -> some View {
-        if isEnabled {
-            content.visualEffect { effect, proxy in
-                let scrollOffset = max(
-                    0,
-                    -proxy.frame(in: .scrollView(axis: .vertical)).minY
+    func body(content: Content) -> some View {
+        content.visualEffect { effect, proxy in
+            let scrollOffset = followsCompactScroll
+                ? max(0, -proxy.frame(in: .scrollView(axis: .vertical)).minY)
+                : 0
+            let presentation = AssetViewerPageLayout(viewport: proxy.size)
+                .presentation(
+                    scrollOffset: scrollOffset,
+                    aspectRatio: aspectRatio,
+                    showsChrome: showsChrome,
+                    topSafeAreaInset: topSafeAreaInset,
+                    bottomSafeAreaInset: bottomSafeAreaInset,
+                    reservesTransportControls: reservesTransportControls
                 )
-                let presentation = AssetViewerPageLayout(viewport: proxy.size)
-                    .presentation(
-                        scrollOffset: scrollOffset,
-                        aspectRatio: aspectRatio
-                    )
-                return effect
-                    .scaleEffect(presentation.mediaScale, anchor: .center)
-                    .offset(y: presentation.mediaOffsetY)
-            }
-        } else {
-            content
+            return effect
+                .scaleEffect(presentation.mediaScale, anchor: .center)
+                .offset(y: presentation.mediaOffsetY)
         }
     }
 }
@@ -256,6 +363,27 @@ private struct AssetInformationPanel: View {
 /// the request the page will make, so it lives next to both.
 let pagePixelSize: CGFloat = 2048
 
+struct AssetViewerFittedMedia<Content: View>: View {
+    let aspectRatio: Double
+    @ViewBuilder let content: Content
+
+    init(aspectRatio: Double, @ViewBuilder content: () -> Content) {
+        self.aspectRatio = aspectRatio
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let frame = AssetViewerPageLayout(viewport: geometry.size)
+                .fittedMediaFrame(aspectRatio: aspectRatio)
+            content
+                .frame(width: frame.width, height: frame.height)
+                .clipped()
+                .position(x: frame.midX, y: frame.midY)
+        }
+    }
+}
+
 struct AssetViewerScreen: View {
     /// pages either side of the current one kept warm. the pager mounts a page
     /// as it scrolls in, which on a quick swipe leaves no time for a download,
@@ -273,17 +401,25 @@ struct AssetViewerScreen: View {
     let onRequestDismissal: (() -> Void)?
     let onSelectionChanged: (String) -> Void
     let onPageZoomChanged: (Bool) -> Void
+    let onChromeVisibilityChanged: (Bool) -> Void
+    let onMediaFrameSourceChanged: (String, UIView, Double, Bool) -> Void
     /// Mirrors whether the information sheet is absent, so the zoom
     /// transition only claims pans that belong to the unobstructed media.
     let onMediaAtTopChanged: (Bool) -> Void
     let presentationID: UUID
     let zoomNamespace: Namespace.ID?
     let isContextPreview: Bool
+    let loadsViewerContent: Bool
+    let transitionMediaVisible: Bool
+    let usesExternalBackdrop: Bool
+    let mediaTopSafeAreaInset: CGFloat?
+    let mediaBottomSafeAreaInset: CGFloat?
     /// set when the grid behind is an album, which adds removal to the menu.
     let album: AlbumContext?
     /// set when the grid behind belongs to one person, which lets the photo on
     /// screen become their portrait.
     let personID: String?
+    let onLaunchMediaReady: () -> Void
 
     @State private var assets: [Asset]
     /// id to index, rebuilt only when membership changes. every swipe used to
@@ -293,6 +429,7 @@ struct AssetViewerScreen: View {
     @State private var currentIndex: Int
     @State private var selectedAssetID: String?
     @State private var chromeVisible = true
+    @State private var physicalSafeAreaInsets = UIEdgeInsets.zero
     @State private var showInfo = false
     @State private var viewerScrollPosition = ScrollPosition(edge: .top)
     /// Only endpoint transitions enter view state. Native scroll geometry owns
@@ -331,7 +468,13 @@ struct AssetViewerScreen: View {
     @State private var toast: String?
     @State private var isDismissing = false
     @State private var didNotifyDismissal = false
-    @State private var prefetcher = ThumbnailPrefetcher(targetPixelSize: pagePixelSize)
+    @State private var launchMediaVisible = true
+    @State private var launchMediaReady = false
+    @State private var interactiveMediaLaidOut = false
+    @State private var prefetcher = ThumbnailPrefetcher(
+        targetPixelSize: pagePixelSize,
+        localContentMode: .aspectFit
+    )
     @State private var playback = VideoPlayback()
 
     init(
@@ -341,11 +484,19 @@ struct AssetViewerScreen: View {
         presentationID: UUID,
         zoomNamespace: Namespace.ID? = nil,
         isContextPreview: Bool = false,
+        loadsViewerContent: Bool = true,
+        transitionMediaVisible: Bool = true,
+        usesExternalBackdrop: Bool = false,
+        mediaTopSafeAreaInset: CGFloat? = nil,
+        mediaBottomSafeAreaInset: CGFloat? = nil,
         album: AlbumContext? = nil,
         personID: String? = nil,
         onRequestDismissal: (() -> Void)? = nil,
+        onLaunchMediaReady: @escaping () -> Void = {},
         onSelectionChanged: @escaping (String) -> Void = { _ in },
         onPageZoomChanged: @escaping (Bool) -> Void = { _ in },
+        onChromeVisibilityChanged: @escaping (Bool) -> Void = { _ in },
+        onMediaFrameSourceChanged: @escaping (String, UIView, Double, Bool) -> Void = { _, _, _, _ in },
         onMediaAtTopChanged: @escaping (Bool) -> Void = { _ in },
         onDismissed: @escaping () -> Void,
         onChange: @escaping (AssetChange) -> Void
@@ -355,14 +506,24 @@ struct AssetViewerScreen: View {
         _indexByAssetID = State(initialValue: indexByAssetID ?? Self.indexMap(for: assets))
         _currentIndex = State(initialValue: safeIndex)
         _selectedAssetID = State(initialValue: assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil)
+        _physicalSafeAreaInsets = State(initialValue: Self.activeWindowSafeAreaInsets())
         self.presentationID = presentationID
         self.zoomNamespace = zoomNamespace
         self.isContextPreview = isContextPreview
+        self.loadsViewerContent = loadsViewerContent
+        self.transitionMediaVisible = transitionMediaVisible
+        self.usesExternalBackdrop = usesExternalBackdrop
+        self.mediaTopSafeAreaInset = mediaTopSafeAreaInset
+        self.mediaBottomSafeAreaInset = mediaBottomSafeAreaInset
+        _launchMediaVisible = State(initialValue: !loadsViewerContent)
         self.album = album
         self.personID = personID
         self.onRequestDismissal = onRequestDismissal
+        self.onLaunchMediaReady = onLaunchMediaReady
         self.onSelectionChanged = onSelectionChanged
         self.onPageZoomChanged = onPageZoomChanged
+        self.onChromeVisibilityChanged = onChromeVisibilityChanged
+        self.onMediaFrameSourceChanged = onMediaFrameSourceChanged
         self.onMediaAtTopChanged = onMediaAtTopChanged
         self.onDismissed = onDismissed
         self.onChange = onChange
@@ -372,10 +533,32 @@ struct AssetViewerScreen: View {
         assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
     }
 
+    private var mediaShowsChrome: Bool {
+        chromeVisible && !isContextPreview
+    }
+
+    private var effectiveMediaTopSafeAreaInset: CGFloat {
+        mediaTopSafeAreaInset ?? physicalSafeAreaInsets.top
+    }
+
+    private var effectiveMediaBottomSafeAreaInset: CGFloat {
+        mediaBottomSafeAreaInset ?? physicalSafeAreaInsets.bottom
+    }
+
     private static func indexMap(for assets: [Asset]) -> [String: Int] {
         var map = [String: Int](minimumCapacity: assets.count)
         for (index, asset) in assets.enumerated() { map[asset.id] = index }
         return map
+    }
+
+    private static func activeWindowSafeAreaInsets() -> UIEdgeInsets {
+        let scenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive }
+            ?? scenes.first
+        return scene?.windows.first(where: \.isKeyWindow)?.safeAreaInsets
+            ?? scene?.windows.first?.safeAreaInsets
+            ?? .zero
     }
 
     /// call after any mutation that changes membership or order.
@@ -470,14 +653,14 @@ struct AssetViewerScreen: View {
                 for: .bottomBar
             )
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar, .bottomBar)
+            .toolbarColorScheme(.dark, for: .navigationBar, .bottomBar)
             .navigationBarTitleDisplayMode(.inline)
-            // chrome only shows over the system background, so its monochrome
-            // controls follow the scheme instead of assuming a dark stage.
-            .tint(.primary)
+            .tint(.white)
             .navigationDestination(for: AssetInformationDestination.self) { destination in
                 informationDestinationView(destination)
                     .tint(.accentColor)
                     .toolbarBackgroundVisibility(.automatic, for: .navigationBar)
+                    .toolbarColorScheme(nil, for: .navigationBar)
             }
             .onChange(of: showInfo, initial: true) { _, _ in
                 reportMediaAtTop()
@@ -508,9 +691,14 @@ struct AssetViewerScreen: View {
                 }
             }
         }
+        .containerBackground(
+            usesExternalBackdrop ? Color.black : Color(uiColor: .systemBackground),
+            for: .navigation
+        )
         .statusBarHidden(isContextPreview || !chromeVisible)
         .allowsHitTesting(!isContextPreview && !isDismissing)
         .onAppear {
+            onChromeVisibilityChanged(chromeVisible)
             if let selectedAssetID { onSelectionChanged(selectedAssetID) }
         }
         .onChange(of: selectedAssetID) { _, id in
@@ -590,7 +778,8 @@ struct AssetViewerScreen: View {
                 }
             }
         }
-        .task(id: current?.id) {
+        .task(id: loadsViewerContent ? current?.id : nil) {
+            guard loadsViewerContent else { return }
             warmNeighbours()
             localIdentifier = nil
             backedUpRemoteID = nil
@@ -626,19 +815,25 @@ struct AssetViewerScreen: View {
                     .clipped()
 
                 if let current {
-                    AssetInformationPanel(
-                        asset: current,
-                        serverAssetID: serverAssetID,
-                        // the endpoint leaves .media the moment a drag starts
-                        // revealing information, so the load still begins
-                        // ahead of the panel actually settling on screen.
-                        isRevealed: showInfo || compactScrollEndpoint != .media,
-                        bottomContentInset: layout.bottomSafeAreaInset + 80,
-                        onDateAdjusted: applyDateAdjustment,
-                        onAlbumAdded: { toast = $0 },
-                        onOpenPerson: { queueInformationDestination(.person($0)) },
-                        onOpenAlbum: { queueInformationDestination(.album($0)) }
-                    )
+                    Group {
+                        if loadsViewerContent {
+                            AssetInformationPanel(
+                                asset: current,
+                                serverAssetID: serverAssetID,
+                                // the endpoint leaves .media the moment a drag starts
+                                // revealing information, so the load still begins
+                                // ahead of the panel actually settling on screen.
+                                isRevealed: showInfo || compactScrollEndpoint != .media,
+                                bottomContentInset: layout.bottomSafeAreaInset + 80,
+                                onDateAdjusted: applyDateAdjustment,
+                                onAlbumAdded: { toast = $0 },
+                                onOpenPerson: { queueInformationDestination(.person($0)) },
+                                onOpenAlbum: { queueInformationDestination(.album($0)) }
+                            )
+                        } else {
+                            Color.clear
+                        }
+                    }
                     .frame(minHeight: layout.informationMinimumHeight, alignment: .top)
                     .frame(maxWidth: .infinity)
                     .background(Color(uiColor: .systemBackground))
@@ -651,9 +846,9 @@ struct AssetViewerScreen: View {
         )
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
-        .scrollDisabled(currentPageZoomed || isContextPreview)
+        .scrollDisabled(!loadsViewerContent || currentPageZoomed || isContextPreview)
         .scrollEdgeEffectHidden(true, for: .top)
-        .background(Color(uiColor: .systemBackground))
+        .background(usesExternalBackdrop ? Color.black : Color(uiColor: .systemBackground))
         .transaction { transaction in
             // Metadata loads below a fixed media boundary; automatic relative
             // offset correction would only move an already-settled viewer.
@@ -699,24 +894,81 @@ struct AssetViewerScreen: View {
 
     private func mediaStage(followsCompactScroll: Bool) -> some View {
         ZStack {
-            Color(uiColor: chromeVisible ? .systemBackground : .black)
+            Color.black
                 .accessibilityIdentifier("asset-viewer")
                 .accessibilityValue(selectedAssetID ?? "")
 
-            AssetPager(
-                assets: assets,
-                indexByID: indexByAssetID,
-                selection: $selectedAssetID,
-                followsCompactScroll: followsCompactScroll,
-                mutesVideo: isContextPreview,
-                playback: playback,
-                optimisticEdits: optimisticEdits,
-                editCacheKeys: editCacheKeys
-            ) { id, isZoomed in
-                guard id == selectedAssetID else { return }
-                currentPageZoomed = isZoomed
-                onPageZoomChanged(isZoomed)
+            ZStack {
+                if loadsViewerContent {
+                    AssetPager(
+                        assets: assets,
+                        indexByID: indexByAssetID,
+                        selection: $selectedAssetID,
+                        followsCompactScroll: followsCompactScroll,
+                        showsChrome: mediaShowsChrome,
+                        topSafeAreaInset: effectiveMediaTopSafeAreaInset,
+                        bottomSafeAreaInset: effectiveMediaBottomSafeAreaInset,
+                        mutesVideo: isContextPreview,
+                        playback: playback,
+                        optimisticEdits: optimisticEdits,
+                        editCacheKeys: editCacheKeys
+                    ) { id, isZoomed in
+                        guard id == selectedAssetID else { return }
+                        currentPageZoomed = isZoomed
+                        onPageZoomChanged(isZoomed)
+                    }
+                    .onGeometryChange(for: Bool.self) { proxy in
+                        proxy.size.width > 0 && proxy.size.height > 0
+                    } action: { isLaidOut in
+                        if isLaidOut { interactiveMediaLaidOut = true }
+                    }
+                }
+
+                if launchMediaVisible, let current {
+                    AssetViewerLaunchMedia(
+                        asset: current,
+                        onReady: {
+                            launchMediaReady = true
+                            onLaunchMediaReady()
+                        }
+                    )
+                        .modifier(
+                            AssetViewerMediaScrollEffect(
+                                followsCompactScroll: followsCompactScroll,
+                                aspectRatio: current.ratio,
+                                showsChrome: mediaShowsChrome,
+                                topSafeAreaInset: effectiveMediaTopSafeAreaInset,
+                                bottomSafeAreaInset: effectiveMediaBottomSafeAreaInset,
+                                reservesTransportControls: current.isVideo || current.isLivePhoto
+                            )
+                        )
+                        .allowsHitTesting(false)
+                        .zIndex(1)
+                }
+
+                if let current {
+                    let aspectRatio = projectedAspectRatio(for: current)
+                    AssetViewerMediaFrameAnchor(
+                        assetID: current.id,
+                        aspectRatio: aspectRatio,
+                        onRegistrationChanged: onMediaFrameSourceChanged
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .modifier(
+                        AssetViewerMediaScrollEffect(
+                            followsCompactScroll: followsCompactScroll,
+                            aspectRatio: aspectRatio,
+                            showsChrome: mediaShowsChrome,
+                            topSafeAreaInset: effectiveMediaTopSafeAreaInset,
+                            bottomSafeAreaInset: effectiveMediaBottomSafeAreaInset,
+                            reservesTransportControls: current.isVideo || current.isLivePhoto
+                        )
+                    )
+                    .allowsHitTesting(false)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .opacity(transitionMediaVisible ? 1 : 0)
             .scrollEdgeEffectHidden(true, for: .top)
             .accessibilityIdentifier("asset-media")
             .onTapGesture {
@@ -727,8 +979,8 @@ struct AssetViewerScreen: View {
                     setInfoVisible(false)
                     return
                 }
-                withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.2)) {
-                    chromeVisible.toggle()
+                withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.22)) {
+                    setChromeVisible(!chromeVisible)
                 }
             }
             .simultaneousGesture(
@@ -739,6 +991,26 @@ struct AssetViewerScreen: View {
             AirPlayRoutePicker(trigger: $airPlayTrigger)
                 .frame(width: 1, height: 1)
                 .allowsHitTesting(false)
+
+            ViewerPhysicalSafeAreaReader { insets in
+                physicalSafeAreaInsets = insets
+            }
+            .frame(width: 1, height: 1)
+            .allowsHitTesting(false)
+        }
+        .task(id: loadsViewerContent && interactiveMediaLaidOut && launchMediaReady) {
+            guard loadsViewerContent else {
+                launchMediaVisible = true
+                interactiveMediaLaidOut = false
+                return
+            }
+            guard interactiveMediaLaidOut, launchMediaReady else { return }
+            await Task.yield()
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            withAnimation(.linear(duration: 0.08)) {
+                launchMediaVisible = false
+            }
         }
     }
 
@@ -755,6 +1027,7 @@ struct AssetViewerScreen: View {
                     VideoControlsBar(playback: playback)
                 }
             }
+            .environment(\.colorScheme, .dark)
             .padding(.bottom, 4)
             .opacity(chromePresentation.showsTransportControls ? 1 : 0)
             .allowsHitTesting(chromePresentation.showsTransportControls)
@@ -908,7 +1181,7 @@ struct AssetViewerScreen: View {
     }
 
     private func queueInformationDestination(_ destination: AssetInformationDestination) {
-        chromeVisible = true
+        setChromeVisible(true)
         if horizontalSizeClass == .regular {
             pendingInformationDestination = destination
             onMediaAtTopChanged(false)
@@ -919,6 +1192,20 @@ struct AssetViewerScreen: View {
             informationNavigationPath.append(destination)
             reportMediaAtTop()
         }
+    }
+
+    private func setChromeVisible(_ visible: Bool) {
+        guard chromeVisible != visible else { return }
+        chromeVisible = visible
+        onChromeVisibilityChanged(visible)
+    }
+
+    private func projectedAspectRatio(for asset: Asset) -> Double {
+        guard let projection = optimisticEdits[asset.id],
+              let image = UIImage(data: projection.imageData),
+              image.size.height > 0
+        else { return asset.ratio }
+        return Double(image.size.width / image.size.height)
     }
 
     private func openPendingInformationDestination() {
@@ -1537,8 +1824,8 @@ struct AssetViewerScreen: View {
     // MARK: - actions
 
     private func requestDismissal() {
-        // UIKit-owned viewers dedupe and track cancellation in their controller
-        // phase. Keeping this local latch set after a cancelled fluid zoom-out
+        // uikit-owned viewers dedupe and track cancellation in their controller
+        // phase. keeping this local latch set after a cancelled interactive close
         // would leave the restored viewer permanently unable to receive taps.
         if let onRequestDismissal {
             onRequestDismissal()
@@ -1993,6 +2280,9 @@ private struct AssetPager: View {
     let indexByID: [String: Int]
     @Binding var selection: String?
     let followsCompactScroll: Bool
+    let showsChrome: Bool
+    let topSafeAreaInset: CGFloat
+    let bottomSafeAreaInset: CGFloat
     let mutesVideo: Bool
     let playback: VideoPlayback
     let optimisticEdits: [String: AssetEditProjection]
@@ -2021,6 +2311,9 @@ private struct AssetPager: View {
         indexByID: [String: Int],
         selection: Binding<String?>,
         followsCompactScroll: Bool,
+        showsChrome: Bool,
+        topSafeAreaInset: CGFloat,
+        bottomSafeAreaInset: CGFloat,
         mutesVideo: Bool,
         playback: VideoPlayback,
         optimisticEdits: [String: AssetEditProjection],
@@ -2031,6 +2324,9 @@ private struct AssetPager: View {
         self.indexByID = indexByID
         _selection = selection
         self.followsCompactScroll = followsCompactScroll
+        self.showsChrome = showsChrome
+        self.topSafeAreaInset = topSafeAreaInset
+        self.bottomSafeAreaInset = bottomSafeAreaInset
         self.mutesVideo = mutesVideo
         self.playback = playback
         self.optimisticEdits = optimisticEdits
@@ -2051,6 +2347,7 @@ private struct AssetPager: View {
         ScrollView(.horizontal) {
             LazyHStack(spacing: 0) {
                 ForEach(assets) { asset in
+                    let presentationAspectRatio = projectedAspectRatio(for: asset)
                     AssetPage(
                         asset: asset,
                         isActive: asset.id == selection,
@@ -2065,8 +2362,12 @@ private struct AssetPager: View {
                     .containerRelativeFrame([.horizontal, .vertical])
                     .modifier(
                         AssetViewerMediaScrollEffect(
-                            isEnabled: followsCompactScroll,
-                            aspectRatio: projectedAspectRatio(for: asset)
+                            followsCompactScroll: followsCompactScroll,
+                            aspectRatio: presentationAspectRatio,
+                            showsChrome: showsChrome,
+                            topSafeAreaInset: topSafeAreaInset,
+                            bottomSafeAreaInset: bottomSafeAreaInset,
+                            reservesTransportControls: asset.isVideo || asset.isLivePhoto
                         )
                     )
                     .clipped()
@@ -2171,6 +2472,46 @@ private struct AssetPager: View {
 
 // MARK: - single page
 
+private struct AssetViewerLaunchMedia: View {
+    @Environment(SessionStore.self) private var session
+    let asset: Asset
+    let onReady: () -> Void
+    @State private var localUnavailable = false
+
+    private var deviceIdentifier: String? {
+        guard !localUnavailable else { return nil }
+        return asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
+    }
+
+    var body: some View {
+        AssetViewerFittedMedia(aspectRatio: asset.ratio) {
+            if let deviceIdentifier {
+                LocalPhotoImage(
+                    localIdentifier: deviceIdentifier,
+                    targetPixelSize: pagePixelSize,
+                    fallbackTargetPixelSize: 640,
+                    fallbackRequestContentMode: .aspectFit,
+                    loadsFallbackIfNeeded: true,
+                    requestContentMode: .aspectFit,
+                    contentMode: .fill,
+                    onUnavailable: { localUnavailable = true },
+                    onReady: onReady
+                )
+            } else if let client = session.client {
+                RemoteImage(
+                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash),
+                    targetPixelSize: pagePixelSize,
+                    thumbhash: asset.thumbhash,
+                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
+                    fallbackTargetPixelSize: 640,
+                    contentMode: .fill,
+                    onReady: onReady
+                )
+            }
+        }
+    }
+}
+
 private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
@@ -2216,9 +2557,15 @@ private struct AssetPage: View {
                 contentID: "\(asset.id)#edit-\(optimisticEdit.operationID)",
                 onZoomChanged: onZoomChanged
             ) {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+                AssetViewerFittedMedia(
+                    aspectRatio: image.size.height > 0
+                        ? Double(image.size.width / image.size.height)
+                        : asset.ratio
+                ) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                }
             }
         } else if asset.isVideo {
             VideoPlayerPage(
@@ -2243,13 +2590,17 @@ private struct AssetPage: View {
                 contentID: asset.id,
                 onZoomChanged: onZoomChanged
             ) {
-                LocalPhotoImage(
-                    localIdentifier: localId,
-                    targetPixelSize: pagePixelSize,
-                    fallbackTargetPixelSize: 640,
-                    contentMode: .fit,
-                    onUnavailable: { localUnavailable = true }
-                )
+                AssetViewerFittedMedia(aspectRatio: asset.ratio) {
+                    LocalPhotoImage(
+                        localIdentifier: localId,
+                        targetPixelSize: pagePixelSize,
+                        fallbackTargetPixelSize: 640,
+                        fallbackRequestContentMode: .aspectFit,
+                        requestContentMode: .aspectFit,
+                        contentMode: .fill,
+                        onUnavailable: { localUnavailable = true }
+                    )
+                }
             }
         } else if let client = session.client {
             // the thumbhash cache key re-renders the page when edits land.
@@ -2258,14 +2609,16 @@ private struct AssetPage: View {
                 contentID: "\(asset.id)#\(cacheKey ?? "")",
                 onZoomChanged: onZoomChanged
             ) {
-                RemoteImage(
-                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: cacheKey),
-                    targetPixelSize: pagePixelSize,
-                    thumbhash: asset.thumbhash,
-                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
-                    fallbackTargetPixelSize: 640,
-                    contentMode: .fit
-                )
+                AssetViewerFittedMedia(aspectRatio: asset.ratio) {
+                    RemoteImage(
+                        url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: cacheKey),
+                        targetPixelSize: pagePixelSize,
+                        thumbhash: asset.thumbhash,
+                        fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
+                        fallbackTargetPixelSize: 640,
+                        contentMode: .fill
+                    )
+                }
             }
         }
     }

@@ -45,9 +45,13 @@ nonisolated struct AssetViewerSelectionResolution: Equatable, Sendable {
 @Observable
 final class ViewerPresentation {
     var route: ViewerRoute?
-    private var activeID: UUID?
+    @ObservationIgnored private var activeID: UUID?
 
     var isTransitioning: Bool { activeID != nil }
+
+    func isActive(_ id: UUID) -> Bool {
+        activeID == id
+    }
 
     func makeRoute(
         assets: [Asset],

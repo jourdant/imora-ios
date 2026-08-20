@@ -31,6 +31,7 @@ struct LivePhotoPage: View {
         ) {
             MediaSurfaceStack(
                 assetID: asset.id,
+                aspectRatio: asset.ratio,
                 mode: .livePhoto,
                 posterLocalIdentifier: localIdentifier,
                 posterURL: posterURL,

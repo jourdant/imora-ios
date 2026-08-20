@@ -1,4 +1,5 @@
 import AVFoundation
+import Photos
 import SwiftUI
 
 /// the app's default ambient audio session is silenced by the ring switch.
@@ -406,6 +407,7 @@ struct VideoPlayerPage: View {
         ) {
             MediaSurfaceStack(
                 assetID: asset.id,
+                aspectRatio: asset.ratio,
                 mode: .video,
                 posterLocalIdentifier: deviceIdentifier,
                 posterURL: posterURL,
@@ -473,6 +475,7 @@ enum MediaSurfaceMode {
 /// changes, and the video surface has to appear without that.
 struct MediaSurfaceStack: View {
     let assetID: String
+    let aspectRatio: Double
     let mode: MediaSurfaceMode
     let posterLocalIdentifier: String?
     let posterURL: URL?
@@ -496,30 +499,33 @@ struct MediaSurfaceStack: View {
     }
 
     var body: some View {
-        ZStack {
-            if let posterLocalIdentifier {
-                LocalPhotoImage(
-                    localIdentifier: posterLocalIdentifier,
-                    targetPixelSize: pagePixelSize,
-                    fallbackTargetPixelSize: 640,
-                    contentMode: .fit,
-                    onUnavailable: { onPosterUnavailable?() }
-                )
-            } else if let posterURL {
-                RemoteImage(
-                    url: posterURL,
-                    targetPixelSize: pagePixelSize,
-                    thumbhash: thumbhash,
-                    fallbackURL: posterFallbackURL,
-                    fallbackTargetPixelSize: 640,
-                    contentMode: .fit
-                )
-            }
-            if showsVideo, let player = playback.player {
-                VideoPlayerSurface(player: player)
+        AssetViewerFittedMedia(aspectRatio: aspectRatio) {
+            ZStack {
+                if let posterLocalIdentifier {
+                    LocalPhotoImage(
+                        localIdentifier: posterLocalIdentifier,
+                        targetPixelSize: pagePixelSize,
+                        fallbackTargetPixelSize: 640,
+                        fallbackRequestContentMode: .aspectFit,
+                        requestContentMode: .aspectFit,
+                        contentMode: .fill,
+                        onUnavailable: { onPosterUnavailable?() }
+                    )
+                } else if let posterURL {
+                    RemoteImage(
+                        url: posterURL,
+                        targetPixelSize: pagePixelSize,
+                        thumbhash: thumbhash,
+                        fallbackURL: posterFallbackURL,
+                        fallbackTargetPixelSize: 640,
+                        contentMode: .fill
+                    )
+                }
+                if showsVideo, let player = playback.player {
+                    VideoPlayerSurface(player: player)
+                }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
     }
 }

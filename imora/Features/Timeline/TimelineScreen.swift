@@ -1352,30 +1352,30 @@ struct TimelineScreen<Header: View>: View {
             album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
             personID: filter.personId,
             willPresent: { route in beginViewerPresentation(route) },
+            didPresent: { id in finishViewerOpening(id) },
             didDismiss: { id in finishViewer(id) },
             onChange: { change in handleViewerChange(change) }
         )
     }
 
     private func beginViewerPresentation(_ route: ViewerRoute) -> Bool {
-        // Only one UIKit viewer can own Timeline suspension. Its completion
-        // clears this gate at the same point the native zoom gives back control.
-        guard viewer.activate(route, presentsCover: false) else { return false }
+        viewer.activate(
+            route,
+            presentsCover: false,
+            replacesSettlingPresentation: true
+        )
+    }
+
+    private func finishViewerOpening(_ id: UUID) {
+        guard viewer.isActive(id) else { return }
         model.suspendForViewer()
         hideScrubberForViewer()
-        return true
     }
 
     private func finishViewer(_ id: UUID) {
         viewer.complete(id)
-        Task {
-            // a short cushion past the zoom out, no more: the rebuild it used
-            // to guard against is debounced now, and the wait was long enough
-            // to be felt when reopening straight away.
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !viewer.isTransitioning else { return }
-            model.resumeAfterViewer()
-        }
+        guard !viewer.isTransitioning else { return }
+        model.resumeAfterViewer()
     }
 
     private func hideScrubberForViewer() {
@@ -1383,14 +1383,14 @@ struct TimelineScreen<Header: View>: View {
         indicatorHideTask = nil
         // a drag interrupted by the viewer never reaches its onEnded, so the
         // hold it took out is released here rather than left standing.
-        isScrubbingTiles = false
+        if isScrubbingTiles { isScrubbingTiles = false }
         model.resumeRebuilds()
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            scrub.endScrub()
-            scrub.indicatorVisible = false
-            scrub.indicatorGrabbable = false
+            if scrub.isScrubbing { scrub.endScrub() }
+            if scrub.indicatorVisible { scrub.indicatorVisible = false }
+            if scrub.indicatorGrabbable { scrub.indicatorGrabbable = false }
         }
     }
 
@@ -1929,10 +1929,13 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         let view = configuration.makeContentView()
         view.backgroundColor = .clear
         view.addInteraction(UIContextMenuInteraction(delegate: context.coordinator))
-        view.addGestureRecognizer(UITapGestureRecognizer(
+        let tap = UITapGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.tapped(_:))
-        ))
+        )
+        tap.cancelsTouchesInView = false
+        tap.delaysTouchesEnded = false
+        view.addGestureRecognizer(tap)
         context.coordinator.rendered = RenderedTile(asset: asset, showsBackupBadge: showsBackupBadge)
         context.coordinator.register(view, assetID: asset.id, in: registry)
         return view
@@ -1995,7 +1998,7 @@ private struct InteractiveAssetTile: UIViewRepresentable {
             }
             self.registry = registry
             registeredAssetID = assetID
-            registry.register(view, for: assetID)
+            registry.register(view, asset: host.asset, session: host.session)
         }
 
         func unregister(_ view: UIView) {
@@ -2007,9 +2010,10 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         @objc func tapped(_ recognizer: UITapGestureRecognizer) {
             guard let view = recognizer.view,
                   let bounds = view.window?.bounds.size,
-                  let presenter = presentationAnchor(for: view),
-                  let viewer = host.makeViewer(false, bounds)
+                  let presenter = presentationAnchor(for: view)
             else { return }
+            let viewer = host.makeViewer(false, bounds)
+            guard let viewer else { return }
             viewer.presentDirectly(from: presenter)
         }
 
@@ -2032,20 +2036,17 @@ private struct InteractiveAssetTile: UIViewRepresentable {
             animator: UIContextMenuInteractionCommitAnimating
         ) {
             guard let view = interaction.view,
+                  let bounds = view.window?.bounds.size,
                   let presenter = presentationAnchor(for: view),
-                  let viewer = animator.previewViewController as? AssetViewerHostingController,
-                  viewer.prepareForContextCommit()
+                  let viewer = host.makeViewer(false, bounds)
             else { return }
 
-            // `.pop` expands the preview that is already on screen. Once that
-            // animation releases it, install that exact controller with no
-            // second animation or delayed full-screen-cover presentation.
+            // `.pop` owns the visual expansion. its disposable preview is
+            // replaced by a prepared full viewer only after uikit releases it.
+            viewer.prepareViewerContentForContextCommit()
             animator.preferredCommitStyle = .pop
-            animator.addAnimations {
-                viewer.revealViewerForContextCommit()
-            }
             animator.addCompletion {
-                viewer.attachAfterContextCommit(to: presenter)
+                viewer.presentAfterContextCommit(from: presenter)
             }
         }
 
