@@ -2327,10 +2327,6 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
             hosted.view.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
         ])
 
-        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        scrollView.addGestureRecognizer(doubleTap)
-
         let coordinator = context.coordinator
         scrollView.onBoundsSizeChanged = { [weak scrollView] in
             guard let scrollView else { return }
@@ -2404,21 +2400,6 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
             onZoomChanged(isZoomed)
         }
 
-        @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-            guard let scrollView = gesture.view as? UIScrollView else { return }
-            if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
-                scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
-                return
-            }
-
-            let point = gesture.location(in: hostingController.view)
-            let size = CGSize(
-                width: scrollView.bounds.width / 2.5,
-                height: scrollView.bounds.height / 2.5
-            )
-            let origin = CGPoint(x: point.x - size.width / 2, y: point.y - size.height / 2)
-            scrollView.zoom(to: CGRect(origin: origin, size: size), animated: true)
-        }
     }
 }
 
