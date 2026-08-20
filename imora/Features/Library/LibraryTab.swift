@@ -8,13 +8,25 @@ struct LibraryTab: View {
     @State private var people: [Person] = []
     @State private var peopleTotal = 0
     @State private var isLoadingPeople = false
-    /// serializes the carousel quick actions per person.
+    @State private var path = NavigationPath()
+    /// serializes the preview quick actions per person.
     @State private var mutatingPersonIDs = Set<String>()
 
-    private static let carouselLimit = 16
+    private static let peopleColumns = [
+        GridItem(
+            .fixed(LibraryPeoplePreview.cellWidth),
+            spacing: LibraryPeoplePreview.gridSpacing,
+            alignment: .top
+        ),
+        GridItem(
+            .fixed(LibraryPeoplePreview.cellWidth),
+            spacing: LibraryPeoplePreview.gridSpacing,
+            alignment: .top
+        )
+    ]
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 Section {
                     NavigationLink(value: LibraryDestination.favorites) {
@@ -35,20 +47,10 @@ struct LibraryTab: View {
 
                 if !people.isEmpty && session.preferences?.peopleEnabled != false {
                     Section {
-                        peopleCarousel
-                            .listRowInsets(EdgeInsets())
-
-                        NavigationLink(value: LibraryDestination.people) {
-                            HStack {
-                                Label("All People", systemImage: "person.2")
-                                Spacer()
-                                if peopleTotal > 0 {
-                                    Text("\(peopleTotal)")
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .accessibilityIdentifier("library-all-people")
+                        peopleGrid
+                            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                     } header: {
                         Text("People")
                     }
@@ -102,58 +104,47 @@ struct LibraryTab: View {
         }
     }
 
-    // MARK: - people carousel
-
-    private var peopleCarousel: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(alignment: .top, spacing: 14) {
-                ForEach(people.prefix(Self.carouselLimit)) { person in
-                    NavigationLink(value: person) {
-                        VStack(spacing: 7) {
-                            PersonAvatar(person: person, targetPixelSize: 240)
-                                .frame(width: 76, height: 76)
-                            Text(person.name.isEmpty ? "Unnamed" : person.name)
-                                .font(.caption)
-                                .foregroundStyle(person.name.isEmpty ? .secondary : .primary)
-                                .lineLimit(1)
-                                .frame(width: 82)
-                        }
-                    }
-                    .buttonStyle(PressableCardStyle())
-                    .disabled(mutatingPersonIDs.contains(person.id))
-                    .accessibilityLabel(person.name.isEmpty ? "Unnamed person" : person.name)
-                    .contextMenu {
-                        carouselMenu(for: person)
-                    }
+    private var peopleGrid: some View {
+        LazyVGrid(columns: Self.peopleColumns, spacing: LibraryPeoplePreview.gridSpacing) {
+            ForEach(LibraryPeoplePreview.people(from: people)) { person in
+                Button {
+                    path.append(person)
+                } label: {
+                    LibraryPersonPreviewCell(person: person)
                 }
-
-                if peopleTotal > Self.carouselLimit || people.count > Self.carouselLimit {
-                    NavigationLink(value: LibraryDestination.people) {
-                        VStack(spacing: 7) {
-                            Circle()
-                                .fill(Color(.secondarySystemFill))
-                                .frame(width: 76, height: 76)
-                                .overlay {
-                                    Image(systemName: "chevron.right")
-                                        .font(.title3.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                }
-                            Text("View All")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 82)
-                        }
-                    }
-                    .buttonStyle(PressableCardStyle())
-                    .accessibilityIdentifier("library-people-view-all")
+                .buttonStyle(PressableCardStyle())
+                .disabled(mutatingPersonIDs.contains(person.id))
+                .accessibilityLabel(LibraryPeoplePreview.accessibilityLabel(for: person))
+                .contextMenu {
+                    previewMenu(for: person)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+
+            Button {
+                path.append(LibraryDestination.people)
+            } label: {
+                LibraryAllPeoplePreviewCell(total: peopleTotal)
+            }
+            .buttonStyle(PressableCardStyle())
+            .accessibilityLabel(allPeopleAccessibilityLabel)
+            .accessibilityIdentifier("library-all-people")
         }
+        .frame(width: LibraryPeoplePreview.gridWidth)
+        .padding(LibraryPeoplePreview.containerPadding)
+        .background(
+            Color(.secondarySystemGroupedBackground),
+            in: .rect(cornerRadius: LibraryPeoplePreview.containerCornerRadius)
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, LibraryPeoplePreview.verticalPadding)
     }
 
-    @ViewBuilder private func carouselMenu(for person: Person) -> some View {
+    private var allPeopleAccessibilityLabel: String {
+        let noun = peopleTotal == 1 ? "person" : "people"
+        return "See all \(peopleTotal) \(noun)"
+    }
+
+    @ViewBuilder private func previewMenu(for person: Person) -> some View {
         let isFavorite = person.isFavorite == true
 
         Button {
@@ -174,7 +165,7 @@ struct LibraryTab: View {
         isLoadingPeople = true
         defer { isLoadingPeople = false }
         let account = session.client?.offlineAccountKey
-        // the shared people cache paints the carousel instantly, offline
+        // the shared people cache paints the grid instantly, offline
         // included; the fetch below reconciles it.
         var cachedWasEmpty = true
         if people.isEmpty, let account {
