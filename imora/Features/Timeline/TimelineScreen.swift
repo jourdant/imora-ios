@@ -457,6 +457,7 @@ struct TimelineScreen<Header: View>: View {
     @State private var rowWindow = RowWindow()
     @State private var rowLayoutBox = RowLayoutBox()
     @State private var scrollPosition = ScrollPosition(edge: .top)
+    @State private var openingChromePrewarmOwner = UUID()
     @State private var pendingAlbumAssets: [String]?
     @State private var pendingEditAsset: Asset?
     @State private var preparedShare: PreparedAssetShare?
@@ -594,11 +595,39 @@ struct TimelineScreen<Header: View>: View {
                 )
             }
         }
+        prewarmOpeningChrome(in: rows, visibleRange: visible)
 
         let mountedLow = min(layout.index(at: top - rowWindowBuffer), count - 1)
         let mountedHigh = min(layout.index(at: top + context.viewportHeight + rowWindowBuffer), count - 1) + 1
         let mounted = mountedLow..<mountedHigh
         if mounted != rowWindow.range { rowWindow.range = mounted }
+    }
+
+    private func prewarmOpeningChrome(
+        in rows: [TimelineRow],
+        visibleRange: Range<Int>
+    ) {
+        guard scrollContext.isIdle,
+              !scrub.isScrubbing,
+              pinchBaseColumns == nil,
+              !isSelecting,
+              !isPicking,
+              !viewer.isTransitioning
+        else { return }
+        let center = CGFloat(visibleRange.lowerBound + visibleRange.upperBound - 1) / 2
+        let prioritizedIndices = visibleRange.sorted {
+            abs(CGFloat($0) - center) < abs(CGFloat($1) - center)
+        }
+        let assets = prioritizedIndices.flatMap { index -> [Asset] in
+            let row = rows[index]
+            guard case .tiles(_, let runs) = row else { return [] }
+            return runs.flatMap(\.assets)
+        }
+        AssetViewerOpeningChromeCache.shared.prewarm(
+            owner: openingChromePrewarmOwner,
+            assets: assets,
+            session: session
+        )
     }
 
     /// everything padded past the last row, which is only the selection bar's
@@ -722,10 +751,37 @@ struct TimelineScreen<Header: View>: View {
             .onScrollPhaseChange { _, newPhase in
                 scrollContext.isIdle = newPhase == .idle
                 if newPhase == .idle {
+                    updateRowWindow()
                     scheduleIndicatorHide()
                 } else {
+                    AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                        owner: openingChromePrewarmOwner
+                    )
                     showIndicator()
                 }
+            }
+            .onChange(of: viewer.isTransitioning) { _, isTransitioning in
+                if isTransitioning {
+                    AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                        owner: openingChromePrewarmOwner
+                    )
+                } else {
+                    updateRowWindow()
+                }
+            }
+            .onChange(of: isSelecting) { _, isSelecting in
+                if isSelecting {
+                    AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                        owner: openingChromePrewarmOwner
+                    )
+                } else {
+                    updateRowWindow()
+                }
+            }
+            .onDisappear {
+                AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                    owner: openingChromePrewarmOwner
+                )
             }
             // the scrollbar is the app's own everywhere, so anything that
             // scrolls at all gets one. gating it on a row count left short
@@ -749,6 +805,9 @@ struct TimelineScreen<Header: View>: View {
                         },
                         onScrubbingChanged: { scrubbing in
                             if scrubbing {
+                                AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                                    owner: openingChromePrewarmOwner
+                                )
                                 showIndicator()
                                 model.deferRebuilds()
                             } else {
@@ -775,6 +834,7 @@ struct TimelineScreen<Header: View>: View {
                             } else {
                                 withAnimation(.easeOut(duration: 0.15)) { apply() }
                             }
+                            if !scrubbing { updateRowWindow() }
                         }
                     )
                 }
@@ -1290,6 +1350,11 @@ struct TimelineScreen<Header: View>: View {
     private func pinchGesture(viewportWidth: CGFloat, viewportHeight: CGFloat) -> some Gesture {
         MagnifyGesture()
             .onChanged { value in
+                if pinchBaseColumns == nil {
+                    AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                        owner: openingChromePrewarmOwner
+                    )
+                }
                 let base = pinchBaseColumns ?? columnCount
                 pinchBaseColumns = base
                 // zooming in shows fewer, larger tiles.
@@ -1312,7 +1377,10 @@ struct TimelineScreen<Header: View>: View {
                     recordsUserPreference: true
                 )
             }
-            .onEnded { _ in pinchBaseColumns = nil }
+            .onEnded { _ in
+                pinchBaseColumns = nil
+                updateRowWindow()
+            }
     }
 
     // MARK: - selection
@@ -1349,6 +1417,9 @@ struct TimelineScreen<Header: View>: View {
             previewBounds: previewBounds,
             session: session,
             sourceRegistry: tileRegistry,
+            openingChromePresentation: startsAsContextPreview
+                ? nil
+                : AssetViewerOpeningChromePresentation(asset: asset, session: session),
             album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
             personID: filter.personId,
             willPresent: { route in beginViewerPresentation(route) },

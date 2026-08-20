@@ -20,6 +20,8 @@ nonisolated struct AssetViewerOpeningSwipeInteraction {
 }
 
 nonisolated enum AssetViewerOpeningChromeReveal {
+    static let initialBackdropOpacity: CGFloat = 0.02
+
     static func coverOpacity(isRevealed: Bool) -> CGFloat {
         isRevealed ? 0 : 1
     }

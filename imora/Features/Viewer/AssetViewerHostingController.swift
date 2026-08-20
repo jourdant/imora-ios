@@ -224,17 +224,20 @@ private final class AssetViewerSwipeDismissal {
     let zoomView: UIImageView?
     let mediaFrame: CGRect?
     let chromeSnapshot: AssetViewerChromeSnapshot?
+    let openingChromeOverlay: AssetViewerOpeningChromeOverlay?
 
     init(
         source: AssetViewerZoomSource? = nil,
         zoomView: UIImageView? = nil,
         mediaFrame: CGRect? = nil,
-        chromeSnapshot: AssetViewerChromeSnapshot? = nil
+        chromeSnapshot: AssetViewerChromeSnapshot? = nil,
+        openingChromeOverlay: AssetViewerOpeningChromeOverlay? = nil
     ) {
         self.source = source
         self.zoomView = zoomView
         self.mediaFrame = mediaFrame
         self.chromeSnapshot = chromeSnapshot
+        self.openingChromeOverlay = openingChromeOverlay
     }
 }
 
@@ -259,6 +262,7 @@ private final class AssetViewerDetachedDismissal {
     private let overlayView: UIView
     private let backdropView: UIView
     private let chromeSnapshot: AssetViewerChromeSnapshot?
+    private let openingChromeOverlay: AssetViewerOpeningChromeOverlay?
     private let zoomView: UIImageView?
     private let targetFrame: CGRect?
     private let source: AssetViewerZoomSource?
@@ -268,6 +272,7 @@ private final class AssetViewerDetachedDismissal {
         window: UIWindow,
         backdropAlpha: CGFloat,
         chromeSnapshot: AssetViewerChromeSnapshot?,
+        openingChromeOverlay: AssetViewerOpeningChromeOverlay?,
         contentAlpha: CGFloat,
         zoomView: UIImageView?,
         zoomFrame: CGRect?,
@@ -297,12 +302,23 @@ private final class AssetViewerDetachedDismissal {
         self.overlayView = overlayView
         self.backdropView = backdropView
         self.chromeSnapshot = chromeSnapshot
+        self.openingChromeOverlay = openingChromeOverlay
         self.zoomView = zoomView
         self.targetFrame = targetFrame
         self.source = source
         window.addSubview(overlayView)
         chromeSnapshot?.install(in: window)
         chromeSnapshot?.setAlpha(contentAlpha)
+        if let openingChromeOverlay {
+            let frame = openingChromeOverlay.superview.map {
+                window.convert(openingChromeOverlay.frame, from: $0)
+            } ?? openingChromeOverlay.frame
+            openingChromeOverlay.removeFromSuperview()
+            openingChromeOverlay.frame = frame
+            openingChromeOverlay.alpha = contentAlpha
+            openingChromeOverlay.isUserInteractionEnabled = false
+            window.addSubview(openingChromeOverlay)
+        }
     }
 
     func start(completion: @escaping (UUID) -> Void) {
@@ -314,6 +330,7 @@ private final class AssetViewerDetachedDismissal {
             guard let self else { return }
             self.backdropView.alpha = 0
             self.chromeSnapshot?.setAlpha(0)
+            self.openingChromeOverlay?.alpha = 0
             if let targetFrame = self.targetFrame {
                 self.zoomView?.frame = targetFrame
                 self.zoomView?.layer.cornerRadius = 0
@@ -327,6 +344,7 @@ private final class AssetViewerDetachedDismissal {
             guard let self else { return }
             self.source?.restore()
             self.chromeSnapshot?.restore()
+            self.openingChromeOverlay?.removeFromSuperview()
             self.overlayView.removeFromSuperview()
             self.animator = nil
             completion(self.id)
@@ -339,6 +357,7 @@ private final class AssetViewerDetachedDismissal {
         guard let animator else {
             source?.restore()
             chromeSnapshot?.restore()
+            openingChromeOverlay?.removeFromSuperview()
             overlayView.removeFromSuperview()
             return
         }
@@ -404,6 +423,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
         let animator: UIViewPropertyAnimator
         let zoomSource: AssetViewerZoomSource?
         let zoomView: UIImageView?
+        let openingChromeOverlay: AssetViewerOpeningChromeOverlay?
         switch operation {
         case .presentation:
             guard let prepared = preparePresentation(
@@ -413,6 +433,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
             animator = prepared.animator
             zoomSource = prepared.source
             zoomView = prepared.view
+            openingChromeOverlay = prepared.openingChrome
         case .dismissal:
             guard let prepared = prepareDismissal(
                 using: transitionContext,
@@ -421,6 +442,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
             animator = prepared.animator
             zoomSource = prepared.source
             zoomView = prepared.view
+            openingChromeOverlay = nil
         }
 
         animator.addCompletion { [weak self] _ in
@@ -447,6 +469,13 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
             } else {
                 zoomView?.removeFromSuperview()
             }
+            if self?.operation == .presentation, let openingChrome = openingChromeOverlay {
+                if completed {
+                    self?.controller?.holdOpeningChromeOverlay(openingChrome)
+                } else {
+                    openingChrome.removeFromSuperview()
+                }
+            }
             zoomSource?.restore()
             transitionContext.completeTransition(completed)
             self?.onCompletion?(completed)
@@ -460,7 +489,8 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
     private typealias PreparedTransition = (
         animator: UIViewPropertyAnimator,
         source: AssetViewerZoomSource?,
-        view: UIImageView?
+        view: UIImageView?,
+        openingChrome: AssetViewerOpeningChromeOverlay?
     )
 
     private func preparePresentation(
@@ -478,17 +508,22 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
         controller?.prepareViewerContentForPresentation()
         // views below this threshold stop receiving touches. keeping a nearly
         // invisible destination live lets back and swipe reverse immediately.
-        toView.alpha = 0.02
+        toView.alpha = AssetViewerOpeningChromeReveal.initialBackdropOpacity
+        let openingChrome = controller?.makeOpeningChromeOverlay(in: container)
 
         guard !UIAccessibility.isReduceMotionEnabled,
               let source = controller?.transitionZoomSource(in: container),
               let targetFrame = controller?.transitionMediaFrame(in: container)
         else {
             controller?.setTransitionMediaVisible(true)
+            if let openingChrome {
+                container.addSubview(openingChrome)
+            }
             let animator = UIViewPropertyAnimator(duration: duration, curve: .easeOut) {
                 toView.alpha = 1
+                openingChrome?.reveal()
             }
-            return (animator, nil, nil)
+            return (animator, nil, nil, openingChrome)
         }
 
         source.hide()
@@ -496,14 +531,18 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
         container.addSubview(zoomView)
         activePresentationZoomView = zoomView
         controller?.trackPresentationZoomView(zoomView)
+        if let openingChrome {
+            container.addSubview(openingChrome)
+        }
         let animator = UIViewPropertyAnimator(duration: duration, dampingRatio: 1) {
             toView.alpha = 1
             zoomView.frame = targetFrame
             zoomView.layer.cornerRadius = 0
+            openingChrome?.reveal()
         }
         animator.isInterruptible = true
         animator.isUserInteractionEnabled = true
-        return (animator, source, zoomView)
+        return (animator, source, zoomView, openingChrome)
     }
 
     private func prepareDismissal(
@@ -534,14 +573,14 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
                     )
                     .scaledBy(x: 0.94, y: 0.94)
                 }
-                return (animator, nil, zoomView)
+                return (animator, nil, zoomView, nil)
             }
             let animator = UIViewPropertyAnimator(duration: duration, dampingRatio: 1) {
                 fromView.alpha = 0
                 zoomView.frame = source.frame
                 zoomView.layer.cornerRadius = 0
             }
-            return (animator, source, zoomView)
+            return (animator, source, zoomView, nil)
         }
 
         guard !UIAccessibility.isReduceMotionEnabled,
@@ -563,7 +602,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
                 zoomView.frame = source.frame
                 zoomView.layer.cornerRadius = 0
             }
-            return (animator, source, zoomView)
+            return (animator, source, zoomView, nil)
         }
 
         guard let zoomView = controller?.makeDetachedTransitionZoomView(frame: mediaFrame) else {
@@ -580,7 +619,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
             )
             .scaledBy(x: 0.94, y: 0.94)
         }
-        return (animator, nil, zoomView)
+        return (animator, nil, zoomView, nil)
     }
 
     private func fallbackDismissal(
@@ -591,7 +630,7 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
         let animator = UIViewPropertyAnimator(duration: duration, curve: .easeOut) {
             fromView.alpha = 0
         }
-        return (animator, nil, nil)
+        return (animator, nil, nil, nil)
     }
 
     func animationEnded(_ transitionCompleted: Bool) {
@@ -1070,6 +1109,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     private let transitionDriver: AssetViewerTransitionDriver
     private let mediaFrameSources = AssetViewerMediaFrameSourceRegistry()
     private let session: SessionStore
+    private let openingChromePresentation: AssetViewerOpeningChromePresentation?
     private weak var sourceRegistry: AssetTileRegistry?
     private var preparedViewerRoot: AnyView?
     private var isViewerRootInstalled = false
@@ -1088,6 +1128,8 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     private var presentationZoomFallbackDeadline: CFTimeInterval = 0
     private var presentationMediaReady = false
     private var chromeTransitionDeadline: CFTimeInterval = 0
+    private var openingChromeOverlay: AssetViewerOpeningChromeOverlay?
+    private var openingChromeHandoffGeneration = 0
 
     init(
         route: ViewerRoute,
@@ -1095,6 +1137,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         previewBounds: CGSize,
         session: SessionStore,
         sourceRegistry: AssetTileRegistry,
+        openingChromePresentation: AssetViewerOpeningChromePresentation? = nil,
         album: AlbumContext?,
         personID: String?,
         willPresent: @escaping (ViewerRoute) -> Bool,
@@ -1117,6 +1160,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         self.dismissalRelay = relay
         self.transitionDriver = transitionDriver
         self.session = session
+        self.openingChromePresentation = openingChromePresentation
         self.sourceRegistry = sourceRegistry
 
         let root = AssetViewerHostRoot(
@@ -1219,6 +1263,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     func requestDismissal() {
         guard phase == .presenting || phase == .presented else { return }
         guard !dismissalRequested else { return }
+        if phase == .presented { completeOpeningChromeHandoff() }
         dismissalRequested = true
         if phase == .presenting {
             viewerRootInstallationTask?.cancel()
@@ -1386,6 +1431,27 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         view.layoutIfNeeded()
     }
 
+    fileprivate func makeOpeningChromeOverlay(
+        in container: UIView
+    ) -> AssetViewerOpeningChromeOverlay? {
+        guard let openingChromePresentation else { return nil }
+        return AssetViewerOpeningChromeCache.shared.take(
+            presentation: openingChromePresentation,
+            in: container,
+            onClose: { [weak self] in self?.requestDismissal() }
+        )
+    }
+
+    fileprivate func holdOpeningChromeOverlay(
+        _ overlay: AssetViewerOpeningChromeOverlay
+    ) {
+        guard overlay.superview != nil else { return }
+        openingChromeHandoffGeneration &+= 1
+        openingChromeOverlay?.removeFromSuperview()
+        openingChromeOverlay = overlay
+        overlay.prepareForHandoff()
+    }
+
     fileprivate func trackPresentationZoomView(_ zoomView: UIImageView) {
         activePresentationZoomView = zoomView
     }
@@ -1541,6 +1607,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         guard isReadyForSwipeDismissal,
               let container = presentationController?.containerView ?? view.superview
         else { return false }
+        openingChromeHandoffGeneration &+= 1
+        let openingChromeOverlay = openingChromeOverlay
+        openingChromeOverlay?.isUserInteractionEnabled = false
         removePresentationZoomView()
         suppressSourceInteraction()
         if !UIAccessibility.isReduceMotionEnabled,
@@ -1549,12 +1618,22 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             let zoomView = source?.makeZoomView(frame: mediaFrame, cornerRadius: 0)
                 ?? makeDetachedTransitionZoomView(frame: mediaFrame)
             guard let zoomView else {
-                swipeDismissal = AssetViewerSwipeDismissal()
+                let chromeHost: UIView = view.window ?? container
+                let chromeSnapshot = openingChromeOverlay == nil
+                    ? makeChromeSnapshot(in: chromeHost)
+                    : nil
+                chromeSnapshot?.install(in: chromeHost)
+                swipeDismissal = AssetViewerSwipeDismissal(
+                    chromeSnapshot: chromeSnapshot,
+                    openingChromeOverlay: openingChromeOverlay
+                )
                 return true
             }
             setTransitionMediaVisible(false)
             let chromeHost: UIView = view.window ?? container
-            let chromeSnapshot = makeChromeSnapshot(in: chromeHost)
+            let chromeSnapshot = openingChromeOverlay == nil
+                ? makeChromeSnapshot(in: chromeHost)
+                : nil
             source?.hide()
             container.addSubview(zoomView)
             if let chromeSnapshot {
@@ -1564,10 +1643,19 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
                 source: source,
                 zoomView: zoomView,
                 mediaFrame: mediaFrame,
-                chromeSnapshot: chromeSnapshot
+                chromeSnapshot: chromeSnapshot,
+                openingChromeOverlay: openingChromeOverlay
             )
         } else {
-            swipeDismissal = AssetViewerSwipeDismissal()
+            let chromeHost: UIView = view.window ?? container
+            let chromeSnapshot = openingChromeOverlay == nil
+                ? makeChromeSnapshot(in: chromeHost)
+                : nil
+            chromeSnapshot?.install(in: chromeHost)
+            swipeDismissal = AssetViewerSwipeDismissal(
+                chromeSnapshot: chromeSnapshot,
+                openingChromeOverlay: openingChromeOverlay
+            )
         }
         return true
     }
@@ -1577,6 +1665,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         let progress = min(1, max(0, progress))
         view.alpha = 1 - progress
         swipeDismissal.chromeSnapshot?.setAlpha(1 - progress)
+        swipeDismissal.openingChromeOverlay?.alpha = 1 - progress
         if let zoomView = swipeDismissal.zoomView,
            let mediaFrame = swipeDismissal.mediaFrame {
             let scale = 1 - progress * 0.12
@@ -1629,6 +1718,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             self.view.alpha = 1
             self.view.transform = .identity
             swipeDismissal.chromeSnapshot?.setAlpha(1)
+            swipeDismissal.openingChromeOverlay?.alpha = 1
             if let zoomView = swipeDismissal.zoomView,
                let returnFrame {
                 zoomView.frame = returnFrame
@@ -1643,6 +1733,8 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             swipeDismissal.zoomView?.removeFromSuperview()
             swipeDismissal.source?.restore()
             swipeDismissal.chromeSnapshot?.restore()
+            swipeDismissal.openingChromeOverlay?.isUserInteractionEnabled = true
+            self.completeOpeningChromeHandoff()
             self.swipeDismissal = nil
             self.swipeCancellationAnimator = nil
             self.restoreSourceInteraction()
@@ -1706,7 +1798,11 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         }
 
         let chromeSnapshot: AssetViewerChromeSnapshot?
-        if let swipeChromeSnapshot = swipe?.chromeSnapshot {
+        let openingChromeOverlay = swipe?.openingChromeOverlay
+        if openingChromeOverlay != nil {
+            self.openingChromeOverlay = nil
+            chromeSnapshot = nil
+        } else if let swipeChromeSnapshot = swipe?.chromeSnapshot {
             chromeSnapshot = swipeChromeSnapshot
         } else {
             setTransitionMediaVisible(false)
@@ -1716,6 +1812,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             window: window,
             backdropAlpha: view.alpha,
             chromeSnapshot: chromeSnapshot,
+            openingChromeOverlay: openingChromeOverlay,
             contentAlpha: view.alpha,
             zoomView: zoomView,
             zoomFrame: zoomFrame,
@@ -1725,7 +1822,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     }
 
     private func makeChromeSnapshot(in coordinateSpace: UIView) -> AssetViewerChromeSnapshot? {
-        AssetViewerChromeSnapshot(
+        return AssetViewerChromeSnapshot(
             chromeViews: viewerChromeViews(in: view),
             in: coordinateSpace
         )
@@ -1873,13 +1970,38 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             withTransaction(transaction) {
                 displayState.viewerChromeRevealed = true
             }
+            completeOpeningChromeHandoff()
             releasePresentationZoomViewWhenReady()
             return
         }
-        withAnimation(.easeOut(duration: duration)) {
+        openingChromeHandoffGeneration &+= 1
+        let handoffGeneration = openingChromeHandoffGeneration
+        withAnimation(
+            .easeOut(duration: duration),
+            completionCriteria: .removed
+        ) {
             displayState.viewerChromeRevealed = true
+        } completion: { [weak self] in
+            guard let self,
+                  self.openingChromeHandoffGeneration == handoffGeneration,
+                  self.swipeDismissal == nil
+            else { return }
+            self.completeOpeningChromeHandoff()
         }
         releasePresentationZoomViewWhenReady()
+    }
+
+    private func completeOpeningChromeHandoff() {
+        openingChromeHandoffGeneration &+= 1
+        guard openingChromeOverlay != nil else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            displayState.viewerChromeRevealed = true
+        }
+        view.layoutIfNeeded()
+        openingChromeOverlay?.removeFromSuperview()
+        openingChromeOverlay = nil
     }
 
     private func viewerChromeViews(in root: UIView) -> [UIView] {
@@ -1967,6 +2089,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         viewerRootInstallationTask = nil
         viewerContentActivationTask?.cancel()
         viewerContentActivationTask = nil
+        openingChromeHandoffGeneration &+= 1
+        openingChromeOverlay?.removeFromSuperview()
+        openingChromeOverlay = nil
         removePresentationZoomView()
         clearSwipeDismissal(revealsMedia: false)
         phase = .finished
@@ -1981,10 +2106,22 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     private func clearSwipeDismissal(revealsMedia: Bool) {
         swipeCancellationAnimator?.stopAnimation(true)
         swipeCancellationAnimator = nil
+        let swipeOpeningChrome = swipeDismissal?.openingChromeOverlay
         if revealsMedia { setTransitionMediaVisible(true) }
         swipeDismissal?.zoomView?.removeFromSuperview()
         swipeDismissal?.source?.restore()
         swipeDismissal?.chromeSnapshot?.restore()
+        if revealsMedia {
+            swipeOpeningChrome?.alpha = 1
+            swipeOpeningChrome?.isUserInteractionEnabled = true
+            completeOpeningChromeHandoff()
+        } else {
+            swipeOpeningChrome?.removeFromSuperview()
+            if let swipeOpeningChrome,
+               openingChromeOverlay === swipeOpeningChrome {
+                openingChromeOverlay = nil
+            }
+        }
         swipeDismissal = nil
         if isViewLoaded {
             view.alpha = 1

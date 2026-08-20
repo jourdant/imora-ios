@@ -11,18 +11,33 @@ struct MainTabView: View {
     }
 
     var body: some View {
-        TabView(selection: $selection) {
-            Tab("Photos", systemImage: "photo.on.rectangle.angled", value: TabKey.photos) {
-                TimelineTab()
-            }
-            Tab("Albums", systemImage: "rectangle.stack", value: TabKey.albums) {
-                AlbumsTab()
-            }
-            Tab("Library", systemImage: "books.vertical", value: TabKey.library) {
-                LibraryTab()
-            }
-            Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .search) {
-                SearchTab()
+        ZStack {
+            AssetViewerOpeningChromePrewarmer()
+                .ignoresSafeArea()
+                .background {
+                    VStack(spacing: 0) {
+                        Color.black.frame(height: 132)
+                        Spacer(minLength: 0)
+                        Color.black.frame(height: 112)
+                    }
+                    .ignoresSafeArea()
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+            TabView(selection: $selection) {
+                Tab("Photos", systemImage: "photo.on.rectangle.angled", value: TabKey.photos) {
+                    TimelineTab()
+                }
+                Tab("Albums", systemImage: "rectangle.stack", value: TabKey.albums) {
+                    AlbumsTab()
+                }
+                Tab("Library", systemImage: "books.vertical", value: TabKey.library) {
+                    LibraryTab()
+                }
+                Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .search) {
+                    SearchTab()
+                }
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
