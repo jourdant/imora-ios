@@ -107,10 +107,17 @@ struct RemoteImage: View {
 
             if ContinuousClock.now - start < .milliseconds(120) {
                 image = keyed
+                onReady?()
             } else {
-                withAnimation(.easeIn(duration: 0.15)) { image = keyed }
+                withAnimation(
+                    .easeIn(duration: 0.15),
+                    completionCriteria: .logicallyComplete
+                ) {
+                    image = keyed
+                } completion: {
+                    onReady?()
+                }
             }
-            onReady?()
         }
         // the smaller render of the same photo - the one the grid showed - is
         // usually a disk cache hit, so it paints the view while the full size
@@ -218,10 +225,17 @@ struct LocalPhotoImage: View {
             // fade so a late arrival never pops over the fallback.
             if ContinuousClock.now - start < .milliseconds(120) {
                 image = keyed
+                onReady?()
             } else {
-                withAnimation(.easeIn(duration: 0.15)) { image = keyed }
+                withAnimation(
+                    .easeIn(duration: 0.15),
+                    completionCriteria: .logicallyComplete
+                ) {
+                    image = keyed
+                } completion: {
+                    onReady?()
+                }
             }
-            onReady?()
         }
         .task(id: fallbackKey) {
             guard loadsFallbackIfNeeded,
