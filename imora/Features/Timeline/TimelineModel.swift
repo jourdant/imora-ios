@@ -1155,6 +1155,10 @@ final class TimelineModel {
         return String(format: "%04d-%02d-01", comps.year ?? 0, comps.month ?? 0)
     }
 
+    private static func dayIndex(for date: Date) -> Int {
+        Int((date.timeIntervalSince1970 / 86_400).rounded(.down))
+    }
+
     /// server sections with device-only assets woven in. server data stays
     /// untouched in `sections`; the merge is recomputed on every rebuild.
     private func mergedSections() -> [TimelineSection] {
@@ -1215,8 +1219,7 @@ final class TimelineModel {
 
         var localsByDay: [String: [Asset]] = [:]
         for asset in locals {
-            let comps = utcCalendar.dateComponents([.year, .month, .day], from: asset.localDate)
-            let key = "\(comps.year ?? 0)-\(comps.month ?? 0)-\(comps.day ?? 0)"
+            let key = String(dayIndex(for: asset.localDate))
             localsByDay[key, default: []].append(asset)
         }
 
@@ -1669,7 +1672,7 @@ final class TimelineModel {
             // are already shifted into utc space, where a day is exactly
             // 86400 seconds, and asking the calendar per asset was most of
             // what a bucket load cost.
-            let key = Int((local.timeIntervalSince1970 / 86_400).rounded(.down))
+            let key = dayIndex(for: local)
             if key != currentKey {
                 flush()
                 currentKey = key
