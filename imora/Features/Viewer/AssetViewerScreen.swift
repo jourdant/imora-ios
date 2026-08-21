@@ -142,9 +142,8 @@ private enum AssetViewerScrollEndpoint: Equatable {
     case information
 }
 
-/// Snaps only the initial reveal. Metadata below that point remains a normal
-/// continuous scroll, which avoids the relayout resets caused by view-aligned
-/// targets when asynchronously loaded details change the content height.
+/// preserves the first information stop when returning from deeper metadata.
+/// endpoint gestures use the explicit scroll-position animation instead.
 private nonisolated struct AssetInformationScrollTargetBehavior: ScrollTargetBehavior {
     /// the finger-down offset tracked by the scroll phase handler. the
     /// context's originalTarget is the landing target that was in flight when
@@ -156,13 +155,12 @@ private nonisolated struct AssetInformationScrollTargetBehavior: ScrollTargetBeh
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
         let layout = AssetViewerPageLayout(viewport: context.containerSize)
-        let settled = layout.settledOffset(
+        let landing = layout.nativeLandingOffset(
             startOffset: dragStartOffset,
-            proposedOffset: target.rect.minY,
-            velocity: context.velocity.dy
+            proposedOffset: target.rect.minY
         )
         let maximumOffset = max(0, context.contentSize.height - context.containerSize.height)
-        target.rect.origin.y = min(maximumOffset, max(0, settled))
+        target.rect.origin.y = min(maximumOffset, landing)
     }
 }
 
@@ -401,6 +399,7 @@ struct AssetViewerScreen: View {
     let onRequestDismissal: (() -> Void)?
     let onSelectionChanged: (String) -> Void
     let onPageZoomChanged: (Bool) -> Void
+    let onInteractiveMediaInteractionStarted: () -> Void
     let onChromeVisibilityChanged: (Bool) -> Void
     let onMediaFrameSourceChanged: (String, UIView, Double, Bool) -> Void
     /// Mirrors whether the information sheet is absent, so the zoom
@@ -414,12 +413,14 @@ struct AssetViewerScreen: View {
     let usesExternalBackdrop: Bool
     let mediaTopSafeAreaInset: CGFloat?
     let mediaBottomSafeAreaInset: CGFloat?
+    let openingMediaImage: UIImage?
     /// set when the grid behind is an album, which adds removal to the menu.
     let album: AlbumContext?
     /// set when the grid behind belongs to one person, which lets the photo on
     /// screen become their portrait.
     let personID: String?
     let onLaunchMediaReady: () -> Void
+    private let openingAssetID: String?
 
     @State private var assets: [Asset]
     /// id to index, rebuilt only when membership changes. every swipe used to
@@ -456,6 +457,9 @@ struct AssetViewerScreen: View {
     @State private var confirmationSource: ViewerConfirmationSource = .toolbar
     @State private var airPlayTrigger = 0
     @State private var currentPageZoomed = false
+    @State private var mediaPresentationZoomed = false
+    @State private var informationZoomHandoff = AssetViewerInformationZoomHandoff()
+    @State private var zoomCommandBridge: AssetViewerZoomCommandBridge
     /// device copy of the current asset, when the backup index proves one exists.
     @State private var localIdentifier: String?
     /// server copy of a still-open local asset after it has been backed up.
@@ -468,7 +472,7 @@ struct AssetViewerScreen: View {
     @State private var toast: String?
     @State private var isDismissing = false
     @State private var didNotifyDismissal = false
-    @State private var launchMediaVisible = true
+    @State private var launchMediaBridge: AssetViewerLaunchMediaBridge
     @State private var launchMediaReady = false
     @State private var interactiveMediaLaidOut = false
     @State private var prefetcher = ThumbnailPrefetcher(
@@ -489,12 +493,15 @@ struct AssetViewerScreen: View {
         usesExternalBackdrop: Bool = false,
         mediaTopSafeAreaInset: CGFloat? = nil,
         mediaBottomSafeAreaInset: CGFloat? = nil,
+        openingMediaImage: UIImage? = nil,
+        zoomCommandBridge: AssetViewerZoomCommandBridge? = nil,
         album: AlbumContext? = nil,
         personID: String? = nil,
         onRequestDismissal: (() -> Void)? = nil,
         onLaunchMediaReady: @escaping () -> Void = {},
         onSelectionChanged: @escaping (String) -> Void = { _ in },
         onPageZoomChanged: @escaping (Bool) -> Void = { _ in },
+        onInteractiveMediaInteractionStarted: @escaping () -> Void = {},
         onChromeVisibilityChanged: @escaping (Bool) -> Void = { _ in },
         onMediaFrameSourceChanged: @escaping (String, UIView, Double, Bool) -> Void = { _, _, _, _ in },
         onMediaAtTopChanged: @escaping (Bool) -> Void = { _ in },
@@ -515,13 +522,28 @@ struct AssetViewerScreen: View {
         self.usesExternalBackdrop = usesExternalBackdrop
         self.mediaTopSafeAreaInset = mediaTopSafeAreaInset
         self.mediaBottomSafeAreaInset = mediaBottomSafeAreaInset
-        _launchMediaVisible = State(initialValue: !loadsViewerContent)
+        self.openingMediaImage = openingMediaImage
+        _zoomCommandBridge = State(
+            initialValue: zoomCommandBridge ?? AssetViewerZoomCommandBridge()
+        )
+        openingAssetID = assets.indices.contains(safeIndex) ? assets[safeIndex].id : nil
+        _launchMediaBridge = State(
+            initialValue: AssetViewerLaunchMediaBridge(
+                isVisible: AssetViewerOpeningMediaHandoff.startsWithScrollCoupledPreview(
+                    loadsViewerContent: loadsViewerContent,
+                    usesExternalBackdrop: usesExternalBackdrop,
+                    isContextPreview: isContextPreview,
+                    hasOpeningImage: openingMediaImage != nil
+                )
+            )
+        )
         self.album = album
         self.personID = personID
         self.onRequestDismissal = onRequestDismissal
         self.onLaunchMediaReady = onLaunchMediaReady
         self.onSelectionChanged = onSelectionChanged
         self.onPageZoomChanged = onPageZoomChanged
+        self.onInteractiveMediaInteractionStarted = onInteractiveMediaInteractionStarted
         self.onChromeVisibilityChanged = onChromeVisibilityChanged
         self.onMediaFrameSourceChanged = onMediaFrameSourceChanged
         self.onMediaAtTopChanged = onMediaAtTopChanged
@@ -534,7 +556,7 @@ struct AssetViewerScreen: View {
     }
 
     private var mediaShowsChrome: Bool {
-        chromeVisible && !isContextPreview
+        chromePresentation.usesChromeMediaFrame
     }
 
     private var effectiveMediaTopSafeAreaInset: CGFloat {
@@ -643,9 +665,7 @@ struct AssetViewerScreen: View {
             }
             .toolbar { toolbarContent }
             .toolbarVisibility(
-                !isContextPreview && chromeVisible
-                    && (horizontalSizeClass != .regular || !showInfo)
-                    ? .visible : .hidden,
+                chromePresentation.showsNavigationBar ? .visible : .hidden,
                 for: .navigationBar
             )
             .toolbarVisibility(
@@ -702,18 +722,22 @@ struct AssetViewerScreen: View {
             if let selectedAssetID { onSelectionChanged(selectedAssetID) }
         }
         .onChange(of: selectedAssetID) { _, id in
+            cancelPendingInformationZoom()
             guard let id, let index = indexByAssetID[id] else { return }
             currentIndex = index
             currentPageZoomed = false
+            mediaPresentationZoomed = false
             onSelectionChanged(id)
             onPageZoomChanged(false)
         }
         .onDisappear {
+            cancelPendingInformationZoom()
             prefetcher.cancel()
             viewportRetargetTask?.cancel()
             guard !didNotifyDismissal else { return }
             didNotifyDismissal = true
             currentPageZoomed = false
+            mediaPresentationZoomed = false
             onPageZoomChanged(false)
             onDismissed()
         }
@@ -860,17 +884,26 @@ struct AssetViewerScreen: View {
             updateCompactEndpoint(endpoint)
         }
         .onScrollPhaseChange { oldPhase, phase, context in
+            let beginsInteraction = AssetViewerOpeningMediaHandoff.beginsCompactInteraction(
+                isTracking: phase == .tracking,
+                isInteracting: phase == .interacting,
+                previousWasTracking: oldPhase == .tracking
+            )
+            if beginsInteraction {
+                cancelPendingInformationZoom()
+                claimOpeningTransitionMedia()
+            }
             compactScrollIsActive = phase != .idle
             let liveLayout = AssetViewerPageLayout(viewport: context.geometry.containerSize)
             let offset = max(0, context.geometry.visibleRect.minY)
-            if phase == .tracking || (phase == .interacting && oldPhase != .tracking) {
+            if beginsInteraction {
                 compactDragStartOffset = offset
             }
             // a release inside the media-information transition is driven to
             // its endpoint with the information button's own animation, never
             // left to the slow native deceleration. the settle then happens at
             // that animation's idle.
-            if oldPhase == .interacting, phase != .tracking, !reduceMotion,
+            if oldPhase == .interacting, phase != .tracking,
                let target = liveLayout.directReleaseTarget(
                    startOffset: compactDragStartOffset,
                    releaseOffset: offset,
@@ -881,13 +914,26 @@ struct AssetViewerScreen: View {
             }
             guard phase == .idle else { return }
             let presentation = liveLayout.presentation(scrollOffset: offset)
+            if let canonicalOffset = liveLayout.canonicalEndpointOffset(
+                scrollOffset: offset
+            ) {
+                compactSettledOffset = canonicalOffset
+                showInfo = liveLayout.informationRevealOffset > 0
+                    && canonicalOffset == liveLayout.informationRevealOffset
+                if abs(canonicalOffset - offset) > AssetViewerPageLayout.scrollCommandTolerance {
+                    viewerScrollPosition.scrollTo(y: canonicalOffset)
+                }
+                return
+            }
             compactSettledOffset = presentation.scrollOffset
-            showInfo = presentation.informationProgress >= 0.5
             // a touch that catches a transition mid flight can rest the media
             // between endpoints where nothing else moves the scroll again, so
             // recover to the nearest endpoint.
             if !presentation.isMediaAtTop, !presentation.isShowingInformation {
-                scrollCompact(to: showInfo ? liveLayout.informationRevealOffset : 0)
+                let target = presentation.informationProgress >= 0.5
+                    ? liveLayout.informationRevealOffset
+                    : 0
+                scrollCompact(to: target)
             }
         }
     }
@@ -911,39 +957,40 @@ struct AssetViewerScreen: View {
                         mutesVideo: isContextPreview,
                         playback: playback,
                         optimisticEdits: optimisticEdits,
-                        editCacheKeys: editCacheKeys
+                        editCacheKeys: editCacheKeys,
+                        openingAssetID: openingAssetID,
+                        launchMediaBridge: launchMediaBridge,
+                        openingMediaImage: openingMediaImage,
+                        onLaunchMediaReady: {
+                            launchMediaReady = true
+                            onLaunchMediaReady()
+                        },
+                        allowsDoubleTapZoom: horizontalSizeClass == .regular
+                            || compactScrollEndpoint == .media,
+                        onMediaTap: handleMediaTap,
+                        onDoubleTapZoomChanged: handleDoubleTapZoomChange,
+                        onHorizontalInteractionStarted: handleHorizontalInteractionStarted,
+                        onZoomInteractionStarted: claimInteractiveMedia,
+                        onZoomPresentationChanged: { isZoomed in
+                            withAnimation(
+                                reduceMotion
+                                    ? .linear(duration: 0.12)
+                                    : .smooth(duration: 0.22)
+                            ) {
+                                mediaPresentationZoomed = isZoomed
+                            }
+                        }
                     ) { id, isZoomed in
                         guard id == selectedAssetID else { return }
-                        currentPageZoomed = isZoomed
-                        onPageZoomChanged(isZoomed)
+                        if isZoomed { claimInteractiveMedia() }
+                        setCurrentPageZoomed(isZoomed)
                     }
+                    .environment(zoomCommandBridge)
                     .onGeometryChange(for: Bool.self) { proxy in
                         proxy.size.width > 0 && proxy.size.height > 0
                     } action: { isLaidOut in
                         if isLaidOut { interactiveMediaLaidOut = true }
                     }
-                }
-
-                if launchMediaVisible, let current {
-                    AssetViewerLaunchMedia(
-                        asset: current,
-                        onReady: {
-                            launchMediaReady = true
-                            onLaunchMediaReady()
-                        }
-                    )
-                        .modifier(
-                            AssetViewerMediaScrollEffect(
-                                followsCompactScroll: followsCompactScroll,
-                                aspectRatio: current.ratio,
-                                showsChrome: mediaShowsChrome,
-                                topSafeAreaInset: effectiveMediaTopSafeAreaInset,
-                                bottomSafeAreaInset: effectiveMediaBottomSafeAreaInset,
-                                reservesTransportControls: current.isVideo || current.isLivePhoto
-                            )
-                        )
-                        .allowsHitTesting(false)
-                        .zIndex(1)
                 }
 
                 if let current {
@@ -971,18 +1018,6 @@ struct AssetViewerScreen: View {
             .opacity(transitionMediaVisible ? 1 : 0)
             .scrollEdgeEffectHidden(true, for: .top)
             .accessibilityIdentifier("asset-media")
-            .onTapGesture {
-                // photos closes an open information panel from a tap on the
-                // media before anything else.
-                if horizontalSizeClass != .regular,
-                   compactScrollEndpoint != .media {
-                    setInfoVisible(false)
-                    return
-                }
-                withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.22)) {
-                    setChromeVisible(!chromeVisible)
-                }
-            }
             .simultaneousGesture(
                 infoSwipeGesture,
                 isEnabled: horizontalSizeClass == .regular
@@ -1000,7 +1035,7 @@ struct AssetViewerScreen: View {
         }
         .task(id: loadsViewerContent && interactiveMediaLaidOut && launchMediaReady) {
             guard loadsViewerContent else {
-                launchMediaVisible = true
+                launchMediaBridge.isVisible = false
                 interactiveMediaLaidOut = false
                 return
             }
@@ -1009,7 +1044,7 @@ struct AssetViewerScreen: View {
             await Task.yield()
             guard !Task.isCancelled else { return }
             withAnimation(.linear(duration: 0.08)) {
-                launchMediaVisible = false
+                launchMediaBridge.isVisible = false
             }
         }
     }
@@ -1065,11 +1100,62 @@ struct AssetViewerScreen: View {
     }
 
     private func toggleInfo() {
-        if horizontalSizeClass == .regular {
-            setInfoVisible(!showInfo)
-        } else {
-            setInfoVisible(compactScrollEndpoint == .media)
+        var handoff = informationZoomHandoff
+        let effect = handoff.toggle(
+            assetID: selectedAssetID,
+            isInformationPresented: informationControlIsPresented,
+            isZoomed: currentPageZoomed
+        )
+        informationZoomHandoff = handoff
+        applyInformationZoomEffect(effect)
+    }
+
+    private func applyInformationZoomEffect(
+        _ effect: AssetViewerInformationZoomHandoff.Effect
+    ) {
+        switch effect {
+        case .none:
+            break
+        case .showInformation:
+            setInfoVisible(true)
+        case .hideInformation:
+            setInfoVisible(false)
+        case let .requestFit(request):
+            claimOpeningTransitionMedia()
+            let started = zoomCommandBridge.fitActivePage(
+                assetID: request.assetID
+            ) { completed in
+                completeInformationZoom(request, completed: completed)
+            }
+            if !started {
+                completeInformationZoom(request, completed: false)
+            }
         }
+    }
+
+    private func completeInformationZoom(
+        _ request: AssetViewerInformationZoomHandoff.Request,
+        completed: Bool
+    ) {
+        var handoff = informationZoomHandoff
+        let effect: AssetViewerInformationZoomHandoff.Effect
+        if completed {
+            effect = handoff.fitCompleted(
+                request,
+                selectedAssetID: selectedAssetID
+            )
+        } else {
+            handoff.fitCancelled(request)
+            effect = .none
+        }
+        informationZoomHandoff = handoff
+        applyInformationZoomEffect(effect)
+    }
+
+    private func cancelPendingInformationZoom() {
+        guard informationZoomHandoff.pendingRequest != nil else { return }
+        informationZoomHandoff.cancelPending()
+        zoomCommandBridge.cancelPendingFit()
     }
 
     private var informationControlIsPresented: Bool {
@@ -1080,6 +1166,7 @@ struct AssetViewerScreen: View {
 
     private func setInfoVisible(_ visible: Bool) {
         guard !visible || !currentPageZoomed else { return }
+        if visible { claimOpeningTransitionMedia() }
         if horizontalSizeClass == .regular {
             guard showInfo != visible else { return }
             showInfo = visible
@@ -1200,6 +1287,44 @@ struct AssetViewerScreen: View {
         onChromeVisibilityChanged(visible)
     }
 
+    private func handleMediaTap() {
+        if horizontalSizeClass != .regular,
+           compactScrollEndpoint != .media {
+            setInfoVisible(false)
+            return
+        }
+        withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.22)) {
+            setChromeVisible(!chromeVisible)
+        }
+    }
+
+    private func handleHorizontalInteractionStarted() {
+        cancelPendingInformationZoom()
+        claimOpeningTransitionMedia()
+    }
+
+    private func handleDoubleTapZoomChange(_ isZoomingIn: Bool) {
+        claimInteractiveMedia()
+        withAnimation(reduceMotion ? .linear(duration: 0.12) : .smooth(duration: 0.22)) {
+            mediaPresentationZoomed = isZoomingIn
+            setChromeVisible(!isZoomingIn)
+        }
+    }
+
+    private func setCurrentPageZoomed(_ isZoomed: Bool) {
+        guard currentPageZoomed != isZoomed else { return }
+        currentPageZoomed = isZoomed
+        onPageZoomChanged(isZoomed)
+    }
+
+    private func claimInteractiveMedia() {
+        claimOpeningTransitionMedia()
+    }
+
+    private func claimOpeningTransitionMedia() {
+        onInteractiveMediaInteractionStarted()
+    }
+
     private func projectedAspectRatio(for asset: Asset) -> Double {
         guard let projection = optimisticEdits[asset.id],
               let image = UIImage(data: projection.imageData),
@@ -1264,6 +1389,7 @@ struct AssetViewerScreen: View {
                 guard upwardDistance > 60,
                       upwardDistance > abs(value.translation.width)
                 else { return }
+                cancelPendingInformationZoom()
                 setInfoVisible(true)
             }
     }
@@ -1284,14 +1410,15 @@ struct AssetViewerScreen: View {
             isChromeVisible: chromeVisible,
             isContextPreview: isContextPreview,
             isPlayable: isPlayable,
-            isPlayerReady: isPlayerReady
+            isPlayerReady: isPlayerReady,
+            isMediaZoomed: mediaPresentationZoomed
         )
     }
 
     /// Native toolbar placements own Dynamic Island, status-bar and home-
     /// indicator clearance and supply the platform's standard hit targets.
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
-        if chromePresentation.showsTopToolbarItems {
+        if chromePresentation.mountsTopToolbarItems {
             ToolbarItem(placement: .topBarLeading) {
                 Button {
                     requestDismissal()
@@ -1824,6 +1951,7 @@ struct AssetViewerScreen: View {
     // MARK: - actions
 
     private func requestDismissal() {
+        cancelPendingInformationZoom()
         // uikit-owned viewers dedupe and track cancellation in their controller
         // phase. keeping this local latch set after a cancelled interactive close
         // would leave the restored viewer permanently unable to receive taps.
@@ -2287,6 +2415,16 @@ private struct AssetPager: View {
     let playback: VideoPlayback
     let optimisticEdits: [String: AssetEditProjection]
     let editCacheKeys: [String: String]
+    let openingAssetID: String?
+    let launchMediaBridge: AssetViewerLaunchMediaBridge
+    let openingMediaImage: UIImage?
+    let onLaunchMediaReady: () -> Void
+    let allowsDoubleTapZoom: Bool
+    let onMediaTap: () -> Void
+    let onDoubleTapZoomChanged: (Bool) -> Void
+    let onHorizontalInteractionStarted: () -> Void
+    let onZoomInteractionStarted: () -> Void
+    let onZoomPresentationChanged: (Bool) -> Void
     let onZoomChanged: (String, Bool) -> Void
     private let initialSelection: String?
 
@@ -2318,6 +2456,16 @@ private struct AssetPager: View {
         playback: VideoPlayback,
         optimisticEdits: [String: AssetEditProjection],
         editCacheKeys: [String: String],
+        openingAssetID: String?,
+        launchMediaBridge: AssetViewerLaunchMediaBridge,
+        openingMediaImage: UIImage?,
+        onLaunchMediaReady: @escaping () -> Void,
+        allowsDoubleTapZoom: Bool,
+        onMediaTap: @escaping () -> Void,
+        onDoubleTapZoomChanged: @escaping (Bool) -> Void,
+        onHorizontalInteractionStarted: @escaping () -> Void,
+        onZoomInteractionStarted: @escaping () -> Void,
+        onZoomPresentationChanged: @escaping (Bool) -> Void,
         onZoomChanged: @escaping (String, Bool) -> Void
     ) {
         self.assets = assets
@@ -2331,6 +2479,16 @@ private struct AssetPager: View {
         self.playback = playback
         self.optimisticEdits = optimisticEdits
         self.editCacheKeys = editCacheKeys
+        self.openingAssetID = openingAssetID
+        self.launchMediaBridge = launchMediaBridge
+        self.openingMediaImage = openingMediaImage
+        self.onLaunchMediaReady = onLaunchMediaReady
+        self.allowsDoubleTapZoom = allowsDoubleTapZoom
+        self.onMediaTap = onMediaTap
+        self.onDoubleTapZoomChanged = onDoubleTapZoomChanged
+        self.onHorizontalInteractionStarted = onHorizontalInteractionStarted
+        self.onZoomInteractionStarted = onZoomInteractionStarted
+        self.onZoomPresentationChanged = onZoomPresentationChanged
         self.onZoomChanged = onZoomChanged
         initialSelection = selection.wrappedValue
         if let initialSelection = selection.wrappedValue {
@@ -2355,7 +2513,23 @@ private struct AssetPager: View {
                         mutesVideo: mutesVideo,
                         playback: playback,
                         optimisticEdit: optimisticEdits[asset.id],
-                        editCacheKey: editCacheKeys[asset.id]
+                        editCacheKey: editCacheKeys[asset.id],
+                        ownsLaunchMedia: AssetViewerOpeningMediaHandoff.showsScrollCoupledPreview(
+                            isVisible: true,
+                            assetID: asset.id,
+                            openingAssetID: openingAssetID
+                        ),
+                        launchMediaBridge: launchMediaBridge,
+                        openingMediaImage: openingMediaImage,
+                        onMediaReady: {
+                            guard asset.id == openingAssetID else { return }
+                            onLaunchMediaReady()
+                        },
+                        allowsDoubleTapZoom: allowsDoubleTapZoom && asset.id == selection,
+                        onMediaTap: onMediaTap,
+                        onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                        onZoomInteractionStarted: onZoomInteractionStarted,
+                        onZoomPresentationChanged: onZoomPresentationChanged
                     ) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
@@ -2379,6 +2553,15 @@ private struct AssetPager: View {
         .scrollTargetBehavior(.paging)
         .scrollPosition($position, anchor: .center)
         .scrollIndicators(.hidden)
+        .onScrollPhaseChange { oldPhase, phase, _ in
+            if AssetViewerOpeningMediaHandoff.beginsCompactInteraction(
+                isTracking: phase == .tracking,
+                isInteracting: phase == .interacting,
+                previousWasTracking: oldPhase == .tracking
+            ) {
+                onHorizontalInteractionStarted()
+            }
+        }
         .onAppear {
             guard let initialSelection else {
                 initialPositionResolved = true
@@ -2472,42 +2655,47 @@ private struct AssetPager: View {
 
 // MARK: - single page
 
-private struct AssetViewerLaunchMedia: View {
-    @Environment(SessionStore.self) private var session
-    let asset: Asset
-    let onReady: () -> Void
-    @State private var localUnavailable = false
+@MainActor
+@Observable
+final class AssetViewerLaunchMediaBridge {
+    var isVisible: Bool
 
-    private var deviceIdentifier: String? {
-        guard !localUnavailable else { return nil }
-        return asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
+    init(isVisible: Bool) {
+        self.isVisible = isVisible
     }
+}
+
+struct AssetViewerLaunchMediaModifier: ViewModifier {
+    let asset: Asset
+    let openingImage: UIImage?
+    let ownsLaunchMedia: Bool
+    let bridge: AssetViewerLaunchMediaBridge
+
+    func body(content: Content) -> some View {
+        ZStack {
+            content
+            if ownsLaunchMedia, bridge.isVisible, let openingImage {
+                AssetViewerLaunchMedia(
+                    asset: asset,
+                    openingImage: openingImage
+                )
+                .allowsHitTesting(false)
+                .transition(.opacity)
+                .zIndex(1)
+            }
+        }
+    }
+}
+
+private struct AssetViewerLaunchMedia: View {
+    let asset: Asset
+    let openingImage: UIImage
 
     var body: some View {
         AssetViewerFittedMedia(aspectRatio: asset.ratio) {
-            if let deviceIdentifier {
-                LocalPhotoImage(
-                    localIdentifier: deviceIdentifier,
-                    targetPixelSize: pagePixelSize,
-                    fallbackTargetPixelSize: 640,
-                    fallbackRequestContentMode: .aspectFit,
-                    loadsFallbackIfNeeded: true,
-                    requestContentMode: .aspectFit,
-                    contentMode: .fill,
-                    onUnavailable: { localUnavailable = true },
-                    onReady: onReady
-                )
-            } else if let client = session.client {
-                RemoteImage(
-                    url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: asset.thumbhash),
-                    targetPixelSize: pagePixelSize,
-                    thumbhash: asset.thumbhash,
-                    fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
-                    fallbackTargetPixelSize: 640,
-                    contentMode: .fill,
-                    onReady: onReady
-                )
-            }
+            Image(uiImage: openingImage)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
         }
     }
 }
@@ -2524,6 +2712,15 @@ private struct AssetPage: View {
     let playback: VideoPlayback
     let optimisticEdit: AssetEditProjection?
     let editCacheKey: String?
+    let ownsLaunchMedia: Bool
+    let launchMediaBridge: AssetViewerLaunchMediaBridge
+    let openingMediaImage: UIImage?
+    let onMediaReady: () -> Void
+    let allowsDoubleTapZoom: Bool
+    let onMediaTap: () -> Void
+    let onDoubleTapZoomChanged: (Bool) -> Void
+    let onZoomInteractionStarted: () -> Void
+    let onZoomPresentationChanged: (Bool) -> Void
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -2554,7 +2751,14 @@ private struct AssetPage: View {
     @ViewBuilder private var pageContent: some View {
         if let optimisticEdit, let image = UIImage(data: optimisticEdit.imageData) {
             ZoomableScrollView(
+                assetID: asset.id,
                 contentID: "\(asset.id)#edit-\(optimisticEdit.operationID)",
+                isActivePage: isActive,
+                allowsDoubleTapZoom: allowsDoubleTapZoom,
+                onMediaTap: onMediaTap,
+                onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                onZoomInteractionStarted: onZoomInteractionStarted,
+                onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
                 AssetViewerFittedMedia(
@@ -2565,7 +2769,9 @@ private struct AssetPage: View {
                     Image(uiImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
+                        .onAppear(perform: onMediaReady)
                 }
+                .modifier(launchMediaModifier)
             }
         } else if asset.isVideo {
             VideoPlayerPage(
@@ -2574,6 +2780,15 @@ private struct AssetPage: View {
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
+                onMediaReady: onMediaReady,
+                ownsLaunchMedia: ownsLaunchMedia,
+                launchMediaBridge: launchMediaBridge,
+                openingMediaImage: openingMediaImage,
+                allowsDoubleTapZoom: allowsDoubleTapZoom,
+                onMediaTap: onMediaTap,
+                onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                onZoomInteractionStarted: onZoomInteractionStarted,
+                onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             )
         } else if asset.isLivePhoto {
@@ -2583,11 +2798,27 @@ private struct AssetPage: View {
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
+                onMediaReady: onMediaReady,
+                ownsLaunchMedia: ownsLaunchMedia,
+                launchMediaBridge: launchMediaBridge,
+                openingMediaImage: openingMediaImage,
+                allowsDoubleTapZoom: allowsDoubleTapZoom,
+                onMediaTap: onMediaTap,
+                onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                onZoomInteractionStarted: onZoomInteractionStarted,
+                onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             )
         } else if let localId = deviceIdentifier {
             ZoomableScrollView(
+                assetID: asset.id,
                 contentID: asset.id,
+                isActivePage: isActive,
+                allowsDoubleTapZoom: allowsDoubleTapZoom,
+                onMediaTap: onMediaTap,
+                onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                onZoomInteractionStarted: onZoomInteractionStarted,
+                onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
                 AssetViewerFittedMedia(aspectRatio: asset.ratio) {
@@ -2598,15 +2829,24 @@ private struct AssetPage: View {
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
                         contentMode: .fill,
-                        onUnavailable: { localUnavailable = true }
+                        onUnavailable: { localUnavailable = true },
+                        onReady: onMediaReady
                     )
                 }
+                .modifier(launchMediaModifier)
             }
         } else if let client = session.client {
             // the thumbhash cache key re-renders the page when edits land.
             let cacheKey = editCacheKey ?? asset.thumbhash
             ZoomableScrollView(
+                assetID: asset.id,
                 contentID: "\(asset.id)#\(cacheKey ?? "")",
+                isActivePage: isActive,
+                allowsDoubleTapZoom: allowsDoubleTapZoom,
+                onMediaTap: onMediaTap,
+                onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+                onZoomInteractionStarted: onZoomInteractionStarted,
+                onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
                 AssetViewerFittedMedia(aspectRatio: asset.ratio) {
@@ -2616,11 +2856,22 @@ private struct AssetPage: View {
                         thumbhash: asset.thumbhash,
                         fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
                         fallbackTargetPixelSize: 640,
-                        contentMode: .fill
+                        contentMode: .fill,
+                        onReady: onMediaReady
                     )
                 }
+                .modifier(launchMediaModifier)
             }
         }
+    }
+
+    private var launchMediaModifier: AssetViewerLaunchMediaModifier {
+        AssetViewerLaunchMediaModifier(
+            asset: asset,
+            openingImage: openingMediaImage,
+            ownsLaunchMedia: ownsLaunchMedia,
+            bridge: launchMediaBridge
+        )
     }
 }
 
@@ -2630,9 +2881,20 @@ private struct AssetPage: View {
 /// scroll view watches its own bounds and reports size changes to re-fit the
 /// asset. otherwise the stale zoom offset from the previous orientation
 /// survives until the page is remounted.
-private final class AssetZoomScrollView: UIScrollView {
+final class AssetZoomScrollView: UIScrollView {
     var onBoundsSizeChanged: (() -> Void)?
+    var onHierarchyChanged: (() -> Void)?
     private var lastBoundsSize = CGSize.zero
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        reportHierarchyChange()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        reportHierarchyChange()
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -2641,14 +2903,29 @@ private final class AssetZoomScrollView: UIScrollView {
         lastBoundsSize = bounds.size
         if hadValidSize { onBoundsSizeChanged?() }
     }
+
+    private func reportHierarchyChange() {
+        DispatchQueue.main.async { [weak self] in
+            self?.onHierarchyChanged?()
+        }
+    }
 }
 
 struct ZoomableScrollView<Content: View>: UIViewRepresentable {
+    @Environment(AssetViewerZoomCommandBridge.self) private var zoomCommandBridge
+
+    let assetID: String
     let contentID: String
+    let isActivePage: Bool
+    let allowsDoubleTapZoom: Bool
+    let onMediaTap: () -> Void
+    let onDoubleTapZoomChanged: (Bool) -> Void
+    let onZoomInteractionStarted: () -> Void
+    let onZoomPresentationChanged: (Bool) -> Void
     let onZoomChanged: (Bool) -> Void
     @ViewBuilder let content: Content
 
-    func makeUIView(context: Context) -> UIScrollView {
+    func makeUIView(context: Context) -> AssetZoomScrollView {
         let scrollView = AssetZoomScrollView()
         scrollView.delegate = context.coordinator
         scrollView.maximumZoomScale = 6
@@ -2681,15 +2958,35 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         ])
 
         let coordinator = context.coordinator
+        coordinator.scrollView = scrollView
+        coordinator.attachCommandBridge(zoomCommandBridge)
         scrollView.onBoundsSizeChanged = { [weak scrollView] in
             guard let scrollView else { return }
             coordinator.resetToFit(scrollView)
         }
+        scrollView.onHierarchyChanged = { [weak scrollView, weak coordinator] in
+            guard let scrollView, let coordinator else { return }
+            coordinator.attachGestureHub(from: scrollView)
+        }
         return scrollView
     }
 
-    func updateUIView(_ scrollView: UIScrollView, context: Context) {
+    func updateUIView(_ scrollView: AssetZoomScrollView, context: Context) {
+        let wasActivePage = context.coordinator.isActivePage
+        context.coordinator.zoomCommandAssetID = assetID
+        context.coordinator.isActivePage = isActivePage
+        context.coordinator.allowsDoubleTapZoom = allowsDoubleTapZoom
+        context.coordinator.onMediaTap = onMediaTap
+        context.coordinator.onDoubleTapZoomChanged = onDoubleTapZoomChanged
+        context.coordinator.onZoomInteractionStarted = onZoomInteractionStarted
+        context.coordinator.onZoomPresentationChanged = onZoomPresentationChanged
         context.coordinator.onZoomChanged = onZoomChanged
+        context.coordinator.attachCommandBridge(zoomCommandBridge)
+        if wasActivePage, !isActivePage {
+            context.coordinator.resetToFit(scrollView)
+        }
+        context.coordinator.updateGestureHubActivity()
+        context.coordinator.updateCommandBridgeActivity()
         guard context.coordinator.contentID != contentID else { return }
         context.coordinator.contentID = contentID
         context.coordinator.hostingController.rootView = content
@@ -2698,31 +2995,100 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         scrollView.panGestureRecognizer.isEnabled = false
     }
 
-    static func dismantleUIView(_ scrollView: UIScrollView, coordinator: Coordinator) {
+    static func dismantleUIView(_ scrollView: AssetZoomScrollView, coordinator: Coordinator) {
+        coordinator.resetToFit(scrollView)
         scrollView.delegate = nil
+        scrollView.onBoundsSizeChanged = nil
+        scrollView.onHierarchyChanged = nil
+        coordinator.detachGestureHub()
+        coordinator.detachCommandBridge()
+        coordinator.onMediaTap = {}
+        coordinator.onDoubleTapZoomChanged = { _ in }
+        coordinator.onZoomInteractionStarted = {}
+        coordinator.onZoomPresentationChanged = { _ in }
         coordinator.onZoomChanged = { _ in }
         coordinator.hostingController.view.removeFromSuperview()
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(contentID: contentID, content: content, onZoomChanged: onZoomChanged)
+        Coordinator(
+            contentID: contentID,
+            assetID: assetID,
+            content: content,
+            isActivePage: isActivePage,
+            allowsDoubleTapZoom: allowsDoubleTapZoom,
+            onMediaTap: onMediaTap,
+            onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+            onZoomInteractionStarted: onZoomInteractionStarted,
+            onZoomPresentationChanged: onZoomPresentationChanged,
+            onZoomChanged: onZoomChanged
+        )
     }
 
     @MainActor
-    final class Coordinator: NSObject, UIScrollViewDelegate {
+    final class Coordinator: NSObject,
+        UIScrollViewDelegate,
+        AssetViewerZoomGestureTarget,
+        AssetViewerZoomCommandTarget {
+        private struct PendingInformationFit {
+            let generation: Int
+            let contentID: String
+            let completion: (Bool) -> Void
+        }
+
         let hostingController: UIHostingController<Content>
         var contentID: String
+        var zoomCommandAssetID: String
+        var isActivePage: Bool
+        var allowsDoubleTapZoom: Bool
+        var onMediaTap: () -> Void
+        var onDoubleTapZoomChanged: (Bool) -> Void
+        var onZoomInteractionStarted: () -> Void
+        var onZoomPresentationChanged: (Bool) -> Void
         var onZoomChanged: (Bool) -> Void
+        weak var scrollView: UIScrollView?
+        private weak var gestureHub: AssetViewerZoomGestureHub?
+        private weak var commandBridge: AssetViewerZoomCommandBridge?
         private var lastReportedZoomed = false
+        private var doubleTapTargetZoomed = false
+        private var programmaticZoomTarget: AssetViewerDoubleTapZoom.Target?
+        private var hasAppliedProgrammaticZoom = false
+        private var isApplyingProgrammaticZoom = false
+        private var doubleTapActionGeneration = 0
+        private var hasScheduledDoubleTap = false
+        private var informationFitGeneration = 0
+        private var pendingInformationFit: PendingInformationFit?
 
-        init(contentID: String, content: Content, onZoomChanged: @escaping (Bool) -> Void) {
+        init(
+            contentID: String,
+            assetID: String,
+            content: Content,
+            isActivePage: Bool,
+            allowsDoubleTapZoom: Bool,
+            onMediaTap: @escaping () -> Void,
+            onDoubleTapZoomChanged: @escaping (Bool) -> Void,
+            onZoomInteractionStarted: @escaping () -> Void,
+            onZoomPresentationChanged: @escaping (Bool) -> Void,
+            onZoomChanged: @escaping (Bool) -> Void
+        ) {
             self.contentID = contentID
+            zoomCommandAssetID = assetID
             hostingController = UIHostingController(rootView: content)
+            self.isActivePage = isActivePage
+            self.allowsDoubleTapZoom = allowsDoubleTapZoom
+            self.onMediaTap = onMediaTap
+            self.onDoubleTapZoomChanged = onDoubleTapZoomChanged
+            self.onZoomInteractionStarted = onZoomInteractionStarted
+            self.onZoomPresentationChanged = onZoomPresentationChanged
             self.onZoomChanged = onZoomChanged
         }
 
         func resetZoomReporting() {
+            cancelInformationFit(reconcilesZoomState: false)
+            cancelPendingDoubleTap(reconcilesZoomState: false)
             lastReportedZoomed = false
+            doubleTapTargetZoomed = false
+            if isActivePage { onZoomPresentationChanged(false) }
             onZoomChanged(false)
         }
 
@@ -2731,13 +3097,16 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         /// sync; the offset still needs clearing since a min-zoom page never
         /// gets clamped by the scroll view itself while panning is disabled.
         func resetToFit(_ scrollView: UIScrollView) {
+            cancelInformationFit(reconcilesZoomState: false)
+            cancelPendingDoubleTap(reconcilesZoomState: false)
             if scrollView.zoomScale != scrollView.minimumZoomScale {
                 scrollView.setZoomScale(scrollView.minimumZoomScale, animated: false)
             }
             scrollView.contentOffset = .zero
             scrollView.panGestureRecognizer.isEnabled = false
-            guard lastReportedZoomed else { return }
+            doubleTapTargetZoomed = false
             lastReportedZoomed = false
+            if isActivePage { onZoomPresentationChanged(false) }
             onZoomChanged(false)
         }
 
@@ -2746,11 +3115,344 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         }
 
         func scrollViewDidZoom(_ scrollView: UIScrollView) {
-            let isZoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+            let isZoomed = isZoomed(scrollView)
             scrollView.panGestureRecognizer.isEnabled = isZoomed
+                && pendingInformationFit == nil
+            if pendingInformationFit != nil { return }
+            if let programmaticZoomTarget {
+                if hasAppliedProgrammaticZoom,
+                   hasReached(programmaticZoomTarget, in: scrollView) {
+                    self.programmaticZoomTarget = nil
+                    hasAppliedProgrammaticZoom = false
+                }
+            } else if isZoomed != doubleTapTargetZoomed {
+                doubleTapTargetZoomed = isZoomed
+                if isActivePage { onZoomPresentationChanged(isZoomed) }
+            }
             guard isZoomed != lastReportedZoomed else { return }
             lastReportedZoomed = isZoomed
             onZoomChanged(isZoomed)
+        }
+
+        func scrollViewDidEndZooming(
+            _ scrollView: UIScrollView,
+            with view: UIView?,
+            atScale scale: CGFloat
+        ) {
+            guard pendingInformationFit != nil else { return }
+            switch AssetViewerInformationFitEnd.resolution(
+                isApplyingProgrammaticZoom: isApplyingProgrammaticZoom,
+                isZoomAnimating: scrollView.isZoomAnimating,
+                isZoomed: isZoomed(scrollView)
+            ) {
+            case .ignore:
+                break
+            case .cancel:
+                cancelInformationFit(reconcilesZoomState: true)
+            case .complete:
+                finishInformationFit(in: scrollView)
+            }
+        }
+
+        func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+            guard let pinchGesture = scrollView.pinchGestureRecognizer else { return }
+            let pinchIsActive = pinchGesture.state == .began || pinchGesture.state == .changed
+            if AssetViewerOpeningMediaHandoff.claimsPreviewForPinch(
+                isActivePage: isActivePage,
+                isApplyingProgrammaticZoom: isApplyingProgrammaticZoom,
+                pinchIsActive: pinchIsActive
+            ) {
+                onZoomInteractionStarted()
+            }
+            guard !isApplyingProgrammaticZoom, pinchIsActive else { return }
+            let hadInformationFit = pendingInformationFit != nil
+            let hadProgrammaticZoom = hasScheduledDoubleTap || programmaticZoomTarget != nil
+            if hadInformationFit {
+                cancelInformationFit(reconcilesZoomState: false)
+            }
+            cancelPendingDoubleTap(reconcilesZoomState: false)
+            let isZoomed = isZoomed(scrollView)
+            doubleTapTargetZoomed = isZoomed
+            lastReportedZoomed = isZoomed
+            if isActivePage {
+                if hadInformationFit {
+                    onZoomPresentationChanged(isZoomed)
+                } else if hadProgrammaticZoom {
+                    onDoubleTapZoomChanged(isZoomed)
+                } else {
+                    onZoomPresentationChanged(isZoomed)
+                }
+            }
+            onZoomChanged(isZoomed)
+        }
+
+        func attachGestureHub(from scrollView: UIScrollView) {
+            guard scrollView.window != nil,
+                  let pagerScrollView = enclosingPagerScrollView(from: scrollView)
+            else {
+                detachGestureHub()
+                return
+            }
+            let hub = AssetViewerZoomGestureHub.attached(to: pagerScrollView)
+            if gestureHub !== hub {
+                detachGestureHub()
+                gestureHub = hub
+            }
+            hub.setActive(self, isActive: isActivePage)
+        }
+
+        func detachGestureHub() {
+            cancelPendingDoubleTap()
+            gestureHub?.setActive(self, isActive: false)
+            gestureHub = nil
+        }
+
+        func updateGestureHubActivity() {
+            if !isActivePage { cancelPendingDoubleTap() }
+            gestureHub?.setActive(self, isActive: isActivePage)
+        }
+
+        func attachCommandBridge(_ bridge: AssetViewerZoomCommandBridge) {
+            guard commandBridge !== bridge else { return }
+            detachCommandBridge()
+            commandBridge = bridge
+            bridge.setActive(self, isActive: isActivePage)
+        }
+
+        func detachCommandBridge() {
+            cancelInformationFit(reconcilesZoomState: false)
+            commandBridge?.setActive(self, isActive: false)
+            commandBridge = nil
+        }
+
+        func updateCommandBridgeActivity() {
+            if !isActivePage {
+                cancelInformationFit(reconcilesZoomState: false)
+            }
+            commandBridge?.setActive(self, isActive: isActivePage)
+        }
+
+        func routeMediaTap() {
+            onMediaTap()
+        }
+
+        func routeDoubleTap(at point: CGPoint, from view: UIView) {
+            guard allowsDoubleTapZoom else { return }
+            performDoubleTap(at: hostingController.view.convert(point, from: view))
+        }
+
+        @discardableResult
+        func routeZoomToFit(completion: @escaping (Bool) -> Void) -> Bool {
+            guard isActivePage, let scrollView else { return false }
+            cancelInformationFit(reconcilesZoomState: false)
+            cancelPendingDoubleTap(reconcilesZoomState: false)
+
+            informationFitGeneration &+= 1
+            pendingInformationFit = PendingInformationFit(
+                generation: informationFitGeneration,
+                contentID: contentID,
+                completion: completion
+            )
+            doubleTapTargetZoomed = false
+            lastReportedZoomed = false
+            scrollView.panGestureRecognizer.isEnabled = false
+            onZoomPresentationChanged(false)
+            onZoomChanged(false)
+
+            guard isZoomed(scrollView) else {
+                finishInformationFit(in: scrollView)
+                return true
+            }
+
+            let animated = !UIAccessibility.isReduceMotionEnabled
+            isApplyingProgrammaticZoom = true
+            scrollView.setZoomScale(scrollView.minimumZoomScale, animated: animated)
+            isApplyingProgrammaticZoom = false
+            if !animated || !scrollView.isZoomAnimating {
+                finishInformationFit(in: scrollView)
+            }
+            return true
+        }
+
+        func cancelRoutedZoomToFit() {
+            guard pendingInformationFit != nil else { return }
+            if let scrollView {
+                isApplyingProgrammaticZoom = true
+                scrollView.setZoomScale(scrollView.minimumZoomScale, animated: false)
+                isApplyingProgrammaticZoom = false
+                scrollView.contentOffset = .zero
+                scrollView.panGestureRecognizer.isEnabled = false
+            }
+            cancelInformationFit(reconcilesZoomState: true)
+        }
+
+        private func enclosingPagerScrollView(from scrollView: UIScrollView) -> UIScrollView? {
+            var ancestor = scrollView.superview
+            while let view = ancestor {
+                if let pagerScrollView = view as? UIScrollView {
+                    return pagerScrollView
+                }
+                ancestor = view.superview
+            }
+            return nil
+        }
+
+        private func performDoubleTap(at point: CGPoint) {
+            guard let scrollView else { return }
+            cancelInformationFit(reconcilesZoomState: true)
+            let zoomsIn = !doubleTapTargetZoomed
+            let interactionScale = zoomsIn
+                ? scrollView.minimumZoomScale
+                : max(
+                    scrollView.zoomScale,
+                    scrollView.minimumZoomScale + AssetViewerDoubleTapZoom.fitTolerance * 2
+                )
+            let target = AssetViewerDoubleTapZoom.target(
+                currentScale: interactionScale,
+                minimumScale: scrollView.minimumZoomScale,
+                maximumScale: scrollView.maximumZoomScale,
+                viewport: scrollView.bounds.size,
+                tap: point
+            )
+            programmaticZoomTarget = target
+            hasAppliedProgrammaticZoom = false
+            switch target {
+            case let .fit(scale):
+                doubleTapTargetZoomed = false
+                onDoubleTapZoomChanged(false)
+                scheduleDoubleTap(.fit(scale: scale), in: scrollView)
+            case let .zoom(rect):
+                doubleTapTargetZoomed = true
+                onDoubleTapZoomChanged(true)
+                scheduleDoubleTap(.zoom(rect: rect), in: scrollView)
+            }
+        }
+
+        private func scheduleDoubleTap(
+            _ target: AssetViewerDoubleTapZoom.Target,
+            in scrollView: UIScrollView
+        ) {
+            doubleTapActionGeneration &+= 1
+            let generation = doubleTapActionGeneration
+            let expectedContentID = contentID
+            hasScheduledDoubleTap = true
+            DispatchQueue.main.async { [weak self, weak scrollView] in
+                guard let self,
+                      self.doubleTapActionGeneration == generation
+                else { return }
+                self.hasScheduledDoubleTap = false
+                guard let scrollView,
+                      self.contentID == expectedContentID,
+                      self.isActivePage,
+                      self.scrollView === scrollView
+                else {
+                    self.reconcileDoubleTapState()
+                    return
+                }
+                let animated = !UIAccessibility.isReduceMotionEnabled
+                self.hasAppliedProgrammaticZoom = true
+                self.isApplyingProgrammaticZoom = true
+                defer { self.isApplyingProgrammaticZoom = false }
+                switch target {
+                case let .fit(scale):
+                    scrollView.setZoomScale(scale, animated: animated)
+                case let .zoom(rect):
+                    scrollView.zoom(to: rect, animated: animated)
+                }
+                if self.doubleTapActionGeneration == generation,
+                   self.programmaticZoomTarget == target,
+                   self.hasReached(target, in: scrollView) {
+                    self.programmaticZoomTarget = nil
+                    self.hasAppliedProgrammaticZoom = false
+                }
+            }
+        }
+
+        private func cancelPendingDoubleTap(reconcilesZoomState: Bool = true) {
+            let hadProgrammaticZoom = hasScheduledDoubleTap || programmaticZoomTarget != nil
+            doubleTapActionGeneration &+= 1
+            hasScheduledDoubleTap = false
+            programmaticZoomTarget = nil
+            hasAppliedProgrammaticZoom = false
+            if reconcilesZoomState, hadProgrammaticZoom {
+                reconcileDoubleTapState()
+            }
+        }
+
+        private func finishInformationFit(in scrollView: UIScrollView) {
+            guard let pendingInformationFit,
+                  pendingInformationFit.generation == informationFitGeneration,
+                  pendingInformationFit.contentID == contentID,
+                  isActivePage,
+                  self.scrollView === scrollView,
+                  !isZoomed(scrollView)
+            else {
+                cancelInformationFit(reconcilesZoomState: true)
+                return
+            }
+
+            self.pendingInformationFit = nil
+            informationFitGeneration &+= 1
+            scrollView.contentOffset = .zero
+            scrollView.panGestureRecognizer.isEnabled = false
+            doubleTapTargetZoomed = false
+            lastReportedZoomed = false
+            onZoomPresentationChanged(false)
+            onZoomChanged(false)
+            pendingInformationFit.completion(true)
+        }
+
+        @discardableResult
+        private func cancelInformationFit(
+            reconcilesZoomState: Bool
+        ) -> Bool {
+            guard let pendingInformationFit else { return false }
+            self.pendingInformationFit = nil
+            informationFitGeneration &+= 1
+
+            if reconcilesZoomState, let scrollView {
+                let isZoomed = isZoomed(scrollView)
+                doubleTapTargetZoomed = isZoomed
+                lastReportedZoomed = isZoomed
+                if isActivePage { onZoomPresentationChanged(isZoomed) }
+                onZoomChanged(isZoomed)
+            }
+            pendingInformationFit.completion(false)
+            return true
+        }
+
+        private func reconcileDoubleTapState() {
+            guard let scrollView else { return }
+            let isZoomed = isZoomed(scrollView)
+            programmaticZoomTarget = nil
+            hasAppliedProgrammaticZoom = false
+            doubleTapTargetZoomed = isZoomed
+            if isActivePage { onDoubleTapZoomChanged(isZoomed) }
+            onZoomChanged(isZoomed)
+        }
+
+        private func isZoomed(_ scrollView: UIScrollView) -> Bool {
+            scrollView.zoomScale
+                > scrollView.minimumZoomScale + AssetViewerDoubleTapZoom.fitTolerance
+        }
+
+        private func hasReached(
+            _ target: AssetViewerDoubleTapZoom.Target,
+            in scrollView: UIScrollView
+        ) -> Bool {
+            let targetScale: CGFloat
+            switch target {
+            case let .fit(scale):
+                targetScale = scale
+            case let .zoom(rect):
+                guard rect.width > 0, rect.height > 0 else { return true }
+                targetScale = min(
+                    scrollView.bounds.width / rect.width,
+                    scrollView.bounds.height / rect.height
+                )
+            }
+            return abs(scrollView.zoomScale - targetScale)
+                <= AssetViewerDoubleTapZoom.fitTolerance
         }
 
     }

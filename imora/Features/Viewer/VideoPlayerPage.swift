@@ -398,22 +398,56 @@ struct VideoPlayerPage: View {
     let isActive: Bool
     let forcesMute: Bool
     let playback: VideoPlayback
+    let onMediaReady: () -> Void
+    let ownsLaunchMedia: Bool
+    let launchMediaBridge: AssetViewerLaunchMediaBridge
+    let openingMediaImage: UIImage?
+    let allowsDoubleTapZoom: Bool
+    let onMediaTap: () -> Void
+    let onDoubleTapZoomChanged: (Bool) -> Void
+    let onZoomInteractionStarted: () -> Void
+    let onZoomPresentationChanged: (Bool) -> Void
     let onZoomChanged: (Bool) -> Void
+
+    @State private var localUnavailable = false
+
+    private var posterLocalIdentifier: String? {
+        localUnavailable ? nil : deviceIdentifier
+    }
 
     var body: some View {
         ZoomableScrollView(
-            contentID: asset.id,
+            assetID: asset.id,
+            contentID: "\(asset.id)#\(posterLocalIdentifier ?? "remote")",
+            isActivePage: isActive,
+            allowsDoubleTapZoom: allowsDoubleTapZoom,
+            onMediaTap: onMediaTap,
+            onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+            onZoomInteractionStarted: onZoomInteractionStarted,
+            onZoomPresentationChanged: onZoomPresentationChanged,
             onZoomChanged: onZoomChanged
         ) {
             MediaSurfaceStack(
                 assetID: asset.id,
                 aspectRatio: asset.ratio,
                 mode: .video,
-                posterLocalIdentifier: deviceIdentifier,
+                posterLocalIdentifier: posterLocalIdentifier,
                 posterURL: posterURL,
                 posterFallbackURL: posterFallbackURL,
                 thumbhash: asset.thumbhash,
-                playback: playback
+                playback: playback,
+                onPosterReady: onMediaReady,
+                onPosterUnavailable: {
+                    localUnavailable = true
+                }
+            )
+            .modifier(
+                AssetViewerLaunchMediaModifier(
+                    asset: asset,
+                    openingImage: openingMediaImage,
+                    ownsLaunchMedia: ownsLaunchMedia,
+                    bridge: launchMediaBridge
+                )
             )
         }
         .task(id: "\(asset.id):\(isActive):\(forcesMute)") {
@@ -482,6 +516,7 @@ struct MediaSurfaceStack: View {
     let posterFallbackURL: URL?
     let thumbhash: String?
     let playback: VideoPlayback
+    var onPosterReady: (() -> Void)?
     /// only a live photo needs this: its still is the asset, so losing the
     /// device copy would leave an empty page rather than a stale poster.
     var onPosterUnavailable: (() -> Void)?
@@ -509,7 +544,8 @@ struct MediaSurfaceStack: View {
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
                         contentMode: .fill,
-                        onUnavailable: { onPosterUnavailable?() }
+                        onUnavailable: { onPosterUnavailable?() },
+                        onReady: { onPosterReady?() }
                     )
                 } else if let posterURL {
                     RemoteImage(
@@ -518,11 +554,15 @@ struct MediaSurfaceStack: View {
                         thumbhash: thumbhash,
                         fallbackURL: posterFallbackURL,
                         fallbackTargetPixelSize: 640,
-                        contentMode: .fill
+                        contentMode: .fill,
+                        onReady: { onPosterReady?() }
                     )
                 }
                 if showsVideo, let player = playback.player {
-                    VideoPlayerSurface(player: player)
+                    VideoPlayerSurface(
+                        player: player,
+                        onReady: { onPosterReady?() }
+                    )
                 }
             }
         }
@@ -534,25 +574,92 @@ struct MediaSurfaceStack: View {
 /// ready, then fades over the poster rather than popping in mid-render.
 struct VideoPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
+    let onReady: () -> Void
 
     final class LayerView: UIView {
         override static var layerClass: AnyClass { AVPlayerLayer.self }
 
         private var readyObservation: NSKeyValueObservation?
+        private var hasReportedReady = false
+        private var hasScheduledReadyReport = false
+        private var isFadingIn = false
+        private var onReady: () -> Void = {}
 
-        func fadeInOnFirstFrame() {
-            guard let playerLayer = layer as? AVPlayerLayer,
-                  !playerLayer.isReadyForDisplay
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil,
+                  !isFadingIn,
+                  let playerLayer = layer as? AVPlayerLayer,
+                  playerLayer.isReadyForDisplay
             else { return }
+            scheduleReadyReport(for: playerLayer)
+        }
+
+        func configure(player: AVPlayer, onReady: @escaping () -> Void) {
+            guard let playerLayer = layer as? AVPlayerLayer else { return }
+            self.onReady = onReady
+            if playerLayer.player !== player {
+                readyObservation = nil
+                hasReportedReady = false
+                hasScheduledReadyReport = false
+                isFadingIn = false
+                playerLayer.player = player
+            }
+            guard !playerLayer.isReadyForDisplay else {
+                guard !isFadingIn else { return }
+                alpha = 1
+                scheduleReadyReport(for: playerLayer)
+                return
+            }
+            guard readyObservation == nil else { return }
             alpha = 0
             readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, change in
                 guard change.newValue == true else { return }
                 Task { @MainActor [weak self] in
                     guard let self, self.alpha == 0 else { return }
                     self.readyObservation = nil
-                    UIView.animate(withDuration: 0.18) { self.alpha = 1 }
+                    self.isFadingIn = true
+                    UIView.animate(withDuration: 0.18) {
+                        self.alpha = 1
+                    } completion: { [weak self] finished in
+                        guard let self else { return }
+                        self.isFadingIn = false
+                        guard finished,
+                              self.window != nil,
+                              let playerLayer = self.layer as? AVPlayerLayer,
+                              playerLayer.isReadyForDisplay
+                        else { return }
+                        self.reportReady()
+                    }
                 }
             }
+        }
+
+        private func scheduleReadyReport(for playerLayer: AVPlayerLayer) {
+            guard !hasReportedReady,
+                  !hasScheduledReadyReport,
+                  let expectedPlayer = playerLayer.player
+            else { return }
+            hasScheduledReadyReport = true
+            Task { @MainActor [weak self, weak expectedPlayer] in
+                await Task.yield()
+                guard let self else { return }
+                self.hasScheduledReadyReport = false
+                guard self.window != nil,
+                      let expectedPlayer,
+                      let currentLayer = self.layer as? AVPlayerLayer,
+                      currentLayer.player === expectedPlayer,
+                      currentLayer.isReadyForDisplay,
+                      !self.isFadingIn
+                else { return }
+                self.reportReady()
+            }
+        }
+
+        private func reportReady() {
+            guard !hasReportedReady else { return }
+            hasReportedReady = true
+            onReady()
         }
     }
 
@@ -560,15 +667,13 @@ struct VideoPlayerSurface: UIViewRepresentable {
         let view = LayerView()
         view.backgroundColor = .clear
         let layer = view.layer as? AVPlayerLayer
-        layer?.player = player
         layer?.videoGravity = .resizeAspect
-        view.fadeInOnFirstFrame()
+        view.configure(player: player, onReady: onReady)
         return view
     }
 
     func updateUIView(_ uiView: LayerView, context: Context) {
-        let layer = uiView.layer as? AVPlayerLayer
-        layer?.player = player
+        uiView.configure(player: player, onReady: onReady)
     }
 }
 

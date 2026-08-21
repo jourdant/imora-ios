@@ -846,6 +846,7 @@ private final class AssetViewerTransitionDriver: NSObject,
 
         switch pan.state {
         case .began:
+            controller.cancelPendingViewerZoomCommand()
             if controller.isPresenting {
                 guard beginPresentationSwipe() else {
                     controller.requestDismissal()
@@ -1047,6 +1048,8 @@ final class AssetViewerDisplayState {
     var transitionMediaVisible = false
     var chromeVisible = true
     var mediaSafeAreaInsets: UIEdgeInsets?
+    var openingMediaImage: UIImage?
+    let zoomCommandBridge = AssetViewerZoomCommandBridge()
     /// whether the media is unobstructed. while information is open, pans
     /// belong to its sheet rather than the viewer dismissal.
     var mediaAtTop = true
@@ -1067,6 +1070,14 @@ private final class AssetViewerDismissalRelay {
 
     func presentationMediaReady() {
         controller?.presentationMediaBecameReady()
+    }
+
+    func pageZoomChanged(_ isZoomed: Bool) {
+        controller?.viewerPageZoomChanged(isZoomed)
+    }
+
+    func interactiveMediaInteractionStarted() {
+        controller?.viewerInteractiveMediaInteractionStarted()
     }
 
     func chromeVisibilityChanged(_ visible: Bool) {
@@ -1285,9 +1296,13 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             for: displayState.currentAssetID,
             in: container
         ) else { return nil }
-        guard let image = cachedTransitionImage(), let sourceView = source.view else {
-            return source
+        let image = cachedTransitionImage() ?? source.image
+        if phase == .presenting,
+           displayState.currentAssetID == route.sourceAssetID,
+           displayState.openingMediaImage == nil {
+            displayState.openingMediaImage = image
         }
+        guard let sourceView = source.view else { return source }
         return AssetViewerZoomSource(view: sourceView, image: image, frame: source.frame)
     }
 
@@ -1319,7 +1334,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         let mediaFrame = AssetViewerPageLayout(viewport: bounds.size)
             .presentationMediaFrame(
                 aspectRatio: aspectRatio ?? asset.ratio,
-                showsChrome: displayState.mode == .viewer && displayState.chromeVisible,
+                showsChrome: displayState.mode == .viewer
+                    && displayState.chromeVisible
+                    && !displayState.currentPageZoomed,
                 topSafeAreaInset: safeAreaInsets.top,
                 bottomSafeAreaInset: safeAreaInsets.bottom,
                 reservesTransportControls: asset.isVideo || asset.isLivePhoto
@@ -1407,6 +1424,31 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             zoomView.layer.cornerRadius = 0
         }
         releasePresentationZoomViewWhenReady()
+    }
+
+    fileprivate func viewerPageZoomChanged(_ isZoomed: Bool) {
+        displayState.currentPageZoomed = isZoomed
+    }
+
+    fileprivate func viewerInteractiveMediaInteractionStarted() {
+        guard phase == .presented else { return }
+        if let swipeDismissal, swipeCancellationAnimator != nil {
+            swipeCancellationAnimator?.stopAnimation(true)
+            swipeCancellationAnimator = nil
+            completeSwipeCancellationHandoff(swipeDismissal)
+        }
+        guard swipeDismissal == nil else { return }
+        guard activePresentationZoomView != nil
+            || presentationZoomView != nil
+            || openingChromeOverlay != nil
+            || !displayState.transitionMediaVisible
+            || !displayState.viewerChromeRevealed
+        else { return }
+        setTransitionMediaVisible(true)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        completeOpeningChromeHandoff()
+        removePresentationZoomView()
     }
 
     fileprivate func prepareViewerContentForPresentation() {
@@ -1594,6 +1636,10 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             && !isTouchingControl(at: location)
     }
 
+    fileprivate func cancelPendingViewerZoomCommand() {
+        displayState.zoomCommandBridge.cancelPendingFit()
+    }
+
     fileprivate func commitOpeningSwipeDismissal() {
         guard phase == .presenting, !dismissalRequested else { return }
         dismissalRequested = true
@@ -1728,19 +1774,30 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             }
         }
         animator.addCompletion { [weak self] _ in
-            guard let self, self.swipeDismissal === swipeDismissal else { return }
-            self.setTransitionMediaVisible(true)
-            swipeDismissal.zoomView?.removeFromSuperview()
-            swipeDismissal.source?.restore()
-            swipeDismissal.chromeSnapshot?.restore()
-            swipeDismissal.openingChromeOverlay?.isUserInteractionEnabled = true
-            self.completeOpeningChromeHandoff()
-            self.swipeDismissal = nil
-            self.swipeCancellationAnimator = nil
-            self.restoreSourceInteraction()
+            self?.completeSwipeCancellationHandoff(swipeDismissal)
         }
         swipeCancellationAnimator = animator
         animator.startAnimation()
+    }
+
+    private func completeSwipeCancellationHandoff(
+        _ swipeDismissal: AssetViewerSwipeDismissal
+    ) {
+        guard self.swipeDismissal === swipeDismissal else { return }
+        view.layer.removeAllAnimations()
+        view.alpha = 1
+        view.transform = .identity
+        swipeDismissal.chromeSnapshot?.setAlpha(1)
+        swipeDismissal.openingChromeOverlay?.alpha = 1
+        setTransitionMediaVisible(true)
+        swipeDismissal.zoomView?.removeFromSuperview()
+        swipeDismissal.source?.restore()
+        swipeDismissal.chromeSnapshot?.restore()
+        swipeDismissal.openingChromeOverlay?.isUserInteractionEnabled = true
+        completeOpeningChromeHandoff()
+        self.swipeDismissal = nil
+        swipeCancellationAnimator = nil
+        restoreSourceInteraction()
     }
 
     fileprivate func takeSwipeDismissal() -> AssetViewerSwipeDismissal? {
@@ -1993,7 +2050,6 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
 
     private func completeOpeningChromeHandoff() {
         openingChromeHandoffGeneration &+= 1
-        guard openingChromeOverlay != nil else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -2214,12 +2270,17 @@ private struct AssetViewerHostRoot: View {
                     usesExternalBackdrop: true,
                     mediaTopSafeAreaInset: displayState.mediaSafeAreaInsets?.top,
                     mediaBottomSafeAreaInset: displayState.mediaSafeAreaInsets?.bottom,
+                    openingMediaImage: displayState.openingMediaImage,
+                    zoomCommandBridge: displayState.zoomCommandBridge,
                     album: album,
                     personID: personID,
                     onRequestDismissal: { dismissalRelay.request() },
                     onLaunchMediaReady: { dismissalRelay.presentationMediaReady() },
                     onSelectionChanged: { displayState.currentAssetID = $0 },
-                    onPageZoomChanged: { displayState.currentPageZoomed = $0 },
+                    onPageZoomChanged: { dismissalRelay.pageZoomChanged($0) },
+                    onInteractiveMediaInteractionStarted: {
+                        dismissalRelay.interactiveMediaInteractionStarted()
+                    },
                     onChromeVisibilityChanged: { dismissalRelay.chromeVisibilityChanged($0) },
                     onMediaFrameSourceChanged: {
                         dismissalRelay.mediaFrameSourceChanged(

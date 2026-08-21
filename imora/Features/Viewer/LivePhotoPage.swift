@@ -11,6 +11,15 @@ struct LivePhotoPage: View {
     let isActive: Bool
     let forcesMute: Bool
     let playback: VideoPlayback
+    let onMediaReady: () -> Void
+    let ownsLaunchMedia: Bool
+    let launchMediaBridge: AssetViewerLaunchMediaBridge
+    let openingMediaImage: UIImage?
+    let allowsDoubleTapZoom: Bool
+    let onMediaTap: () -> Void
+    let onDoubleTapZoomChanged: (Bool) -> Void
+    let onZoomInteractionStarted: () -> Void
+    let onZoomPresentationChanged: (Bool) -> Void
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -26,7 +35,14 @@ struct LivePhotoPage: View {
         // id changes, so the id has to name the source: losing the device copy
         // would otherwise keep the failed still on screen forever.
         ZoomableScrollView(
+            assetID: asset.id,
             contentID: "\(asset.id)#\(localIdentifier ?? "remote")",
+            isActivePage: isActive,
+            allowsDoubleTapZoom: allowsDoubleTapZoom,
+            onMediaTap: onMediaTap,
+            onDoubleTapZoomChanged: onDoubleTapZoomChanged,
+            onZoomInteractionStarted: onZoomInteractionStarted,
+            onZoomPresentationChanged: onZoomPresentationChanged,
             onZoomChanged: onZoomChanged
         ) {
             MediaSurfaceStack(
@@ -38,7 +54,16 @@ struct LivePhotoPage: View {
                 posterFallbackURL: posterFallbackURL,
                 thumbhash: asset.thumbhash,
                 playback: playback,
+                onPosterReady: onMediaReady,
                 onPosterUnavailable: { localUnavailable = true }
+            )
+            .modifier(
+                AssetViewerLaunchMediaModifier(
+                    asset: asset,
+                    openingImage: openingMediaImage,
+                    ownsLaunchMedia: ownsLaunchMedia,
+                    bridge: launchMediaBridge
+                )
             )
             // press and hold plays the clip, the same gesture the system photos
             // app uses. the handler only touches the playback reference, which

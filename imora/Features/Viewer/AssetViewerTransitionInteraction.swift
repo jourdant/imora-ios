@@ -19,6 +19,44 @@ nonisolated struct AssetViewerOpeningSwipeInteraction {
     }
 }
 
+nonisolated enum AssetViewerOpeningMediaHandoff {
+    static func beginsCompactInteraction(
+        isTracking: Bool,
+        isInteracting: Bool,
+        previousWasTracking: Bool
+    ) -> Bool {
+        isTracking || (isInteracting && !previousWasTracking)
+    }
+
+    static func startsWithScrollCoupledPreview(
+        loadsViewerContent: Bool,
+        usesExternalBackdrop: Bool,
+        isContextPreview: Bool,
+        hasOpeningImage: Bool
+    ) -> Bool {
+        loadsViewerContent
+            && usesExternalBackdrop
+            && !isContextPreview
+            && hasOpeningImage
+    }
+
+    static func claimsPreviewForPinch(
+        isActivePage: Bool,
+        isApplyingProgrammaticZoom: Bool,
+        pinchIsActive: Bool
+    ) -> Bool {
+        isActivePage && !isApplyingProgrammaticZoom && pinchIsActive
+    }
+
+    static func showsScrollCoupledPreview(
+        isVisible: Bool,
+        assetID: String,
+        openingAssetID: String?
+    ) -> Bool {
+        isVisible && assetID == openingAssetID
+    }
+}
+
 nonisolated enum AssetViewerOpeningChromeReveal {
     static let initialBackdropOpacity: CGFloat = 0.02
 

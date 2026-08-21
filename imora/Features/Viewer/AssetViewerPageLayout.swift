@@ -18,10 +18,12 @@ nonisolated struct AssetViewerScrollPresentation: Equatable, Sendable {
 /// information never changes a playable asset's vertical viewport mid-
 /// transition. Videos and live photos both reserve it.
 nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
-    let showsTopToolbarItems: Bool
+    let mountsTopToolbarItems: Bool
+    let showsNavigationBar: Bool
     let showsViewerBottomBar: Bool
     let reservesTransportControls: Bool
     let showsTransportControls: Bool
+    let usesChromeMediaFrame: Bool
 
     init(
         isCompact: Bool,
@@ -30,18 +32,21 @@ nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
         isChromeVisible: Bool,
         isContextPreview: Bool,
         isPlayable: Bool,
-        isPlayerReady: Bool
+        isPlayerReady: Bool,
+        isMediaZoomed: Bool
     ) {
         let canShowChrome = isChromeVisible && !isContextPreview
         let mediaIsUnobstructed = isCompact ? isAtMedia : !isInformationPresented
 
-        showsTopToolbarItems = canShowChrome && mediaIsUnobstructed
+        mountsTopToolbarItems = !isContextPreview && !isInformationPresented
+        showsNavigationBar = canShowChrome && (isCompact || !isInformationPresented)
         showsViewerBottomBar = canShowChrome && (isCompact || !isInformationPresented)
         reservesTransportControls = isPlayable && !isContextPreview
         showsTransportControls = reservesTransportControls
             && canShowChrome
             && mediaIsUnobstructed
             && isPlayerReady
+        usesChromeMediaFrame = canShowChrome && !isMediaZoomed
     }
 }
 
@@ -61,6 +66,8 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
     static let topChromeReservation: CGFloat = 72
     static let bottomChromeReservation: CGFloat = 68
     static let transportControlsReservation: CGFloat = 56
+    static let scrollCommandTolerance: CGFloat = 0.001
+    private static let endpointTolerance: CGFloat = 1
 
     let viewport: CGSize
     let bottomSafeAreaInset: CGFloat
@@ -103,7 +110,8 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
         bottomSafeAreaInset: CGFloat,
         reservesTransportControls: Bool
     ) -> CGRect {
-        guard showsChrome else { return fittedMediaFrame(aspectRatio: aspectRatio) }
+        let fullFrame = fittedMediaFrame(aspectRatio: aspectRatio)
+        guard showsChrome else { return fullFrame }
         let minY = max(0, topSafeAreaInset) + Self.topChromeReservation
         let transportReservation = reservesTransportControls
             ? Self.transportControlsReservation
@@ -112,10 +120,35 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
             - max(0, bottomSafeAreaInset)
             - Self.bottomChromeReservation
             - transportReservation
-        guard maxY > minY else { return fittedMediaFrame(aspectRatio: aspectRatio) }
+        guard maxY > minY else { return fullFrame }
+        let availableBounds = CGRect(
+            x: 0,
+            y: minY,
+            width: viewport.width,
+            height: maxY - minY
+        )
+        let safeBounds: CGRect
+        // mirroring the transport reservation in landscape would collapse media.
+        if reservesTransportControls, viewport.width > viewport.height {
+            safeBounds = availableBounds
+        } else {
+            let centerY = viewport.height / 2
+            let safeHalfHeight = min(centerY - minY, maxY - centerY)
+            guard safeHalfHeight > 0 else { return fullFrame }
+            safeBounds = CGRect(
+                x: 0,
+                y: centerY - safeHalfHeight,
+                width: viewport.width,
+                height: safeHalfHeight * 2
+            )
+        }
+        if fullFrame.minY >= safeBounds.minY,
+           fullFrame.maxY <= safeBounds.maxY {
+            return fullFrame
+        }
         return fittedMediaFrame(
             aspectRatio: aspectRatio,
-            in: CGRect(x: 0, y: minY, width: viewport.width, height: maxY - minY)
+            in: safeBounds
         )
     }
 
@@ -214,23 +247,43 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
             reservesTransportControls: reservesTransportControls
         )
         let progress = informationProgress(scrollOffset: offset)
-        let endpointTolerance: CGFloat = 1
-
         return AssetViewerScrollPresentation(
             scrollOffset: offset,
             mediaScale: transform.scale,
             mediaOffsetY: transform.offsetY,
             mediaFrameMaxY: mediaFrameMaxY(scrollOffset: offset),
             informationProgress: progress,
-            isMediaAtTop: offset <= endpointTolerance,
+            isMediaAtTop: offset <= Self.endpointTolerance,
             isShowingInformation: informationRevealOffset > 0
-                && offset >= informationRevealOffset - endpointTolerance
+                && offset >= informationRevealOffset - Self.endpointTolerance
         )
+    }
+
+    func canonicalEndpointOffset(scrollOffset: CGFloat) -> CGFloat? {
+        guard scrollOffset.isFinite else { return nil }
+        let offset = max(0, scrollOffset)
+        if offset <= Self.endpointTolerance { return 0 }
+        if abs(offset - informationRevealOffset) <= Self.endpointTolerance {
+            return informationRevealOffset
+        }
+        return nil
     }
 
     /// how close to an endpoint a gesture may start while still counting as
     /// leaving from that endpoint.
     private static let settleTolerance: CGFloat = 24
+
+    func nativeLandingOffset(
+        startOffset: CGFloat,
+        proposedOffset: CGFloat
+    ) -> CGFloat {
+        let start = max(0, startOffset)
+        let proposed = max(0, proposedOffset)
+        guard start > informationRevealOffset + Self.settleTolerance,
+              proposed < informationRevealOffset
+        else { return proposed }
+        return informationRevealOffset
+    }
 
     /// Provides a single discoverable first stop without turning all metadata
     /// into page-aligned content. Once a gesture begins at that stop or below,
@@ -302,7 +355,7 @@ nonisolated struct AssetViewerPageLayout: Equatable, Sendable {
             velocity: velocity
         )
         guard settled == 0 || settled == informationRevealOffset else { return nil }
-        guard abs(settled - release) > 1 else { return nil }
+        guard abs(settled - release) > Self.scrollCommandTolerance else { return nil }
         return settled
     }
 }
