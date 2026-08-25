@@ -284,10 +284,13 @@ private struct AssetInformationSheet: View {
             )
         }
         .scrollDismissesKeyboard(.interactively)
-        .background(Color(uiColor: .systemBackground))
+        // information continues the viewer's black stage, so the sheet is
+        // pure black with dark-resolved content in either system appearance.
+        .background(Color.black)
+        .environment(\.colorScheme, .dark)
         .presentationDetents([Self.detent])
         .presentationDragIndicator(.visible)
-        .presentationBackground(Color(uiColor: .systemBackground))
+        .presentationBackground(Color.black)
         .presentationBackgroundInteraction(.enabled(upThrough: Self.detent))
         .tint(.accentColor)
         .sheet(isPresented: $showAddToAlbum) {
@@ -864,7 +867,10 @@ struct AssetViewerScreen: View {
                     }
                     .frame(minHeight: layout.informationMinimumHeight, alignment: .top)
                     .frame(maxWidth: .infinity)
-                    .background(Color(uiColor: .systemBackground))
+                    // information continues the black media stage below the
+                    // fold, so its content always resolves dark.
+                    .background(Color.black)
+                    .environment(\.colorScheme, .dark)
                 }
             }
         }
@@ -876,7 +882,15 @@ struct AssetViewerScreen: View {
         .scrollDismissesKeyboard(.interactively)
         .scrollDisabled(!loadsViewerContent || currentPageZoomed || isContextPreview)
         .scrollEdgeEffectHidden(true, for: .top)
-        .background(usesExternalBackdrop ? Color.black : Color(uiColor: .systemBackground))
+        // top overscroll shows the media backdrop, bottom overscroll the black
+        // information surface.
+        .background {
+            VStack(spacing: 0) {
+                usesExternalBackdrop ? Color.black : Color(uiColor: .systemBackground)
+                Color.black
+            }
+            .ignoresSafeArea()
+        }
         .transaction { transaction in
             // Metadata loads below a fixed media boundary; automatic relative
             // offset correction would only move an already-settled viewer.
