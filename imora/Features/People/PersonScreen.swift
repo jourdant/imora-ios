@@ -34,6 +34,22 @@ struct PersonScreen: View {
             showsLargeTitle: false,
             resyncTrigger: resyncTrigger,
             onPickAsset: isPickingFeatured ? { asset in Task { await setFeaturedPhoto(asset) } } : nil,
+            trailingItems: {
+                ToolbarItem(placement: .topBarTrailing) {
+                    if isPickingFeatured {
+                        Button("Cancel") { isPickingFeatured = false }
+                            .accessibilityIdentifier("person-cancel-featured")
+                    } else {
+                        Menu {
+                            menuItems
+                        } label: {
+                            Image(systemName: "ellipsis")
+                        }
+                        .accessibilityLabel("More")
+                        .accessibilityIdentifier("person-menu")
+                    }
+                }
+            },
             header: {
                 if !isPickingFeatured {
                     PersonHeader(
@@ -55,22 +71,6 @@ struct PersonScreen: View {
         // going back mid-pick would leave the person entirely, so cancelling
         // is the only way out of the mode.
         .navigationBarBackButtonHidden(isPickingFeatured)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if isPickingFeatured {
-                    Button("Cancel") { isPickingFeatured = false }
-                        .accessibilityIdentifier("person-cancel-featured")
-                } else {
-                    Menu {
-                        menuItems
-                    } label: {
-                        Image(systemName: "ellipsis")
-                    }
-                    .accessibilityLabel("More")
-                    .accessibilityIdentifier("person-menu")
-                }
-            }
-        }
         .overlay(alignment: .top) {
             if let toast {
                 ToastBanner(text: toast) { self.toast = nil }

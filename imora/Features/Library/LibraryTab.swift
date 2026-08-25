@@ -409,33 +409,34 @@ struct TrashScreen: View {
             emptyIcon: "trash",
             emptyMessage: "Trash is empty",
             showsLargeTitle: false,
-            serverCommand: $serverCommand
-        )
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        serverCommand = .restoreAllTrash
+            serverCommand: $serverCommand,
+            trailingItems: {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            serverCommand = .restoreAllTrash
+                        } label: {
+                            Label("Restore All", systemImage: "arrow.uturn.backward")
+                        }
+                        Button(role: .destructive) {
+                            confirmEmpty = true
+                        } label: {
+                            Label("Empty Trash", systemImage: "trash.slash")
+                        }
                     } label: {
-                        Label("Restore All", systemImage: "arrow.uturn.backward")
+                        Image(systemName: "ellipsis")
                     }
-                    Button(role: .destructive) {
-                        confirmEmpty = true
-                    } label: {
-                        Label("Empty Trash", systemImage: "trash.slash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .accessibilityLabel("More")
-                // ios 26 morphs the dialog out of its source control, so it sits
-                // on the menu button - on the screen root it floats detached.
-                .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
-                    Button("Empty Trash", role: .destructive) {
-                        serverCommand = .emptyTrash
+                    .accessibilityLabel("More")
+                    // ios 26 morphs the dialog out of its source control, so it
+                    // sits on the menu button - on the screen root it floats
+                    // detached.
+                    .confirmationDialog("Permanently delete everything in the trash?", isPresented: $confirmEmpty, titleVisibility: .visible) {
+                        Button("Empty Trash", role: .destructive) {
+                            serverCommand = .emptyTrash
+                        }
                     }
                 }
             }
-        }
+        )
     }
 }

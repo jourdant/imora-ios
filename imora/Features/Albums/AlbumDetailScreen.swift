@@ -59,6 +59,11 @@ struct AlbumDetailScreen: View {
             albumOwnerID: album.owner?.id,
             onAlbumAssetCountDelta: { delta in
                 setAlbum(album.withAssetCountDelta(delta))
+            },
+            trailingItems: {
+                ToolbarItem(placement: .topBarTrailing) {
+                    menu
+                }
             }
         ) {
             AlbumHeader(album: album) {
@@ -67,11 +72,6 @@ struct AlbumDetailScreen: View {
             }
         }
         .id(timelineGeneration)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                menu
-            }
-        }
         .overlay(alignment: .bottom) {
             if let feedback {
                 Text(feedback)

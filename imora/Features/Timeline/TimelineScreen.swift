@@ -415,7 +415,7 @@ nonisolated enum TimelineServerCommand: Equatable {
 }
 
 /// reusable bucketed photo grid, the workhorse behind most screens.
-struct TimelineScreen<Header: View>: View {
+struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.openURL) private var openURL
@@ -443,6 +443,12 @@ struct TimelineScreen<Header: View>: View {
     var onPickAsset: ((Asset) -> Void)?
     @Binding private var serverCommand: TimelineServerCommand?
     let header: Header
+    /// the host's own trailing navigation items. they are declared here
+    /// rather than on the host so this screen owns the whole trailing group:
+    /// the select pill always leads them, and selection mode unmounts them
+    /// in place - a host-side toolbar would merge ahead of anything added
+    /// from inside.
+    let trailingItems: Trailing
 
     @State private var model: TimelineModel
     @State private var selection = Set<String>()
@@ -460,8 +466,11 @@ struct TimelineScreen<Header: View>: View {
     @State private var openingChromePrewarmOwner = UUID()
     @State private var pendingAlbumAssets: [String]?
     @State private var pendingEditAsset: Asset?
-    @State private var preparedShare: PreparedAssetShare?
-    @State private var sharingAssetIDs = Set<String>()
+    @State private var shareRequest: AssetShareRequest?
+    /// frozen at the moment the pill is tapped, so the sheet's grid holds
+    /// still while items are unchecked inside it.
+    @State private var selectedSheetAssets: [Asset] = []
+    @State private var showsSelectedSheet = false
     @State private var downloadingAssetIDs = Set<String>()
     /// Serializes mutations per asset while still allowing unrelated photos
     /// to update concurrently. The set also disables bulk actions that overlap
@@ -491,6 +500,9 @@ struct TimelineScreen<Header: View>: View {
         onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
         onPickAsset: ((Asset) -> Void)? = nil,
         serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
+        @ToolbarContentBuilder trailingItems: () -> Trailing = {
+            ToolbarItemGroup(placement: .topBarTrailing) {}
+        },
         @ViewBuilder header: () -> Header = { EmptyView() }
     ) {
         self.title = title
@@ -504,11 +516,18 @@ struct TimelineScreen<Header: View>: View {
         self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
         self.onPickAsset = onPickAsset
         _serverCommand = serverCommand
+        self.trailingItems = trailingItems()
         self.header = header()
         _model = State(initialValue: TimelineModel(filter: filter, mergesLocal: mergesLocalPhotos))
     }
 
     private var isPicking: Bool { onPickAsset != nil }
+
+    /// the default builder hands back an empty group, and a spacer next to
+    /// nothing would only push the select pill inward.
+    private var hasTrailingItems: Bool {
+        Trailing.self != ToolbarItemGroup<EmptyView>.self
+    }
 
     private func tileSide(for width: CGFloat) -> CGFloat {
         AssetGridLayout.tileSide(viewportWidth: width, columns: columnCount)
@@ -842,32 +861,71 @@ struct TimelineScreen<Header: View>: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(showsLargeTitle ? .large : .inline)
+        // one toolbar owns the whole trailing group, so selection swaps the
+        // items in place - the bar itself stays put and the controls fade
+        // where they are instead of sliding away with it. only the tab bar
+        // leaves, for the bottom controls, like the photos app.
         .toolbar {
             if isSelecting, !isPicking {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { exitSelection() }
-                        .disabled(isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs))
+                if filter.isTrashed != true {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        SelectionMoreMenu(
+                            filter: filter,
+                            isDisabled: isSelectionWorking || selection.isEmpty,
+                            onFavorite: { await applyFavorite() },
+                            onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
+                            onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
+                            onAddToAlbum: { pendingAlbumAssets = Array(selection) }
+                        )
+                    }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        exitSelection()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .disabled(isSelectionWorking)
+                    .accessibilityLabel("Cancel Selection")
+                    .accessibilityIdentifier("selection-cancel")
+                }
+            } else {
+                if !isPicking, !model.isEmpty {
+                    // leads the host's items as a pill of its own: the fixed
+                    // spacer splits the glass so it never merges into their
+                    // group.
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Select") { enterSelection() }
+                            .accessibilityIdentifier("timeline-select")
+                    }
+                    if hasTrailingItems {
+                        ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                    }
+                }
+                trailingItems
             }
         }
+        .toolbarVisibility(isSelecting ? .hidden : .automatic, for: .tabBar)
+        .navigationBarBackButtonHidden(isSelecting)
         .overlay { overlayState }
         .overlay(alignment: .bottom) {
             if isSelecting, !isPicking {
-                SelectionActionBar(
+                SelectionControlBar(
                     count: selection.count,
                     filter: filter,
-                    isWorking: isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs),
-                    onFavorite: { await applyFavorite() },
-                    onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
-                    onTrash: { await applyTrash() },
+                    isWorking: isSelectionWorking,
+                    onShare: shareSelection,
+                    onShowSelected: presentSelectedSheet,
                     onRestore: filter.isTrashed == true ? { await applyRestore() } : nil,
-                    onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
-                    onAddToAlbum: { pendingAlbumAssets = Array(selection) }
+                    onTrash: { await applyTrash() }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.smooth(duration: 0.25), value: isSelecting)
+        .sheet(isPresented: $showsSelectedSheet) {
+            SelectedAssetsSheet(assets: selectedSheetAssets, selection: $selection)
+        }
         // no pull-to-refresh: the realtime hub keeps every grid current.
         .task {
             if let client = session.client {
@@ -914,8 +972,10 @@ struct TimelineScreen<Header: View>: View {
                 }
             )
         }
-        .sheet(item: $preparedShare) { share in
-            TimelineShareSheet(url: share.url)
+        .background {
+            AssetSharePresenter(request: $shareRequest) {
+                exitSelection()
+            }
         }
         .fullScreenCover(item: $pendingEditAsset) { asset in
             AssetEditScreen(asset: asset) { outcome in
@@ -1078,11 +1138,6 @@ struct TimelineScreen<Header: View>: View {
                             .padding(6)
                     }
                 }
-                .overlay {
-                    if selection.contains(asset.id) {
-                        Rectangle().stroke(Color.accentColor, lineWidth: 3)
-                    }
-                }
                 .onTapGesture {
                     if isSelectable(asset) { toggle(asset) }
                 }
@@ -1178,25 +1233,11 @@ struct TimelineScreen<Header: View>: View {
                 Task { _ = await setVisibility(ids: [serverID], isArchived ? .timeline : .archive) }
             })
         }
-        if isSelectable(asset) {
-            primary.append(UIAction(title: "Select", image: UIImage(systemName: "checkmark.circle")) { _ in
-                isSelecting = true
-                selection.insert(asset.id)
-            })
-        }
 
         var transfer: [UIMenuElement] = []
-        if sharingAssetIDs.contains(asset.id) {
-            transfer.append(UIAction(
-                title: "Preparing Share…",
-                image: UIImage(systemName: "square.and.arrow.up"),
-                attributes: .disabled
-            ) { _ in })
-        } else {
-            transfer.append(UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { _ in
-                Task { await share(asset) }
-            })
-        }
+        transfer.append(UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { _ in
+            shareRequest = AssetShareRequest(assets: [asset])
+        })
         if asset.isLocal, let localID = asset.localIdentifier {
             transfer.append(backupMenuElement(for: asset, localID: localID, availability: availability))
         }
@@ -1385,18 +1426,50 @@ struct TimelineScreen<Header: View>: View {
 
     // MARK: - selection
 
+    /// deselecting the last item keeps the mode on - the pill just reads
+    /// "Select Items" again, exactly like photos.app.
     private func toggle(_ asset: Asset) {
         if selection.contains(asset.id) {
             selection.remove(asset.id)
-            if selection.isEmpty { isSelecting = false }
         } else {
             selection.insert(asset.id)
         }
     }
 
+    /// entry and exit run inside one animation so the toolbar swap fades in
+    /// place together with the bottom bar's move.
+    private func enterSelection() {
+        withAnimation(.smooth(duration: 0.25)) {
+            isSelecting = true
+        }
+    }
+
     private func exitSelection() {
-        selection.removeAll()
-        isSelecting = false
+        showsSelectedSheet = false
+        withAnimation(.smooth(duration: 0.25)) {
+            selection.removeAll()
+            isSelecting = false
+        }
+    }
+
+    private var isSelectionWorking: Bool {
+        isRunningServerCommand || !selection.isDisjoint(with: mutatingAssetIDs)
+    }
+
+    /// the asset list is captured here so deselecting immediately afterwards
+    /// cannot change what was asked for; metadata options come from the saved
+    /// defaults. selection clears on tap so the grid is free while the share
+    /// prepares in the background.
+    private func shareSelection() {
+        let assets = model.flatAssets.filter { selection.contains($0.id) }
+        guard !assets.isEmpty else { return }
+        shareRequest = AssetShareRequest(assets: assets, options: .current)
+        exitSelection()
+    }
+
+    private func presentSelectedSheet() {
+        selectedSheetAssets = model.flatAssets.filter { selection.contains($0.id) }
+        showsSelectedSheet = true
     }
 
     private func viewerController(
@@ -1637,25 +1710,6 @@ struct TimelineScreen<Header: View>: View {
             commit: { _ in if let removal { model.commit(removal) } }
         )
         return result != nil
-    }
-
-    private func share(_ asset: Asset) async {
-        guard sharingAssetIDs.insert(asset.id).inserted else { return }
-        defer { sharingAssetIDs.remove(asset.id) }
-        do {
-            let url: URL
-            if let localID = asset.localIdentifier {
-                url = try await LocalSharedAssetFile(localIdentifier: localID).exportedURL()
-            } else if let client = session.client {
-                url = try await SharedAssetFile(client: client, asset: asset).exportedURL()
-            } else {
-                ErrorToastCenter.shared.show("Sharing is not available while signed out.")
-                return
-            }
-            preparedShare = PreparedAssetShare(url: url)
-        } catch {
-            ErrorToastCenter.shared.show("Couldn’t prepare this item for sharing", error: error)
-        }
     }
 
     private func backUp(localID: String) async {
@@ -1915,27 +1969,6 @@ private struct ScrubberLayoutKey: Equatable {
     }
 }
 
-private struct PreparedAssetShare: Identifiable {
-    let id = UUID()
-    let url: URL
-}
-
-/// UIKit owns context-menu actions, so their asynchronously prepared export is
-/// handed to the system share controller through a small SwiftUI sheet bridge.
-private struct TimelineShareSheet: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-        controller.completionWithItemsHandler = { _, _, _, _ in
-            try? FileManager.default.removeItem(at: url)
-        }
-        return controller
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
-}
-
 extension [String]: @retroactive Identifiable {
     public var id: String { joined(separator: ",") }
 }
@@ -2140,72 +2173,6 @@ private struct InteractiveAssetTile: UIViewRepresentable {
             }
             return controller
         }
-    }
-}
-
-/// glass bottom bar shown during multi-select.
-private struct SelectionActionBar: View {
-    let count: Int
-    let filter: TimelineFilter
-    let isWorking: Bool
-    let onFavorite: () async -> Void
-    let onArchive: () async -> Void
-    let onTrash: () async -> Void
-    var onRestore: (() async -> Void)?
-    var onRemoveFromAlbum: (() async -> Void)?
-    let onAddToAlbum: () -> Void
-
-    var body: some View {
-        GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 4) {
-                Text("\(count)")
-                    .font(.headline)
-                    .monospacedDigit()
-                    .frame(minWidth: 32)
-
-                Spacer(minLength: 0)
-
-                if let onRestore {
-                    barButton("arrow.uturn.backward", "Restore") { Task { await onRestore() } }
-                } else if let onRemoveFromAlbum {
-                    barButton("heart", "Favorite") { Task { await onFavorite() } }
-                    barButton("rectangle.stack.badge.plus", "Album", action: onAddToAlbum)
-                    barButton("rectangle.stack.badge.minus", "Remove") { Task { await onRemoveFromAlbum() } }
-                } else {
-                    barButton("heart", "Favorite") { Task { await onFavorite() } }
-                    barButton(
-                        filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox",
-                        filter.visibility == .archive ? "Unarchive" : "Archive"
-                    ) { Task { await onArchive() } }
-                    barButton("rectangle.stack.badge.plus", "Album", action: onAddToAlbum)
-                }
-                barButton(
-                    filter.isTrashed == true ? "trash.slash" : "trash",
-                    filter.isTrashed == true ? "Delete" : "Trash",
-                    role: .destructive
-                ) { Task { await onTrash() } }
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 10)
-            .glassEffect(.regular, in: .capsule)
-        }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 8)
-        .disabled(isWorking || count == 0)
-    }
-
-    private func barButton(_ icon: String, _ label: String, role: ButtonRole? = nil, action: @escaping () -> Void) -> some View {
-        Button(role: role, action: action) {
-            VStack(spacing: 2) {
-                Image(systemName: icon)
-                    .font(.body)
-                Text(label)
-                    .font(.caption2)
-            }
-            .frame(minWidth: 52)
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(role == .destructive ? .red : .primary)
     }
 }
 
