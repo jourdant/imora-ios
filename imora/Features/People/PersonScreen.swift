@@ -25,7 +25,9 @@ struct PersonScreen: View {
 
     var body: some View {
         TimelineScreen(
-            title: isPickingFeatured ? "Select Featured Photo" : (person.name.isEmpty ? "Unnamed" : person.name),
+            // the hero already carries the portrait and name, so the bar
+            // stays empty until the picker needs it.
+            title: isPickingFeatured ? "Select Featured Photo" : "",
             filter: TimelineFilter(personId: person.id),
             emptyIcon: "person.crop.circle",
             emptyMessage: "No photos of this person",
@@ -41,6 +43,7 @@ struct PersonScreen: View {
                             draftName = person.name
                             showRename = true
                         },
+                        onEditPortrait: { if !mutationInFlight { isPickingFeatured = true } },
                         onEditBirthDate: { showBirthDate = true }
                     )
                 }
@@ -113,27 +116,11 @@ struct PersonScreen: View {
         let isHidden = person.isHidden == true
 
         Button {
-            draftName = person.name
-            showRename = true
-        } label: {
-            Label(person.name.isEmpty ? "Add a Name" : "Rename", systemImage: "pencil")
-        }
-        .disabled(mutationInFlight)
-
-        Button {
             Task { await setFavorite(!isFavorite) }
         } label: {
             Label(isFavorite ? "Unfavorite" : "Favorite", systemImage: isFavorite ? "heart.slash" : "heart")
         }
         .disabled(mutationInFlight)
-
-        Button {
-            isPickingFeatured = true
-        } label: {
-            Label("Select Featured Photo", systemImage: "person.crop.square")
-        }
-        .disabled(mutationInFlight)
-        .accessibilityIdentifier("person-featured-photo")
 
         Button {
             showBirthDate = true
@@ -257,70 +244,146 @@ struct PersonScreen: View {
     }
 }
 
-/// portrait, name and vitals above the person's grid.
+/// hero above the person's grid: the portrait bleeds into a soft backdrop
+/// made of itself, with the name and vitals as glass chips underneath.
 private struct PersonHeader: View {
+    @Environment(SessionStore.self) private var session
     let person: Person
     let assetCount: Int?
     let onEditName: () -> Void
+    let onEditPortrait: () -> Void
     let onEditBirthDate: () -> Void
 
+    private let portraitSide: CGFloat = 132
+
     var body: some View {
-        VStack(spacing: 12) {
-            PersonAvatar(person: person, targetPixelSize: 480, showsFavorite: false)
-                .frame(width: 104, height: 104)
-
-            VStack(spacing: 4) {
-                Button(action: onEditName) {
-                    HStack(spacing: 6) {
-                        Text(person.name.isEmpty ? "Add a Name" : person.name)
-                            .font(.title2.weight(.semibold))
-                            .foregroundStyle(person.name.isEmpty ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
-                            .lineLimit(2)
-                            .multilineTextAlignment(.center)
-                        if person.isFavorite == true {
-                            Image(systemName: "heart.fill")
-                                .font(.subheadline)
-                                .foregroundStyle(.pink)
-                                .accessibilityLabel("Favorite")
-                        }
-                    }
-                }
+        VStack(spacing: 14) {
+            Button(action: onEditPortrait) { portrait }
                 .buttonStyle(.plain)
-                .accessibilityIdentifier("person-name")
+                .accessibilityLabel("Featured photo")
+                .accessibilityHint("Choose a different photo")
+                .accessibilityIdentifier("person-featured-photo")
 
-                if let metaLabel {
-                    Text(metaLabel)
-                        .font(.footnote)
+            Button(action: onEditName) {
+                HStack(spacing: 8) {
+                    Text(person.name.isEmpty ? "Add a Name" : person.name)
+                        .font(.title.weight(.bold))
+                        .foregroundStyle(person.name.isEmpty ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                    if person.isFavorite == true {
+                        Image(systemName: "heart.fill")
+                            .font(.headline)
+                            .foregroundStyle(.pink)
+                            .symbolEffect(.bounce, value: person.isFavorite)
+                            .accessibilityLabel("Favorite")
+                    }
+                    Image(systemName: "pencil")
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
                 }
+                .padding(.horizontal, 24)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(person.name.isEmpty ? "Add a name" : "Rename")
+            .accessibilityIdentifier("person-name")
+
+            chips
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 24)
+        .padding(.bottom, 20)
+        .background {
+            // the header scrolls under the bar, so the backdrop is stretched
+            // well past its own top edge to reach the status bar.
+            GeometryReader { proxy in
+                backdrop
+                    .frame(width: proxy.size.width, height: proxy.size.height + backdropOverflow)
+                    .offset(y: -backdropOverflow)
+            }
+        }
+    }
+
+    private let backdropOverflow: CGFloat = 320
+
+    /// the portrait itself, blown up and blurred, dissolving into the
+    /// screen background so the hero feels lit by the person.
+    @ViewBuilder private var backdrop: some View {
+        if let url = session.personThumbnailURL(person) {
+            RemoteImage(url: url, targetPixelSize: 64)
+                .scaleEffect(1.6)
+                .blur(radius: 48, opaque: true)
+                .saturation(1.4)
+                .opacity(0.55)
+                .mask {
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black, location: 0),
+                            .init(color: .black, location: 0.5),
+                            .init(color: .black.opacity(0.6), location: 0.75),
+                            .init(color: .clear, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .clipped()
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var portrait: some View {
+        PersonAvatar(person: person, targetPixelSize: 480, showsFavorite: false)
+            .frame(width: portraitSide, height: portraitSide)
+            .padding(4)
+            .glassEffect(.regular, in: .circle)
+            .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+            .overlay(alignment: .bottomTrailing) {
+                Image(systemName: "pencil")
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 32, height: 32)
+                    .glassEffect(.regular, in: .circle)
+                    .accessibilityHidden(true)
+            }
+    }
+
+    private var chips: some View {
+        HStack(spacing: 8) {
+            if let assetCount {
+                chip(
+                    "\(assetCount) \(assetCount == 1 ? "Photo" : "Photos")",
+                    systemImage: "photo.on.rectangle",
+                    tinted: false
+                )
             }
 
             Button(action: onEditBirthDate) {
-                Label(birthLabel ?? "Add Date of Birth", systemImage: "birthday.cake")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(birthLabel == nil ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .glassEffect(.regular, in: .capsule)
+                chip(
+                    birthLabel ?? "Add Birthday",
+                    systemImage: "birthday.cake",
+                    tinted: birthLabel == nil
+                )
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("person-birthdate")
+
+            if person.isHidden == true {
+                chip("Hidden", systemImage: "eye.slash", tinted: false)
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 10)
-        .padding(.bottom, 18)
+        .padding(.horizontal, 16)
     }
 
-    /// item count and hidden state on one quiet line.
-    private var metaLabel: String? {
-        var parts: [String] = []
-        if let assetCount {
-            parts.append("\(assetCount) \(assetCount == 1 ? "Item" : "Items")")
-        }
-        if person.isHidden == true {
-            parts.append("Hidden")
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    private func chip(_ text: String, systemImage: String, tinted: Bool) -> some View {
+        Label(text, systemImage: systemImage)
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(tinted ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .glassEffect(.regular, in: .capsule)
     }
 
     /// "Jan 5, 1990 · Age 36" once a birth date is set.
