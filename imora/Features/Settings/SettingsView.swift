@@ -53,6 +53,13 @@ struct SettingsView: View {
                     .accessibilityIdentifier("settings-notifications")
 
                     NavigationLink {
+                        PrivacyScreen()
+                    } label: {
+                        Label("Privacy", systemImage: "hand.raised")
+                    }
+                    .accessibilityIdentifier("settings-privacy")
+
+                    NavigationLink {
                         StorageScreen()
                     } label: {
                         Label("Storage", systemImage: "internaldrive")
