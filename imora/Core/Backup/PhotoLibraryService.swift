@@ -351,23 +351,51 @@ nonisolated enum PhotoLibraryService {
         let filename: String
     }
 
+    /// what `exportPrimary` would hand out, for callers that must describe
+    /// the file before exporting it.
+    nonisolated struct PrimaryResourceInfo: Sendable {
+        let contentType: UTType?
+        let filename: String
+        let hasLocation: Bool
+    }
+
     @concurrent
-    static func exportPrimary(localIdentifier: String, to directory: URL) async throws -> ExportedResource {
+    static func primaryResourceInfo(localIdentifier: String) async -> PrimaryResourceInfo? {
+        guard let asset = fetchPHAsset(localIdentifier), let resource = primaryResource(for: asset) else {
+            return nil
+        }
+        return PrimaryResourceInfo(
+            contentType: UTType(resource.uniformTypeIdentifier),
+            filename: resource.originalFilename,
+            hasLocation: asset.location != nil
+        )
+    }
+
+    @concurrent
+    static func exportPrimary(
+        localIdentifier: String,
+        to directory: URL,
+        progress: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> ExportedResource {
         guard let asset = fetchPHAsset(localIdentifier) else { throw PhotoLibraryError.assetMissing }
         guard let resource = primaryResource(for: asset) else { throw PhotoLibraryError.resourceMissing }
-        return try await export(resource, to: directory)
+        return try await export(resource, to: directory, progress: progress)
     }
 
     @concurrent
     static func exportMotion(localIdentifier: String, to directory: URL) async throws -> ExportedResource {
         guard let asset = fetchPHAsset(localIdentifier) else { throw PhotoLibraryError.assetMissing }
         guard let resource = motionResource(for: asset) else { throw PhotoLibraryError.resourceMissing }
-        return try await export(resource, to: directory)
+        return try await export(resource, to: directory, progress: nil)
     }
 
     /// streams the resource into a temp file through the same cancellable
     /// requestData path used for hashing - writeData offers no cancellation.
-    private static func export(_ resource: PHAssetResource, to directory: URL) async throws -> ExportedResource {
+    private static func export(
+        _ resource: PHAssetResource,
+        to directory: URL,
+        progress: (@Sendable (Double) -> Void)?
+    ) async throws -> ExportedResource {
         guard availableCapacity(at: directory) > storageFloor else {
             throw PhotoLibraryError.insufficientStorage
         }
@@ -378,6 +406,9 @@ nonisolated enum PhotoLibraryService {
 
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
+        options.progressHandler = { fraction in
+            progress?(fraction)
+        }
         let box = DataRequestBox(fileHandle: handle)
         do {
             try await withTaskCancellationHandler {
@@ -387,8 +418,8 @@ nonisolated enum PhotoLibraryService {
                     } completionHandler: { error in
                         if let error {
                             continuation.resume(throwing: mapCancellation(error))
-                        } else if box.writeFailed {
-                            continuation.resume(throwing: PhotoLibraryError.exportFailed)
+                        } else if let writeError = box.writeError {
+                            continuation.resume(throwing: writeError)
                         } else {
                             continuation.resume()
                         }
@@ -441,7 +472,7 @@ private nonisolated final class DataRequestBox: @unchecked Sendable {
         var hasher = Insecure.SHA1()
         var requestID: PHAssetResourceDataRequestID?
         var cancelled = false
-        var writeFailed = false
+        var writeError: NSError?
     }
 
     private let lock: OSAllocatedUnfairLock<State>
@@ -455,10 +486,13 @@ private nonisolated final class DataRequestBox: @unchecked Sendable {
     func append(_ data: Data) {
         lock.withLock { state in
             if let fileHandle {
+                guard state.writeError == nil else { return }
                 do {
                     try fileHandle.write(contentsOf: data)
                 } catch {
-                    state.writeFailed = true
+                    if state.writeError == nil {
+                        state.writeError = error as NSError
+                    }
                 }
             } else {
                 state.hasher.update(data: data)
@@ -472,8 +506,8 @@ private nonisolated final class DataRequestBox: @unchecked Sendable {
         }
     }
 
-    var writeFailed: Bool {
-        lock.withLock { $0.writeFailed }
+    var writeError: NSError? {
+        lock.withLock { $0.writeError }
     }
 
     /// handles the race where cancellation lands before the request id exists.

@@ -169,7 +169,7 @@ nonisolated enum AssetType: String, Codable {
     case other = "OTHER"
 }
 
-nonisolated enum AssetVisibility: String, Codable {
+nonisolated enum AssetVisibility: String, Codable, Sendable {
     case timeline
     case hidden
     case archive
@@ -178,7 +178,7 @@ nonisolated enum AssetVisibility: String, Codable {
 
 /// lightweight asset used across grids. built from timeline buckets or full
 /// dtos. codable so fetched buckets can persist for offline browsing.
-nonisolated struct Asset: Identifiable, Hashable, Codable {
+nonisolated struct Asset: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let ownerId: String
     let isImage: Bool
@@ -205,6 +205,11 @@ nonisolated struct Asset: Identifiable, Hashable, Codable {
     /// its two assets through `livePhotoVideoId`, but a device-only asset has
     /// no server ids yet and would otherwise look like a plain still.
     var hasLocalMotion = false
+    /// carried opportunistically by full asset responses. timeline buckets
+    /// omit these so opening a large share never waits on detail requests.
+    var originalFileName: String? = nil
+    var originalMimeType: String? = nil
+    var isEdited: Bool? = nil
 
     var isLocal: Bool { localIdentifier != nil }
 
@@ -358,7 +363,10 @@ nonisolated struct AssetDetail: Codable, Identifiable, Hashable {
             ratio: ratio,
             city: exifInfo?.city,
             country: exifInfo?.country,
-            createdAt: createdAt.flatMap { APIDate.parse($0) }
+            createdAt: createdAt.flatMap { APIDate.parse($0) },
+            originalFileName: originalFileName,
+            originalMimeType: originalMimeType,
+            isEdited: isEdited
         )
     }
 }
