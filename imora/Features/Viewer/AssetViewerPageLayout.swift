@@ -38,8 +38,11 @@ nonisolated struct AssetViewerChromePresentation: Equatable, Sendable {
         let canShowChrome = isChromeVisible && !isContextPreview
         let mediaIsUnobstructed = isCompact ? isAtMedia : !isInformationPresented
 
-        mountsTopToolbarItems = !isContextPreview && !isInformationPresented
-        showsNavigationBar = canShowChrome && (isCompact || !isInformationPresented)
+        // chrome toggles fade the top items in place: the bar stays mounted
+        // whenever it structurally could show, and hiding chrome unmounts the
+        // items instead of sliding the whole bar away.
+        mountsTopToolbarItems = isChromeVisible && !isContextPreview && !isInformationPresented
+        showsNavigationBar = !isContextPreview && (isCompact || !isInformationPresented)
         showsViewerBottomBar = canShowChrome && (isCompact || !isInformationPresented)
         reservesTransportControls = isPlayable && !isContextPreview
         showsTransportControls = reservesTransportControls
