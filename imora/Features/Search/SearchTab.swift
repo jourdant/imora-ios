@@ -283,6 +283,7 @@ struct SearchResultsGrid: View {
 
     @State private var albumAsset: Asset?
     @State private var editingAsset: Asset?
+    @State private var shareRequest: AssetShareRequest?
     @State private var workingAssetIDs: Set<String> = []
     @State private var toast: String?
 
@@ -290,6 +291,9 @@ struct SearchResultsGrid: View {
 
     var body: some View {
         gridContent
+            .background {
+                AssetSharePresenter(request: $shareRequest)
+            }
             .sheet(item: $albumAsset) { asset in
                 AddToAlbumSheet(assetIDs: [asset.id]) { message in
                     toast = message
@@ -403,13 +407,10 @@ struct SearchResultsGrid: View {
         let isWorking = workingAssetIDs.contains(asset.id)
 
         Section {
-            if let client = session.client {
-                ShareLink(
-                    item: SharedAssetFile(client: client, asset: asset),
-                    preview: SharePreview(asset.localDate.formatted(date: .abbreviated, time: .omitted))
-                ) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                }
+            Button {
+                shareRequest = AssetShareRequest(assets: [asset])
+            } label: {
+                Label("Share", systemImage: "square.and.arrow.up")
             }
 
             if actions.canFavorite {

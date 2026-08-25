@@ -449,6 +449,7 @@ struct AssetViewerScreen: View {
     @State private var informationNavigationPath: [AssetInformationDestination] = []
     @State private var pendingInformationDestination: AssetInformationDestination?
     @State private var showAddToAlbum = false
+    @State private var shareRequest: AssetShareRequest?
     @State private var showShareLinks = false
     @State private var showSimilar = false
     @State private var showEditor = false
@@ -759,6 +760,9 @@ struct AssetViewerScreen: View {
                     toast = message
                 }
             }
+        }
+        .background {
+            AssetSharePresenter(request: $shareRequest)
         }
         .sheet(isPresented: $showShareLinks) {
             if let serverAssetID {
@@ -1461,16 +1465,13 @@ struct AssetViewerScreen: View {
     /// far right with explicit device/everywhere choices.
     @ToolbarContentBuilder private func remoteToolbarItems(_ current: Asset) -> some ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
-            if let client = session.client {
-                ShareLink(
-                    item: SharedAssetFile(client: client, asset: current),
-                    preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Share")
-                .accessibilityIdentifier("viewer-share")
+            Button {
+                shareRequest = AssetShareRequest(assets: [current])
+            } label: {
+                Image(systemName: "square.and.arrow.up")
             }
+            .accessibilityLabel("Share")
+            .accessibilityIdentifier("viewer-share")
         }
 
         ToolbarSpacer(.flexible, placement: .bottomBar)
@@ -1561,15 +1562,12 @@ struct AssetViewerScreen: View {
     /// server actions come after they are backed up.
     @ToolbarContentBuilder private func localToolbarItems(_ current: Asset) -> some ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
-            if let localId = current.localIdentifier {
-                ShareLink(
-                    item: LocalSharedAssetFile(localIdentifier: localId),
-                    preview: SharePreview(current.localDate.formatted(date: .abbreviated, time: .omitted))
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Share")
+            Button {
+                shareRequest = AssetShareRequest(assets: [current])
+            } label: {
+                Image(systemName: "square.and.arrow.up")
             }
+            .accessibilityLabel("Share")
         }
 
         ToolbarSpacer(.flexible, placement: .bottomBar)
@@ -3455,67 +3453,5 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
                 <= AssetViewerDoubleTapZoom.fitTolerance
         }
 
-    }
-}
-
-// MARK: - share support
-
-nonisolated struct SharedAssetFile: Transferable {
-    let client: ImmichClient
-    let asset: Asset
-
-    func exportedURL() async throws -> URL {
-        let url = client.editedOriginalURL(assetID: asset.id)
-        var request = URLRequest(url: url)
-        for (key, value) in client.authHeaders {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-        // streamed to disk: buffering with data(for:) held the whole original
-        // in memory, which could jetsam the app on a large video.
-        let (tempURL, response) = try await URLSession.shared.download(for: request)
-        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
-        guard (200..<300).contains(http.statusCode) else {
-            try? FileManager.default.removeItem(at: tempURL)
-            throw ImmichError.http(http.statusCode, "")
-        }
-        var filename = "photo"
-        if let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
-           let range = disposition.range(of: "filename=\"") {
-            filename = String(disposition[range.upperBound...].prefix(while: { $0 != "\"" }))
-        } else if asset.isVideo {
-            filename = "video.mov"
-        } else {
-            filename = "photo.jpg"
-        }
-        let directory = FileManager.default.temporaryDirectory.appending(path: "share")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let target = directory.appending(path: "\(UUID().uuidString)-\(filename)")
-        try FileManager.default.moveItem(at: tempURL, to: target)
-        return target
-    }
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(exportedContentType: .item) { wrapper in
-            SentTransferredFile(try await wrapper.exportedURL())
-        }
-    }
-}
-
-/// shares the untouched bytes of a device-only asset.
-nonisolated struct LocalSharedAssetFile: Transferable {
-    let localIdentifier: String
-
-    func exportedURL() async throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "share")
-        return try await PhotoLibraryService.exportPrimary(
-            localIdentifier: localIdentifier,
-            to: directory
-        ).fileURL
-    }
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(exportedContentType: .item) { wrapper in
-            SentTransferredFile(try await wrapper.exportedURL())
-        }
     }
 }
