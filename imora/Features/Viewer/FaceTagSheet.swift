@@ -28,14 +28,17 @@ nonisolated struct FaceRegion: Equatable, Sendable {
     let height: Int
 }
 
-/// tag one person on the current asset: position a box over the face, then
-/// pick who it is. native port of the immich web face editor, which draws a
-/// draggable rect on the preview and reports it in that preview's pixels.
+/// tag one person on the current asset in two steps: position a box over
+/// the face on the full-size photo, then pick who it is. native port of the
+/// immich web face editor, which draws a draggable rect on the preview and
+/// reports it in that preview's pixels.
 struct FaceTagSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(SessionStore.self) private var session
 
     let asset: Asset
+    /// people already tagged on this asset, hidden from the picker.
+    var taggedPeople: [Person] = []
     let onTag: (Person, FaceRegion) -> Void
 
     @State private var image: UIImage?
@@ -43,59 +46,62 @@ struct FaceTagSheet: View {
     /// normalized to the preview, like the web editor before conversion.
     @State private var box = CGRect(x: 0.35, y: 0.35, width: 0.3, height: 0.3)
     @State private var people: [Person] = []
-    @State private var selection: Person?
     @State private var isLoading = true
     @State private var query = ""
     @State private var showNewPerson = false
     @State private var newPersonName = ""
+    @State private var showPersonPicker = false
+
+    private var selectablePeople: [Person] {
+        let taggedIDs = Set(taggedPeople.map(\.id))
+        return people.filter { !taggedIDs.contains($0.id) }
+    }
 
     private var visiblePeople: [Person] {
-        guard !query.isEmpty else { return people }
-        return people.filter { $0.name.localizedStandardContains(query) }
+        guard !query.isEmpty else { return selectablePeople }
+        return selectablePeople.filter { $0.name.localizedStandardContains(query) }
     }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                canvasArea
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
+            regionStep
+                .navigationDestination(isPresented: $showPersonPicker) {
+                    personStep
+                }
+        }
+        .task { await loadImage() }
+        .task { await loadPeople() }
+    }
 
+    // MARK: - step 1, face region
+
+    private var regionStep: some View {
+        canvasArea
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .safeAreaInset(edge: .bottom) {
                 Text("Move and resize the box over the face.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 10)
-                    .padding(.bottom, 4)
-
-                peopleList
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.8))
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity)
             }
+            .background {
+                Color.black.ignoresSafeArea()
+            }
+            .environment(\.colorScheme, .dark)
             .navigationTitle("Tag a Person")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
-                        if let selection { commit(selection) }
-                    }
-                    .disabled(selection == nil || image == nil)
-                    .accessibilityIdentifier("tag-person-confirm")
+                    Button("Next") { showPersonPicker = true }
+                        .disabled(image == nil)
+                        .accessibilityIdentifier("tag-person-next")
                 }
             }
-            .task { await loadImage() }
-            .task { await loadPeople() }
-            .alert("New Person", isPresented: $showNewPerson) {
-                TextField("Name", text: $newPersonName)
-                Button("Create") {
-                    let name = newPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !name.isEmpty else { return }
-                    commit(.pending(name: name))
-                }
-                .disabled(newPersonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("Cancel", role: .cancel) {}
-            }
-        }
     }
 
     @ViewBuilder private var canvasArea: some View {
@@ -105,7 +111,8 @@ struct FaceTagSheet: View {
                     image.size.width / max(image.size.height, 1),
                     contentMode: .fit
                 )
-                .frame(maxWidth: .infinity, maxHeight: 300)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 16)
                 .accessibilityIdentifier("tag-person-canvas")
         } else if loadFailed {
             VStack(spacing: 10) {
@@ -117,14 +124,14 @@ struct FaceTagSheet: View {
                     .foregroundStyle(.tint)
                     .buttonStyle(.plain)
             }
-            .frame(maxWidth: .infinity, minHeight: 220)
         } else {
             ProgressView()
-                .frame(maxWidth: .infinity, minHeight: 220)
         }
     }
 
-    private var peopleList: some View {
+    // MARK: - step 2, person picker
+
+    private var personStep: some View {
         List {
             Section {
                 Button {
@@ -133,7 +140,6 @@ struct FaceTagSheet: View {
                 } label: {
                     Label("New Person", systemImage: "plus")
                 }
-                .disabled(image == nil)
                 .accessibilityIdentifier("tag-person-new")
             }
 
@@ -142,8 +148,12 @@ struct FaceTagSheet: View {
                     personRow(person)
                 }
             } footer: {
-                if !isLoading, people.isEmpty {
-                    Text("No people on this server yet. Name a new person to start.")
+                if !isLoading, visiblePeople.isEmpty, query.isEmpty {
+                    Text(
+                        people.isEmpty
+                            ? "No people on this server yet. Name a new person to start."
+                            : "Everyone is already tagged on this item. Name a new person to add someone else."
+                    )
                 }
             }
         }
@@ -157,26 +167,47 @@ struct FaceTagSheet: View {
             placement: .navigationBarDrawer(displayMode: .always),
             prompt: "Search people"
         )
+        .navigationTitle("Choose a Person")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert("New Person", isPresented: $showNewPerson) {
+            TextField("Name", text: $newPersonName)
+            Button("Create") {
+                let name = newPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return }
+                commit(.pending(name: name))
+            }
+            .disabled(newPersonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        }
     }
 
     private func personRow(_ person: Person) -> some View {
-        let isSelected = selection?.id == person.id
-        return Button {
-            selection = isSelected ? nil : person
+        Button {
+            commit(person)
         } label: {
             HStack(spacing: 12) {
                 if let url = session.personThumbnailURL(person) {
                     RemoteImage(url: url, targetPixelSize: 120)
                         .frame(width: 48, height: 48)
                         .clipShape(.circle)
+                } else {
+                    Circle()
+                        .fill(.quaternary)
+                        .frame(width: 48, height: 48)
+                        .overlay {
+                            Image(systemName: "person.fill")
+                                .foregroundStyle(.secondary)
+                        }
                 }
+
                 Text(person.name.isEmpty ? "Unnamed" : person.name)
-                    .foregroundStyle(.primary)
-                Spacer()
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isSelected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                    .foregroundStyle(person.name.isEmpty ? Color.secondary : Color.primary)
+
+                Spacer(minLength: 0)
             }
+            .contentShape(.rect)
         }
+        .buttonStyle(.plain)
         .accessibilityIdentifier("tag-person-row-\(person.id)")
     }
 
@@ -206,8 +237,6 @@ struct FaceTagSheet: View {
                 isLoading = false
             }
         }
-        // already-tagged people stay listed: a person can legitimately get a
-        // second face region on the same asset.
         if let response = try? await session.client?.people() {
             people = response.people.filter { !($0.isHidden ?? false) }
         }

@@ -186,8 +186,8 @@ struct AssetInfoPanel: View {
                 )
             }
         }
-        .sheet(isPresented: $showAddPeople) {
-            FaceTagSheet(asset: asset) { person, region in
+        .fullScreenCover(isPresented: $showAddPeople) {
+            FaceTagSheet(asset: asset, taggedPeople: displayedPeople) { person, region in
                 submitTagPerson(person, region: region, for: asset.id)
             }
         }
@@ -705,8 +705,8 @@ struct AssetInfoPanel: View {
         guard let client = session.client else { return }
         let current = displayedPeople
         let isNewPerson = !current.contains { $0.id == person.id }
-        // A person already on the asset can gain a second face region; the
-        // visible list only changes for a new person.
+        // the picker hides people already on the asset, so this only guards
+        // a refresh that tagged the same person mid-flow.
         let desired = isNewPerson ? current + [person] : current
 
         peopleMutations.submit(
