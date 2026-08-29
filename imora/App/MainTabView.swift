@@ -35,8 +35,14 @@ struct MainTabView: View {
                 Tab("Library", systemImage: "books.vertical", value: TabKey.library) {
                     LibraryTab()
                 }
-                Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .search) {
-                    SearchTab()
+                if #available(iOS 27.0, *) {
+                    Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .prominent) {
+                        SearchTab()
+                    }
+                } else {
+                    Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .search) {
+                        SearchTab()
+                    }
                 }
             }
         }
