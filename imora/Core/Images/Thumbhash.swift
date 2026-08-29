@@ -1,18 +1,34 @@
 import UIKit
 
+private nonisolated final class ThumbhashImageCache: @unchecked Sendable {
+    let images: NSCache<NSString, UIImage>
+
+    init() {
+        images = NSCache()
+        images.totalCostLimit = 8 << 20
+    }
+}
+
 /// decodes immich thumbhash strings into tiny placeholder images.
 /// port of the reference thumbhash implementation.
 nonisolated enum Thumbhash {
+    private static let cache = ThumbhashImageCache()
+
     private static var isCancelled: Bool {
         withUnsafeCurrentTask { $0?.isCancelled ?? false }
     }
 
     static func image(fromBase64 base64: String) -> UIImage? {
         guard !isCancelled else { return nil }
+        let key = base64 as NSString
+        if let cached = cache.images.object(forKey: key) { return cached }
         var normalized = base64.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         while normalized.count % 4 != 0 { normalized.append("=") }
         guard let data = Data(base64Encoded: normalized) else { return nil }
-        return image(from: [UInt8](data))
+        guard let image = image(from: [UInt8](data)) else { return nil }
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.images.setObject(image, forKey: key, cost: cost)
+        return image
     }
 
     static func image(from hash: [UInt8]) -> UIImage? {
@@ -64,34 +80,55 @@ nonisolated enum Thumbhash {
         let width = ratio > 1 ? 32 : Int((32 * ratio).rounded())
         let height = ratio > 1 ? Int((32 / ratio).rounded()) : 32
 
+        let componentWidth = max(lx, hasAlpha ? 5 : 3)
+        let componentHeight = max(ly, hasAlpha ? 5 : 3)
+        var xBasis = [Double](repeating: 0, count: width * componentWidth)
+        var yBasis = [Double](repeating: 0, count: height * componentHeight)
+        for x in 0..<width {
+            for cx in 0..<componentWidth {
+                xBasis[x * componentWidth + cx] = cos(
+                    .pi / Double(width) * (Double(x) + 0.5) * Double(cx)
+                )
+            }
+        }
+        for y in 0..<height {
+            for cy in 0..<componentHeight {
+                yBasis[y * componentHeight + cy] = cos(
+                    .pi / Double(height) * (Double(y) + 0.5) * Double(cy)
+                )
+            }
+        }
+
+        func accumulate(
+            _ dc: Double,
+            _ ac: [Double],
+            _ nx: Int,
+            _ ny: Int,
+            x: Int,
+            y: Int
+        ) -> Double {
+            var value = dc
+            var index = 0
+            for cy in 0..<ny {
+                var cx = cy > 0 ? 0 : 1
+                let fy = yBasis[y * componentHeight + cy] * 2
+                while cx * ny < nx * (ny - cy), index < ac.count {
+                    value += ac[index] * xBasis[x * componentWidth + cx] * fy
+                    index += 1
+                    cx += 1
+                }
+            }
+            return value
+        }
+
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for y in 0..<height {
             guard !isCancelled else { return nil }
             for x in 0..<width {
-                var fx = [Double](repeating: 0, count: max(lx, hasAlpha ? 5 : 3))
-                var fy = [Double](repeating: 0, count: max(ly, hasAlpha ? 5 : 3))
-                for cx in fx.indices { fx[cx] = cos(.pi / Double(width) * (Double(x) + 0.5) * Double(cx)) }
-                for cy in fy.indices { fy[cy] = cos(.pi / Double(height) * (Double(y) + 0.5) * Double(cy)) }
-
-                func accumulate(_ dc: Double, _ ac: [Double], _ nx: Int, _ ny: Int) -> Double {
-                    var value = dc
-                    var j = 0
-                    for cy in 0..<ny {
-                        var cx = cy > 0 ? 0 : 1
-                        let fy2 = fy[cy] * 2
-                        while cx * ny < nx * (ny - cy), j < ac.count {
-                            value += ac[j] * fx[cx] * fy2
-                            j += 1
-                            cx += 1
-                        }
-                    }
-                    return value
-                }
-
-                let l = accumulate(lDC, lAC, lx, ly)
-                let p = accumulate(pDC, pAC, 3, 3)
-                let q = accumulate(qDC, qAC, 3, 3)
-                let a = hasAlpha ? accumulate(aDC, aAC, 5, 5) : 1
+                let l = accumulate(lDC, lAC, lx, ly, x: x, y: y)
+                let p = accumulate(pDC, pAC, 3, 3, x: x, y: y)
+                let q = accumulate(qDC, qAC, 3, 3, x: x, y: y)
+                let a = hasAlpha ? accumulate(aDC, aAC, 5, 5, x: x, y: y) : 1
 
                 let b = l - 2.0 / 3.0 * p
                 let r = (3 * l - b + q) / 2
