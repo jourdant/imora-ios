@@ -1209,6 +1209,9 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         // keep the source grid mounted so the next tap never waits for uikit
         // to restore the presenting hierarchy.
         modalPresentationStyle = .custom
+        // a custom presentation leaves the status bar to the presenter, whose
+        // light-mode dark glyphs would vanish over the black viewer.
+        modalPresentationCapturesStatusBarAppearance = true
         transitioningDelegate = transitionDriver
 
         if startsAsContextPreview,
@@ -1223,6 +1226,10 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // the viewer is always black, so everything it hosts - glass bars,
+        // menus, dialogs - resolves dark in either system appearance. scoped
+        // to this presentation; the rest of the app follows the system.
+        overrideUserInterfaceStyle = .dark
         view.backgroundColor = displayState.mode == .viewer ? .black : .clear
         transitionDriver.installGesture(on: view)
     }

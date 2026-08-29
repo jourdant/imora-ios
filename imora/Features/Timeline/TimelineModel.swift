@@ -476,6 +476,18 @@ final class TimelineModel {
         flatAssetIndexByID[id]
     }
 
+    func rowIndex(containingAnyOf assetIDs: [String]) -> Int? {
+        assetIDs.lazy.compactMap { self.rowAssetLocationByID[$0]?.row }.first
+    }
+
+    func bucketID(containing localDate: Date) -> String? {
+        let targetMonth = Self.monthKey(for: localDate)
+        return sections.first { section in
+            guard let date = Self.bucketDate(section.id) else { return false }
+            return Self.monthKey(for: date) == targetMonth
+        }?.id
+    }
+
     var viewerAssetIndexByID: [String: Int] {
         flatAssetIndexByID
     }

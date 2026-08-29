@@ -4,6 +4,7 @@ struct MainTabView: View {
     /// in-app navigation targets land here, so the shell owns both the inbox
     /// sheet and the tab switch an album deep link needs.
     @Bindable private var router = NotificationRouter.shared
+    @Bindable private var timelineRouter = TimelineNavigationRouter.shared
     @State private var selection: TabKey = .photos
 
     enum TabKey: Hashable {
@@ -54,6 +55,9 @@ struct MainTabView: View {
             // the albums tab picks the id up itself; switching to it is what
             // makes the tab exist in the first place.
             if id != nil { selection = .albums }
+        }
+        .onChange(of: timelineRouter.pendingTarget) { _, target in
+            if target != nil { selection = .photos }
         }
     }
 }

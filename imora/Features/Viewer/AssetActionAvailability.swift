@@ -12,6 +12,7 @@ nonisolated struct AssetActionAvailability: Equatable {
     let canEdit: Bool
     let canAddToAlbum: Bool
     let canArchive: Bool
+    let canViewInTimeline: Bool
     let canRestore: Bool
     let canDeletePermanently: Bool
 
@@ -34,6 +35,7 @@ nonisolated struct AssetActionAvailability: Equatable {
         canEdit = ownsAsset && isRemoteAsset && asset.isImage && isActive
         canAddToAlbum = hasServerCopy && isActive
         canArchive = ownsAsset && isRemoteAsset && isActive
+        canViewInTimeline = ownsAsset && isActive && asset.visibility == .timeline
         canRestore = ownsAsset && isRemoteAsset && asset.isTrashed
         canDeletePermanently = ownsAsset && isRemoteAsset && asset.isTrashed
     }

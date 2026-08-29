@@ -1661,6 +1661,12 @@ struct AssetViewerScreen: View {
                         }
                         .accessibilityIdentifier("viewer-remove-from-album")
                     }
+                    if actionAvailability?.canViewInTimeline == true {
+                        Button { viewCurrentInTimeline() } label: {
+                            Label("View in Timeline", systemImage: "photo.on.rectangle.angled")
+                        }
+                        .accessibilityIdentifier("viewer-view-in-timeline")
+                    }
                     if serverAssetID != nil, (current.isLocal || ownsCurrent) {
                         Button { showShareLinks = true } label: {
                             Label("Share Link", systemImage: "link")
@@ -1961,6 +1967,16 @@ struct AssetViewerScreen: View {
     }
 
     // MARK: - actions
+
+    private func viewCurrentInTimeline() {
+        guard let current, actionAvailability?.canViewInTimeline == true else { return }
+        let target = TimelineNavigationTarget(asset: current, serverAssetID: serverAssetID)
+        requestDismissal()
+        Task { @MainActor in
+            await Task.yield()
+            TimelineNavigationRouter.shared.open(target)
+        }
+    }
 
     private func requestDismissal() {
         cancelPendingInformationZoom()

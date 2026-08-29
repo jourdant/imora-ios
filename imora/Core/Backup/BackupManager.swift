@@ -49,6 +49,15 @@ nonisolated enum SingleAssetBackupError: LocalizedError {
     }
 }
 
+/// outcome of a multi-select backup started from the grid.
+nonisolated struct BulkBackupOutcome: Equatable, Sendable {
+    var uploaded = 0
+    var alreadyBackedUp = 0
+    var skipped = 0
+    var failed = 0
+    var firstFailure: String?
+}
+
 /// device asset paired with what the backup index knows about it.
 nonisolated struct LocalTimelineItem: Equatable, Sendable {
     let device: DeviceAsset
@@ -842,6 +851,102 @@ final class BackupManager {
             throw SingleAssetBackupError.failed("the server did not return a backup identifier.")
         }
         return remoteID
+    }
+
+    /// backs up several device assets picked in the grid. setup runs once and
+    /// uploads share the worker pool of a full run, so every tile keeps its
+    /// own progress overlay. like the single-asset path, this ignores the
+    /// automatic-backup preference: the selection is an explicit ask.
+    func backUp(localIdentifiers: [String]) async throws -> BulkBackupOutcome {
+        guard await PhotoLibraryService.requestFullAccess() else {
+            throw ImmichError.http(0, "full photo library access is required for backup.")
+        }
+        let user = try await client.currentUser()
+        userId = user.id
+        await index.load(serverHost: client.apiURL.host() ?? "", userId: user.id)
+
+        var outcome = BulkBackupOutcome()
+        var queue: [DeviceAsset] = []
+        for localId in localIdentifiers {
+            // an upload already in flight from another trigger covers this one.
+            if case .uploading = uploadStates[localId] {
+                outcome.skipped += 1
+                continue
+            }
+            if let entry = await index.entry(for: localId), entry.isBackedUp {
+                outcome.alreadyBackedUp += 1
+                continue
+            }
+            guard let asset = await PhotoLibraryService.assetInfo(localIdentifier: localId) else {
+                outcome.skipped += 1
+                continue
+            }
+            queue.append(asset)
+        }
+        guard !queue.isEmpty else {
+            await refreshLocalSnapshots()
+            return outcome
+        }
+
+        let client = client
+        let index = index
+        let deviceId = DeviceID.current
+        let scratch = Self.scratchDirectory
+        let account = accountKey
+        var quotaMessage: String?
+        let progress: @Sendable (String, Double) -> Void = { [weak self] localId, fraction in
+            guard let self else { return }
+            Task { @MainActor in self.noteUploadProgress(localId, fraction) }
+        }
+
+        await withTaskGroup(of: (String, UploadOutcome).self) { group in
+            var next = 0
+            @MainActor func addNext() {
+                guard next < queue.count, quotaMessage == nil else { return }
+                let asset = queue[next]
+                next += 1
+                uploadStates[asset.localIdentifier] = .uploading(0)
+                group.addTask {
+                    let result = await Self.uploadOne(
+                        asset: asset, client: client, index: index,
+                        deviceId: deviceId, scratch: scratch, account: account,
+                        onProgress: progress
+                    )
+                    return (asset.localIdentifier, result)
+                }
+            }
+            for _ in 0..<Self.uploadWorkers { addNext() }
+            while let (localId, result) = await group.next() {
+                switch result {
+                case .uploaded:
+                    outcome.uploaded += 1
+                    uploadStates[localId] = nil
+                case .duplicate:
+                    outcome.alreadyBackedUp += 1
+                    uploadStates[localId] = nil
+                case .failed(let reason):
+                    outcome.failed += 1
+                    if outcome.firstFailure == nil { outcome.firstFailure = reason }
+                    markUploadFailed(localId)
+                case .skipped:
+                    outcome.skipped += 1
+                    uploadStates[localId] = nil
+                case .quota(let message):
+                    // nothing else can succeed once the account is full.
+                    quotaMessage = message
+                    uploadStates[localId] = nil
+                    group.cancelAll()
+                }
+                localChanged()
+                addNext()
+            }
+        }
+        await index.save()
+        await refreshLocalSnapshots()
+        if let quotaMessage {
+            throw ImmichError.http(400, quotaMessage)
+        }
+        return outcome
     }
 
     private func waitForUpload(localIdentifier: String) async throws {

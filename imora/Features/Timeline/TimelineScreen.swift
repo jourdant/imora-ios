@@ -111,7 +111,7 @@ private struct VirtualRowStack<Content: View>: View {
     let starts: [CGFloat]
     let totalHeight: CGFloat
     let window: RowWindow
-    @ViewBuilder let content: (TimelineRow) -> Content
+    @ViewBuilder let content: (Int, TimelineRow) -> Content
 
     var body: some View {
         let count = min(rows.count, starts.count)
@@ -122,7 +122,7 @@ private struct VirtualRowStack<Content: View>: View {
             // position and hit testing needs no transforms - the same trick the
             // rows use horizontally.
             ForEach(items, id: \.row.id) { item in
-                content(item.row)
+                content(item.index, item.row)
                     .padding(.top, starts[item.index])
             }
         }
@@ -443,6 +443,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     /// opening it, and nothing else on a tile responds. person pages choose a
     /// featured photo this way.
     var onPickAsset: ((Asset) -> Void)?
+    @Binding private var navigationTarget: TimelineNavigationTarget?
     @Binding private var serverCommand: TimelineServerCommand?
     let header: Header
     /// the host's own trailing navigation items. they are declared here
@@ -488,6 +489,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
     @State private var tileRegistry = AssetTileRegistry()
+    @State private var selectionSlideController = TimelineSelectionSlideController()
     @State private var isRunningServerCommand = false
 
     init(
@@ -501,6 +503,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         albumOwnerID: String? = nil,
         onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
         onPickAsset: ((Asset) -> Void)? = nil,
+        navigationTarget: Binding<TimelineNavigationTarget?> = .constant(nil),
         serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
         @ToolbarContentBuilder trailingItems: () -> Trailing = {
             ToolbarItemGroup(placement: .topBarTrailing) {}
@@ -517,6 +520,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         self.albumOwnerID = albumOwnerID
         self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
         self.onPickAsset = onPickAsset
+        _navigationTarget = navigationTarget
         _serverCommand = serverCommand
         self.trailingItems = trailingItems()
         self.header = header()
@@ -696,9 +700,19 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                         starts: layout.starts,
                         totalHeight: layout.total,
                         window: rowWindow
-                    ) { row in
-                        rowView(row, side: side)
+                    ) { rowIndex, row in
+                        rowView(row, rowIndex: rowIndex, side: side)
                     }
+                }
+                .background {
+                    TimelineSelectionSlideInstaller(
+                        controller: selectionSlideController,
+                        isEnabled: isSelecting && !isPicking,
+                        selectedIDs: selection,
+                        assetIDsInRectangle: selectableAssetIDs,
+                        applyChanges: applySelectionRectangle,
+                        onActiveChanged: handleSelectionSlideActivity
+                    )
                 }
                 .padding(.bottom, tailPadding)
             }
@@ -735,6 +749,9 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
                 scrollContext.viewportWidth = width
+                if navigationTarget != nil {
+                    Task { await revealPendingTimelineTarget() }
+                }
                 let range = AssetGridLayout.columnRange(viewportWidth: width)
                 let target = preferredColumnCount.map {
                     min(range.upperBound, max(range.lowerBound, $0))
@@ -888,10 +905,13 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                         SelectionMoreMenu(
                             filter: filter,
                             isDisabled: isSelectionWorking || selection.isEmpty,
+                            serverActionsDisabled: selectionHasLocalAssets,
                             onFavorite: { await applyFavorite() },
                             onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
                             onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
-                            onAddToAlbum: { pendingAlbumAssets = Array(selection) }
+                            onAddToAlbum: { pendingAlbumAssets = Array(selection) },
+                            onBackUp: selectionHasLocalAssets ? applyBackup : nil,
+                            backUpTitle: isBackupOnlySelection ? "Back Up" : "Back Up Missing"
                         )
                     }
                 }
@@ -960,7 +980,11 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     )
                 }
                 await model.load()
+                await revealPendingTimelineTarget()
             }
+        }
+        .onChange(of: navigationTarget) {
+            Task { await revealPendingTimelineTarget() }
         }
         .onChange(of: resyncTrigger) {
             model.requestResync()
@@ -1010,6 +1034,32 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
 
     // MARK: - rows
 
+    private func revealPendingTimelineTarget() async {
+        guard let target = navigationTarget,
+              mergesLocalPhotos,
+              scrollContext.viewportWidth > 0
+        else { return }
+        if let bucketID = model.bucketID(containing: target.localDate) {
+            await model.loadBucket(bucketID)
+        }
+        guard navigationTarget == target,
+              let rowIndex = model.rowIndex(containingAnyOf: target.candidateAssetIDs)
+        else { return }
+
+        let side = tileSide(for: scrollContext.viewportWidth)
+        let layout = rowLayout(side: side)
+        guard layout.starts.indices.contains(rowIndex), model.rows.indices.contains(rowIndex) else { return }
+        let rowHeight = model.rows[rowIndex].height(tileSide: side)
+        let centeringInset = max(0, (scrollContext.viewportHeight - rowHeight) / 2)
+        let offset = max(0, scrub.headerHeight + layout.starts[rowIndex] - centeringInset)
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollPosition.scrollTo(y: offset)
+        }
+        navigationTarget = nil
+    }
+
     /// lands a rows swap the way the official clients do: content that
     /// changed above the viewport applies instantly with the scroll offset
     /// shifted by the exact height delta, so visible photos never move;
@@ -1054,7 +1104,11 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         }
     }
 
-    @ViewBuilder private func rowView(_ row: TimelineRow, side: CGFloat) -> some View {
+    @ViewBuilder private func rowView(
+        _ row: TimelineRow,
+        rowIndex: Int,
+        side: CGFloat
+    ) -> some View {
         switch row {
         case .titleBand(_, let segments):
             // leading padding instead of offset keeps each segment in layout,
@@ -1073,9 +1127,16 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             ZStack(alignment: .topLeading) {
                 ForEach(runs, id: \.colStart) { run in
                     HStack(spacing: 2) {
-                        ForEach(run.assets) { asset in
+                        ForEach(Array(run.assets.enumerated()), id: \.element.id) { offset, asset in
                             let isProjectedRemoved = model.projectedRemovalIDs.contains(asset.id)
-                            tile(asset, targetPixelSize: targetPixelSize)
+                            tile(
+                                asset,
+                                targetPixelSize: targetPixelSize,
+                                selectionPosition: SelectionGridPosition(
+                                    row: rowIndex,
+                                    column: run.colStart + offset
+                                )
+                            )
                                 .frame(width: side, height: side)
                                 .opacity(isProjectedRemoved ? 0 : 1)
                                 .allowsHitTesting(!isProjectedRemoved)
@@ -1138,7 +1199,11 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         .frame(width: width, height: 36, alignment: .bottomLeading)
     }
 
-    @ViewBuilder private func tile(_ asset: Asset, targetPixelSize: CGFloat) -> some View {
+    @ViewBuilder private func tile(
+        _ asset: Asset,
+        targetPixelSize: CGFloat,
+        selectionPosition: SelectionGridPosition
+    ) -> some View {
         // picking wants one photo and nothing else, so a tile carries neither
         // the long-press menu nor a viewer of its own while the mode is on.
         if let onPickAsset {
@@ -1169,6 +1234,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 isSelecting: isSelecting,
                 isSelected: selection.contains(asset.id),
                 isSelectable: isSelectable(asset),
+                selectionPosition: selectionPosition,
                 registry: tileRegistry,
                 toggleSelection: { toggle(asset) },
                 menu: { UIMenu(children: menuElements(for: asset)) },
@@ -1374,13 +1440,28 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         return asset.ownerId == userID || albumOwnerID == userID
     }
 
+    /// device photos join selection only while they still need a backup, so
+    /// server actions keep their remote-id contract for everything else.
     private func isSelectable(_ asset: Asset) -> Bool {
-        !asset.isLocal && owns(asset)
+        if asset.isLocal { return !asset.isLocalBackedUp }
+        return owns(asset)
     }
 
     private func isSelectableAssetID(_ id: String) -> Bool {
         guard let index = model.flatAssetIndex(for: id) else { return false }
         return isSelectable(model.flatAssets[index])
+    }
+
+    /// device ids carry the local- prefix, so selection composition reads
+    /// off the id set without walking the model.
+    private var selectionHasLocalAssets: Bool {
+        selection.contains { $0.hasPrefix("local-") }
+    }
+
+    /// backed-up device photos are never selectable, so a local-only
+    /// selection is exactly the not-yet-backed-up one bulk backup serves.
+    private var isBackupOnlySelection: Bool {
+        !selection.isEmpty && selection.allSatisfy { $0.hasPrefix("local-") }
     }
 
     @ViewBuilder private var overlayState: some View {
@@ -1450,6 +1531,60 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         } else {
             selection.insert(asset.id)
         }
+    }
+
+    private func selectableAssetIDs(
+        in rectangle: SelectionGridRectangle
+    ) -> Set<String> {
+        guard !model.rows.isEmpty else { return [] }
+        let lowerRow = max(0, rectangle.rows.lowerBound)
+        let upperRow = min(model.rows.count - 1, rectangle.rows.upperBound)
+        guard lowerRow <= upperRow else { return [] }
+
+        var result = Set<String>()
+        for rowIndex in lowerRow...upperRow {
+            guard case .tiles(_, let runs) = model.rows[rowIndex] else { continue }
+            for run in runs {
+                for (offset, asset) in run.assets.enumerated() {
+                    let column = run.colStart + offset
+                    guard rectangle.columns.contains(column),
+                          isSelectable(asset),
+                          !model.projectedRemovalIDs.contains(asset.id)
+                    else { continue }
+                    result.insert(asset.id)
+                }
+            }
+        }
+        return result
+    }
+
+    private func applySelectionRectangle(
+        _ changes: [SelectionRectangleState.Change]
+    ) {
+        guard isSelecting, !changes.isEmpty else { return }
+        var updated = selection
+        for change in changes where isSelectableAssetID(change.assetID) {
+            if change.selects {
+                updated.insert(change.assetID)
+            } else {
+                updated.remove(change.assetID)
+            }
+        }
+        selection = updated
+    }
+
+    private func handleSelectionSlideActivity(_ isActive: Bool) {
+        if isActive {
+            AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                owner: openingChromePrewarmOwner
+            )
+            showIndicator()
+            model.deferRebuilds()
+            return
+        }
+        scheduleIndicatorHide()
+        model.resumeRebuilds()
+        updateRowWindow()
     }
 
     /// entry and exit run inside one animation so the toolbar swap, the tab
@@ -1781,7 +1916,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     /// Device deletion happens first so cancelling the system prompt leaves the
     /// server untouched. Once that irreversible step succeeds, the remote
     /// projection disappears immediately and is restored if the server rejects
-    /// its half of the operation.
+    /// its half of the operation. not-yet-backed-up device photos have no
+    /// server half at all: deleting them only removes them from the library.
     @discardableResult
     private func deleteAssets(_ assets: [Asset], force: Bool) async -> Bool {
         guard let client = session.client else {
@@ -1791,20 +1927,19 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         let targets = assets.compactMap { asset -> (sourceID: String, serverID: String)? in
             serverIdentifier(for: asset).map { (asset.id, $0) }
         }
-        guard targets.count == assets.count, !targets.isEmpty else {
-            ErrorToastCenter.shared.show("This item does not have a server copy yet.")
-            return false
-        }
-        let sourceIDs = Set(targets.map(\.sourceID))
-        guard beginServerMutation(ids: sourceIDs) else { return false }
+        let serverSourceIDs = Set(targets.map(\.sourceID))
+        let deviceOnlyIDs = Set(assets.map(\.id)).subtracting(serverSourceIDs)
+        let sourceIDs = serverSourceIDs.union(deviceOnlyIDs)
+        guard !sourceIDs.isEmpty, beginServerMutation(ids: sourceIDs) else { return false }
         defer { finishServerMutation(ids: sourceIDs) }
 
         var localIDs = Set<String>()
-        for (asset, target) in zip(assets, targets) {
+        for asset in assets {
             if let localID = pairedLocalIdentifier(for: asset) {
                 localIDs.insert(localID)
-            } else if let backup = session.backup,
-                      let localID = await backup.localIdentifier(forRemote: target.serverID) {
+            } else if let serverID = serverIdentifier(for: asset),
+                      let backup = session.backup,
+                      let localID = await backup.localIdentifier(forRemote: serverID) {
                 localIDs.insert(localID)
             }
         }
@@ -1821,6 +1956,13 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             for target in targets { downloadedLocalIdentifiers[target.serverID] = nil }
         }
 
+        // the device copies are gone for good at this point, so device-only
+        // photos leave the grid immediately and never roll back.
+        if !deviceOnlyIDs.isEmpty {
+            model.commit(model.removeAssetsForOptimisticAction(ids: deviceOnlyIDs))
+        }
+        guard !targets.isEmpty else { return true }
+
         let errorMessage: String
         if localIDs.isEmpty {
             errorMessage = force ? "Couldn’t delete permanently" : "Couldn’t move to trash"
@@ -1832,7 +1974,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         var removal: TimelineRemoval?
         let result: Void? = await OptimisticAction.perform(
             errorMessage: errorMessage,
-            apply: { removal = model.removeAssetsForOptimisticAction(ids: sourceIDs) },
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: serverSourceIDs) },
             rollback: { if let removal { model.restore(removal) } },
             request: {
                 try await client.trashAssets(ids: targets.map(\.serverID), force: force)
@@ -1950,6 +2092,40 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         if selection.isEmpty { exitSelection() }
     }
 
+    /// uploads continue after the mode closes so tiles report progress
+    /// through their own overlays, like the single-asset menu action.
+    private func applyBackup() {
+        guard let backup = session.backup else {
+            ErrorToastCenter.shared.show("Backup is not available.")
+            return
+        }
+        let localIDs = model.flatAssets
+            .filter { selection.contains($0.id) }
+            .compactMap(\.localIdentifier)
+        guard !localIDs.isEmpty else { return }
+        exitSelection()
+        Task {
+            do {
+                let outcome = try await backup.backUp(localIdentifiers: localIDs)
+                if outcome.failed > 0 {
+                    ErrorToastCenter.shared.show(bulkBackupFailureMessage(outcome))
+                }
+            } catch {
+                ErrorToastCenter.shared.show("Couldn’t back up", error: error)
+            }
+            // partial uploads may have landed even when the run threw.
+            await model.refreshLocalItems()
+        }
+    }
+
+    private func bulkBackupFailureMessage(_ outcome: BulkBackupOutcome) -> String {
+        let base = outcome.failed == 1
+            ? "Couldn’t back up 1 item."
+            : "Couldn’t back up \(outcome.failed) items."
+        guard let reason = outcome.firstFailure else { return base }
+        return "\(base) \(reason)"
+    }
+
     private static func scrubberMonths(spans: [TimelineSectionSpan], side: CGFloat) -> [ScrubberMonth] {
         var y: CGFloat = 0
         return spans.map { span in
@@ -2034,10 +2210,382 @@ private struct PlaceholderGrid: View {
     }
 }
 
-/// uikit-hosted tile owning tap and long press. swiftui's contextMenu cannot
-/// commit when the floating preview is tapped, so the interaction is bridged
-/// on the same view that draws the tile. UIKit owns its temporary preview and
-/// source visibility; the app keeps no duplicate or delayed cleanup view.
+@MainActor
+private protocol SelectionAutoScrollerDelegate: AnyObject {
+    func selectionAutoScrollerDidScroll(to point: CGPoint, in window: UIWindow)
+}
+
+@MainActor
+private final class SelectionAutoScroller {
+    @MainActor
+    private final class DisplayLinkTarget: NSObject {
+        weak var owner: SelectionAutoScroller?
+
+        @objc func tick(_ displayLink: CADisplayLink) {
+            owner?.advance(displayLink)
+        }
+    }
+
+    weak var delegate: SelectionAutoScrollerDelegate?
+    private weak var scrollView: UIScrollView?
+    private weak var window: UIWindow?
+    private var location = CGPoint.zero
+    private var speed: CGFloat = 0
+    private var displayLink: CADisplayLink?
+    private var lastTimestamp: CFTimeInterval?
+    private let displayLinkTarget = DisplayLinkTarget()
+
+    init(delegate: SelectionAutoScrollerDelegate) {
+        self.delegate = delegate
+        displayLinkTarget.owner = self
+    }
+
+    deinit {
+        displayLink?.invalidate()
+    }
+
+    func update(location: CGPoint, in window: UIWindow, scrollView: UIScrollView) {
+        self.location = location
+        self.window = window
+        self.scrollView = scrollView
+        let frame = scrollView.convert(scrollView.bounds, to: window)
+        guard frame.height > 0 else {
+            stopDisplayLink()
+            return
+        }
+        speed = SelectionAutoScrollProfile.timeline.speed(
+            at: location.y,
+            in: frame.minY...frame.maxY
+        )
+        if speed == 0 {
+            stopDisplayLink()
+        } else {
+            startDisplayLink()
+        }
+    }
+
+    func stop() {
+        speed = 0
+        scrollView = nil
+        window = nil
+        stopDisplayLink()
+    }
+
+    private func startDisplayLink() {
+        guard displayLink == nil else { return }
+        let link = CADisplayLink(
+            target: displayLinkTarget,
+            selector: #selector(DisplayLinkTarget.tick(_:))
+        )
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+        lastTimestamp = nil
+    }
+
+    private func advance(_ displayLink: CADisplayLink) {
+        guard let scrollView, let window, speed != 0 else {
+            stop()
+            return
+        }
+        let elapsed = lastTimestamp.map { displayLink.timestamp - $0 }
+            ?? displayLink.targetTimestamp - displayLink.timestamp
+        lastTimestamp = displayLink.timestamp
+        let interval = min(1.0 / 15.0, max(0, elapsed))
+        let insets = scrollView.adjustedContentInset
+        let minimumY = -insets.top
+        let maximumY = max(
+            minimumY,
+            scrollView.contentSize.height - scrollView.bounds.height + insets.bottom
+        )
+        let currentY = scrollView.contentOffset.y
+        let targetY = min(maximumY, max(minimumY, currentY + speed * interval))
+        guard abs(targetY - currentY) > 0.01 else { return }
+        scrollView.setContentOffset(
+            CGPoint(x: scrollView.contentOffset.x, y: targetY),
+            animated: false
+        )
+        delegate?.selectionAutoScrollerDidScroll(to: location, in: window)
+    }
+}
+
+@MainActor
+private final class TimelineSelectionSlideController: NSObject,
+    UIGestureRecognizerDelegate,
+    SelectionAutoScrollerDelegate
+{
+    private weak var scrollView: UIScrollView?
+    private weak var directRecognizer: UIPanGestureRecognizer?
+    private weak var heldRecognizer: UILongPressGestureRecognizer?
+    private weak var activeRecognizer: UIGestureRecognizer?
+    private var isEnabled = false
+    private var isActive = false
+    private var selectedIDs = Set<String>()
+    private var origin: SelectionGridPosition?
+    private var target: SelectionGridPosition?
+    private var selectionRectangle = SelectionRectangleState()
+    private var assetIDsInRectangle: (SelectionGridRectangle) -> Set<String> = { _ in [] }
+    private var applyChanges: ([SelectionRectangleState.Change]) -> Void = { _ in }
+    private var onActiveChanged: (Bool) -> Void = { _ in }
+    private let selectionFeedback = UISelectionFeedbackGenerator()
+    private lazy var autoScroller = SelectionAutoScroller(delegate: self)
+
+    func configure(
+        isEnabled: Bool,
+        selectedIDs: Set<String>,
+        assetIDsInRectangle: @escaping (SelectionGridRectangle) -> Set<String>,
+        applyChanges: @escaping ([SelectionRectangleState.Change]) -> Void,
+        onActiveChanged: @escaping (Bool) -> Void
+    ) {
+        self.selectedIDs = selectedIDs
+        self.assetIDsInRectangle = assetIDsInRectangle
+        self.applyChanges = applyChanges
+        self.onActiveChanged = onActiveChanged
+        self.isEnabled = isEnabled
+        if !isEnabled { finishSelection() }
+        directRecognizer?.isEnabled = isEnabled
+        heldRecognizer?.isEnabled = isEnabled
+    }
+
+    func attach(to scrollView: UIScrollView) {
+        guard self.scrollView !== scrollView else { return }
+        detach()
+        let direct = UIPanGestureRecognizer(target: self, action: #selector(selected(_:)))
+        direct.maximumNumberOfTouches = 1
+        direct.delegate = self
+        direct.isEnabled = isEnabled
+        let held = UILongPressGestureRecognizer(target: self, action: #selector(selected(_:)))
+        held.minimumPressDuration = 0.3
+        held.allowableMovement = 14
+        held.numberOfTouchesRequired = 1
+        held.delegate = self
+        held.isEnabled = isEnabled
+        scrollView.addGestureRecognizer(direct)
+        scrollView.addGestureRecognizer(held)
+        scrollView.panGestureRecognizer.require(toFail: direct)
+        self.scrollView = scrollView
+        directRecognizer = direct
+        heldRecognizer = held
+    }
+
+    func detach() {
+        finishSelection()
+        if let directRecognizer { scrollView?.removeGestureRecognizer(directRecognizer) }
+        if let heldRecognizer { scrollView?.removeGestureRecognizer(heldRecognizer) }
+        directRecognizer = nil
+        heldRecognizer = nil
+        scrollView = nil
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard isEnabled,
+              let scrollView,
+              let window = scrollView.window
+        else { return false }
+        let point = originPoint(of: gestureRecognizer, in: window)
+        guard tile(at: point, in: scrollView, window: window)?.isSelectable == true else {
+            return false
+        }
+        guard let direct = gestureRecognizer as? UIPanGestureRecognizer else {
+            return gestureRecognizer === heldRecognizer
+        }
+        guard gestureRecognizer === directRecognizer else { return false }
+        let translation = direct.translation(in: window)
+        return SelectionDirectDragIntent.timeline.matches(
+            translation: CGSize(width: translation.x, height: translation.y)
+        )
+    }
+
+    @objc private func selected(_ recognizer: UIGestureRecognizer) {
+        guard let scrollView, let window = scrollView.window else {
+            finishSelection()
+            return
+        }
+        let point = recognizer.location(in: window)
+        switch recognizer.state {
+        case .began:
+            beginSelection(recognizer, point: point, scrollView: scrollView, window: window)
+        case .changed:
+            guard activeRecognizer === recognizer else { return }
+            updateRectangle(at: point, in: scrollView, window: window)
+            autoScroller.update(location: point, in: window, scrollView: scrollView)
+        case .ended, .cancelled, .failed:
+            if activeRecognizer === recognizer { finishSelection() }
+        default:
+            break
+        }
+    }
+
+    private func beginSelection(
+        _ recognizer: UIGestureRecognizer,
+        point: CGPoint,
+        scrollView: UIScrollView,
+        window: UIWindow
+    ) {
+        guard activeRecognizer == nil else { return }
+        guard let tile = tile(
+            at: originPoint(of: recognizer, in: window),
+            in: scrollView,
+            window: window
+        ), tile.isSelectable else { return }
+        activeRecognizer = recognizer
+        origin = tile.selectionPosition
+        target = nil
+        selectionRectangle.begin(
+            originIsSelected: tile.isSelected,
+            selectedIDs: selectedIDs
+        )
+        setActive(true)
+        selectionFeedback.prepare()
+        updateRectangle(at: point, in: scrollView, window: window)
+        autoScroller.update(location: point, in: window, scrollView: scrollView)
+    }
+
+    private func finishSelection() {
+        autoScroller.stop()
+        selectionRectangle.end()
+        activeRecognizer = nil
+        origin = nil
+        target = nil
+        setActive(false)
+    }
+
+    private func setActive(_ isActive: Bool) {
+        guard self.isActive != isActive else { return }
+        self.isActive = isActive
+        onActiveChanged(isActive)
+    }
+
+    private func originPoint(
+        of recognizer: UIGestureRecognizer,
+        in window: UIWindow
+    ) -> CGPoint {
+        let point = recognizer.location(in: window)
+        guard let pan = recognizer as? UIPanGestureRecognizer else { return point }
+        let translation = pan.translation(in: window)
+        return CGPoint(x: point.x - translation.x, y: point.y - translation.y)
+    }
+
+    private func updateRectangle(
+        at point: CGPoint,
+        in scrollView: UIScrollView,
+        window: UIWindow
+    ) {
+        guard let origin,
+              let tile = tile(at: point, in: scrollView, window: window),
+              tile.selectionPosition != target
+        else { return }
+        target = tile.selectionPosition
+        let rectangle = SelectionGridRectangle(origin: origin, target: tile.selectionPosition)
+        apply(selectionRectangle.update(assetIDs: assetIDsInRectangle(rectangle)))
+    }
+
+    private func tile(
+        at point: CGPoint,
+        in scrollView: UIScrollView,
+        window: UIWindow
+    ) -> InteractiveAssetTileView? {
+        let frame = scrollView.convert(scrollView.bounds, to: window)
+        guard frame.width > 2, frame.height > 2 else { return nil }
+        let clamped = CGPoint(
+            x: min(frame.maxX - 1, max(frame.minX + 1, point.x)),
+            y: min(frame.maxY - 1, max(frame.minY + 1, point.y))
+        )
+        var candidate = scrollView.hitTest(scrollView.convert(clamped, from: window), with: nil)
+        while let view = candidate {
+            if let tile = view as? InteractiveAssetTileView { return tile }
+            candidate = view.superview
+        }
+        return nil
+    }
+
+    private func apply(_ changes: [SelectionRectangleState.Change]) {
+        guard !changes.isEmpty else { return }
+        applyChanges(changes)
+        selectionFeedback.selectionChanged()
+        selectionFeedback.prepare()
+    }
+
+    func selectionAutoScrollerDidScroll(to point: CGPoint, in window: UIWindow) {
+        guard let scrollView else { return }
+        updateRectangle(at: point, in: scrollView, window: window)
+    }
+}
+
+private final class TimelineSelectionSlideInstallerView: UIView {
+    weak var controller: TimelineSelectionSlideController?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        attach()
+    }
+
+    func attach() {
+        guard window != nil else { return }
+        var candidate = superview
+        while let view = candidate {
+            if let scrollView = view as? UIScrollView {
+                controller?.attach(to: scrollView)
+                return
+            }
+            candidate = view.superview
+        }
+    }
+}
+
+private struct TimelineSelectionSlideInstaller: UIViewRepresentable {
+    let controller: TimelineSelectionSlideController
+    let isEnabled: Bool
+    let selectedIDs: Set<String>
+    let assetIDsInRectangle: (SelectionGridRectangle) -> Set<String>
+    let applyChanges: ([SelectionRectangleState.Change]) -> Void
+    let onActiveChanged: (Bool) -> Void
+
+    func makeUIView(context: Context) -> TimelineSelectionSlideInstallerView {
+        let view = TimelineSelectionSlideInstallerView()
+        view.isUserInteractionEnabled = false
+        view.controller = controller
+        configureController()
+        return view
+    }
+
+    func updateUIView(_ uiView: TimelineSelectionSlideInstallerView, context: Context) {
+        uiView.controller = controller
+        configureController()
+        uiView.attach()
+    }
+
+    static func dismantleUIView(
+        _ uiView: TimelineSelectionSlideInstallerView,
+        coordinator: Void
+    ) {
+        uiView.controller?.detach()
+    }
+
+    private func configureController() {
+        controller.configure(
+            isEnabled: isEnabled,
+            selectedIDs: selectedIDs,
+            assetIDsInRectangle: assetIDsInRectangle,
+            applyChanges: applyChanges,
+            onActiveChanged: onActiveChanged
+        )
+    }
+}
+
+/// the uikit-hosted tile owns tap and long press. swiftui context menus cannot
+/// commit when the floating preview is tapped, so the interaction stays on the
+/// same view that draws the tile.
+private final class InteractiveAssetTileView: UIView {
+    var isSelected = false
+    var isSelectable = false
+    var selectionPosition = SelectionGridPosition(row: 0, column: 0)
+}
+
 private struct InteractiveAssetTile: UIViewRepresentable {
     @Environment(SessionStore.self) private var session
     let asset: Asset
@@ -2046,14 +2594,16 @@ private struct InteractiveAssetTile: UIViewRepresentable {
     let isSelecting: Bool
     let isSelected: Bool
     let isSelectable: Bool
+    let selectionPosition: SelectionGridPosition
     let registry: AssetTileRegistry
     let toggleSelection: () -> Void
     let menu: () -> UIMenu
     let makeViewer: (_ startsAsContextPreview: Bool, _ bounds: CGSize) -> AssetViewerHostingController?
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+    func makeUIView(context: Context) -> InteractiveAssetTileView {
+        let view = InteractiveAssetTileView()
         view.backgroundColor = .clear
+        updateInteractionState(of: view)
         let contentView = configuration.makeContentView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(contentView)
@@ -2099,8 +2649,9 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
+    func updateUIView(_ uiView: InteractiveAssetTileView, context: Context) {
         context.coordinator.host = self
+        updateInteractionState(of: uiView)
         // every scroll phase change re-runs the grid body, and each tile hosts
         // a swiftui renderer of its own: handing back an identical
         // configuration would redraw all of them for nothing. backup state
@@ -2137,7 +2688,7 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         let isSelectable: Bool
     }
 
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
+    static func dismantleUIView(_ uiView: InteractiveAssetTileView, coordinator: Coordinator) {
         coordinator.unregister(uiView)
     }
 
@@ -2157,6 +2708,12 @@ private struct InteractiveAssetTile: UIViewRepresentable {
                 .environment(session)
         }
         .margins(.all, 0)
+    }
+
+    private func updateInteractionState(of view: InteractiveAssetTileView) {
+        view.isSelected = isSelected
+        view.isSelectable = isSelectable
+        view.selectionPosition = selectionPosition
     }
 
     final class Coordinator: NSObject, UIContextMenuInteractionDelegate {
@@ -2254,7 +2811,6 @@ private struct InteractiveAssetTile: UIViewRepresentable {
             _ interaction: UIContextMenuInteraction,
             configurationForMenuAtLocation location: CGPoint
         ) -> UIContextMenuConfiguration? {
-            guard !host.isSelecting else { return nil }
             guard let bounds = interaction.view?.window?.bounds.size else { return nil }
             let viewer = host.makeViewer(true, bounds)
             return UIContextMenuConfiguration(
@@ -2448,7 +3004,7 @@ private struct ScrubberMarkerRail: View, Equatable {
                         // draw under a uikit indicator, so sharing the column
                         // is as layered as the two can get.
                         Circle()
-                            .fill(.white)
+                            .fill(Color(.label))
                             .frame(width: 4, height: 4)
                             .shadow(color: .black.opacity(0.4), radius: 1)
                             .padding(.trailing, 2.5)

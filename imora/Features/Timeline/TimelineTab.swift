@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TimelineTab: View {
     @Environment(SessionStore.self) private var session
+    @Bindable private var router = TimelineNavigationRouter.shared
     @State private var showSettings = false
 
     var body: some View {
@@ -14,6 +15,7 @@ struct TimelineTab: View {
                 filter: TimelineFilter(withPartners: true, withStacked: true),
                 showsLargeTitle: false,
                 mergesLocalPhotos: true,
+                navigationTarget: $router.pendingTarget,
                 trailingItems: {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {

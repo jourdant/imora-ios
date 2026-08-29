@@ -170,7 +170,6 @@ private struct AssetViewerOpeningChromeSource: View {
         }
         .containerBackground(Color.clear, for: .navigation)
         .tint(.white)
-        .preferredColorScheme(.dark)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -338,6 +337,11 @@ private final class AssetViewerOpeningChromeRendererController:
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // the snapshot overlays the always-black viewer, so its content must
+        // resolve dark in either system appearance. a trait override stays
+        // scoped to this hosting view - preferredColorScheme is a window
+        // preference and would pin the whole app dark from here.
+        overrideUserInterfaceStyle = .dark
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
         view.accessibilityElementsHidden = true

@@ -5,44 +5,65 @@ import SwiftUI
 // behind its center pill.
 
 /// remaining bulk actions behind an ellipsis, mounted as a toolbar item next
-/// to the cancel button - the bottom bar has no room left for it.
+/// to the cancel button - the bottom bar has no room left for it. bulk
+/// backup lives here too, offered whenever the selection holds
+/// not-yet-backed-up device photos.
 struct SelectionMoreMenu: View {
     let filter: TimelineFilter
     let isDisabled: Bool
+    /// server actions need a remote id for every item, so a selection
+    /// holding device photos turns them off while back up stays live.
+    let serverActionsDisabled: Bool
     let onFavorite: () async -> Void
     let onArchive: () async -> Void
     var onRemoveFromAlbum: (() async -> Void)?
     let onAddToAlbum: () -> Void
+    /// set while the selection holds not-yet-backed-up device photos. only
+    /// those upload; the title reads back up missing when server items are
+    /// mixed in.
+    var onBackUp: (() -> Void)?
+    var backUpTitle = "Back Up"
 
     var body: some View {
         Menu {
-            Button {
-                Task { await onFavorite() }
-            } label: {
-                Label("Favorite", systemImage: "heart")
-            }
-            if let onRemoveFromAlbum {
-                Button(action: onAddToAlbum) {
-                    Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
-                }
-                Button {
-                    Task { await onRemoveFromAlbum() }
-                } label: {
-                    Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
-                }
-            } else {
-                Button {
-                    Task { await onArchive() }
-                } label: {
-                    Label(
-                        filter.visibility == .archive ? "Unarchive" : "Archive",
-                        systemImage: filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
-                    )
-                }
-                Button(action: onAddToAlbum) {
-                    Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+            if let onBackUp {
+                Section {
+                    Button(action: onBackUp) {
+                        Label(backUpTitle, systemImage: "icloud.and.arrow.up")
+                    }
+                    .accessibilityIdentifier("selection-backup")
                 }
             }
+            Section {
+                Button {
+                    Task { await onFavorite() }
+                } label: {
+                    Label("Favorite", systemImage: "heart")
+                }
+                if let onRemoveFromAlbum {
+                    Button(action: onAddToAlbum) {
+                        Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                    }
+                    Button {
+                        Task { await onRemoveFromAlbum() }
+                    } label: {
+                        Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                    }
+                } else {
+                    Button {
+                        Task { await onArchive() }
+                    } label: {
+                        Label(
+                            filter.visibility == .archive ? "Unarchive" : "Archive",
+                            systemImage: filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
+                        )
+                    }
+                    Button(action: onAddToAlbum) {
+                        Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                    }
+                }
+            }
+            .disabled(serverActionsDisabled)
         } label: {
             Image(systemName: "ellipsis")
         }
