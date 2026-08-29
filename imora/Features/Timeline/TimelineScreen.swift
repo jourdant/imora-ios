@@ -2,6 +2,7 @@ import SwiftUI
 
 private struct TimelineScrollState: Equatable {
     let offsetY: CGFloat
+    let indicatorOffsetY: CGFloat
     let insetTop: CGFloat
     let insetBottom: CGFloat
     let containerHeight: CGFloat
@@ -90,7 +91,7 @@ private final class RowWindow {
 
 /// how far past the viewport rows stay mounted, so a swipe reveals content
 /// that already exists and placeholder onAppear loads run ahead of arrival.
-private let rowWindowBuffer: CGFloat = 600
+private let rowWindowBuffer: CGFloat = 360
 
 /// the app's own lazy stack, replacing LazyVStack: every mounted row is
 /// placed at its exact offset inside a frame of exactly the layout's total
@@ -297,7 +298,7 @@ private final class ScrubberState {
         if insetTop != state.insetTop { insetTop = state.insetTop }
         if insetBottom != state.insetBottom { insetBottom = state.insetBottom }
         if containerHeight != state.containerHeight { containerHeight = state.containerHeight }
-        if offsetY != state.offsetY { offsetY = state.offsetY }
+        if offsetY != state.indicatorOffsetY { offsetY = state.indicatorOffsetY }
     }
 
     /// every input `railMarks` reads. the thumb moves every frame of a drag but
@@ -418,6 +419,7 @@ nonisolated enum TimelineServerCommand: Equatable {
 struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     @Environment(SessionStore.self) private var session
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.openURL) private var openURL
 
     let title: String
@@ -533,6 +535,11 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         AssetGridLayout.tileSide(viewportWidth: width, columns: columnCount)
     }
 
+    private func thumbnailPixelSize(for side: CGFloat) -> CGFloat {
+        let pixels = max(1, side * displayScale)
+        return min(1_280, (pixels / 32).rounded(.up) * 32)
+    }
+
     private func applyColumnCount(
         _ target: Int,
         viewportWidth: CGFloat,
@@ -586,7 +593,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     private func updateRowWindow() {
         let context = scrollContext
         guard context.viewportWidth > 0, context.viewportHeight > 0 else { return }
-        let layout = rowLayout(side: tileSide(for: context.viewportWidth))
+        let side = tileSide(for: context.viewportWidth)
+        let layout = rowLayout(side: side)
         let rows = model.rows
         let count = min(rows.count, layout.starts.count)
         guard count > 0 else {
@@ -610,7 +618,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     visibleRowIDs: context.visibleRowIDs,
                     model: model,
                     client: session.client,
-                    backup: session.backup
+                    backup: session.backup,
+                    targetPixelSize: thumbnailPixelSize(for: side)
                 )
             }
         }
@@ -704,24 +713,20 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 )
             )
             .onScrollGeometryChange(for: TimelineScrollState.self) { scroll in
-                // rounded so sub point layout noise dedupes to equal states.
+                // the indicator is rounded to suppress sub point drawing noise,
+                // while row windowing keeps the precise offset.
                 let insetTop = scroll.contentInsets.top
+                let offsetY = scroll.contentOffset.y + insetTop
                 return TimelineScrollState(
-                    offsetY: max(0, ((scroll.contentOffset.y + insetTop) * 2).rounded() / 2),
+                    offsetY: offsetY,
+                    indicatorOffsetY: max(0, (offsetY * 2).rounded() / 2),
                     insetTop: insetTop.rounded(),
                     insetBottom: scroll.contentInsets.bottom.rounded(),
                     containerHeight: max(1, scroll.containerSize.height.rounded())
                 )
             } action: { _, state in
                 scrub.update(with: state)
-            }
-            // precise offset for scroll compensation and the row window; the
-            // quantized fraction above is too coarse for either. plain box
-            // write plus a window recompute that renders only on a real slide.
-            .onScrollGeometryChange(for: CGFloat.self) { scroll in
-                scroll.contentOffset.y + scroll.contentInsets.top
-            } action: { _, offset in
-                scrollContext.offsetY = offset
+                scrollContext.offsetY = state.offsetY
                 updateRowWindow()
             }
             .onChange(of: geometry.size.height, initial: true) { _, height in
@@ -751,7 +756,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     visibleRowIDs: scrollContext.visibleRowIDs,
                     model: model,
                     client: session.client,
-                    backup: session.backup
+                    backup: session.backup,
+                    targetPixelSize: thumbnailPixelSize(for: side)
                 )
             }
             // keyed on the row tallies, so any change of layout - a bucket
@@ -772,11 +778,17 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 if newPhase == .idle {
                     updateRowWindow()
                     scheduleIndicatorHide()
+                    // the scrubber owns the hold for the length of its drag.
+                    if !scrub.isScrubbing { model.resumeRebuilds() }
                 } else {
                     AssetViewerOpeningChromeCache.shared.cancelPrewarming(
                         owner: openingChromePrewarmOwner
                     )
                     showIndicator()
+                    // reflowing the library under a moving finger is what
+                    // makes the grid jump; loads keep landing in the model
+                    // and project in one compensated pass at idle.
+                    model.deferRebuilds()
                 }
             }
             .onChange(of: viewer.isTransitioning) { _, isTransitioning in
@@ -831,14 +843,18 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                                 model.deferRebuilds()
                             } else {
                                 scheduleIndicatorHide()
-                                model.resumeRebuilds()
+                                // a drag can end mid-deceleration; the phase
+                                // handler lifts the hold once the scroll is
+                                // actually at rest.
+                                if scrollContext.isIdle { model.resumeRebuilds() }
                                 // the window went unwarmed for the length of
                                 // the drag; catch it up where it landed.
                                 prefetcher.update(
                                     visibleRowIDs: scrollContext.visibleRowIDs,
                                     model: model,
                                     client: session.client,
-                                    backup: session.backup
+                                    backup: session.backup,
+                                    targetPixelSize: thumbnailPixelSize(for: side)
                                 )
                             }
                             // outside the animation below: this swaps what every
@@ -909,20 +925,22 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         .navigationBarBackButtonHidden(isSelecting)
         .overlay { overlayState }
         .overlay(alignment: .bottom) {
-            if isSelecting, !isPicking {
-                SelectionControlBar(
-                    count: selection.count,
-                    filter: filter,
-                    isWorking: isSelectionWorking,
-                    onShare: shareSelection,
-                    onShowSelected: presentSelectedSheet,
-                    onRestore: filter.isTrashed == true ? { await applyRestore() } : nil,
-                    onTrash: { await applyTrash() }
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+            ZStack {
+                if isSelecting, !isPicking {
+                    SelectionControlBar(
+                        count: selection.count,
+                        filter: filter,
+                        isWorking: isSelectionWorking,
+                        onShare: shareSelection,
+                        onShowSelected: presentSelectedSheet,
+                        onRestore: filter.isTrashed == true ? { await applyRestore() } : nil,
+                        onTrash: { await applyTrash() }
+                    )
+                    .transition(.opacity)
+                }
             }
+            .animation(.smooth(duration: 0.25), value: isSelecting)
         }
-        .animation(.smooth(duration: 0.25), value: isSelecting)
         .sheet(isPresented: $showsSelectedSheet) {
             SelectedAssetsSheet(assets: selectedSheetAssets, selection: $selection)
         }
@@ -935,9 +953,9 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 // @state storage that owns the model and leak it on pop. the
                 // weak capture is renamed so it does not shadow the strong
                 // reference this task already holds.
-                model.applyRowsUpdate = { [weak weakModel = model, context = scrollContext, position = _scrollPosition] old, new, apply in
+                model.applyRowsUpdate = { [weak weakModel = model, context = scrollContext, position = _scrollPosition] old, new, animated, apply in
                     Self.applyRowsChange(
-                        old: old, new: new, apply: apply,
+                        old: old, new: new, animated: animated, apply: apply,
                         model: weakModel, context: context, position: position
                     )
                 }
@@ -992,13 +1010,15 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
 
     // MARK: - rows
 
-    /// lands a realtime rows swap the way the official clients do: content
-    /// that changed above the viewport applies instantly with the scroll
-    /// offset shifted by the exact height delta, so visible photos never
-    /// move; changes in or below the viewport reflow with an animation.
+    /// lands a rows swap the way the official clients do: content that
+    /// changed above the viewport applies instantly with the scroll offset
+    /// shifted by the exact height delta, so visible photos never move;
+    /// changes in or below the viewport reflow with an animation when one
+    /// was requested.
     private static func applyRowsChange(
         old: [TimelineRow],
         new: [TimelineRow],
+        animated: Bool,
         apply: () -> Void,
         model: TimelineModel?,
         context: ScrollContext,
@@ -1027,7 +1047,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 return
             }
         }
-        if UIAccessibility.isReduceMotionEnabled || !context.isIdle {
+        if !animated || UIAccessibility.isReduceMotionEnabled || !context.isIdle {
             apply()
         } else {
             withAnimation(.smooth(duration: 0.3)) { apply() }
@@ -1049,12 +1069,13 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             .frame(height: 36, alignment: .bottomLeading)
 
         case .tiles(_, let runs):
+            let targetPixelSize = thumbnailPixelSize(for: side)
             ZStack(alignment: .topLeading) {
                 ForEach(runs, id: \.colStart) { run in
                     HStack(spacing: 2) {
                         ForEach(run.assets) { asset in
                             let isProjectedRemoved = model.projectedRemovalIDs.contains(asset.id)
-                            tile(asset)
+                            tile(asset, targetPixelSize: targetPixelSize)
                                 .frame(width: side, height: side)
                                 .opacity(isProjectedRemoved ? 0 : 1)
                                 .allowsHitTesting(!isProjectedRemoved)
@@ -1117,30 +1138,16 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         .frame(width: width, height: 36, alignment: .bottomLeading)
     }
 
-    @ViewBuilder private func tile(_ asset: Asset) -> some View {
+    @ViewBuilder private func tile(_ asset: Asset, targetPixelSize: CGFloat) -> some View {
         // picking wants one photo and nothing else, so a tile carries neither
         // the long-press menu nor a viewer of its own while the mode is on.
         if let onPickAsset {
-            AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
+            AssetTile(
+                asset: asset,
+                showsBackupBadge: mergesLocalPhotos,
+                targetPixelSize: targetPixelSize
+            )
                 .onTapGesture { onPickAsset(asset) }
-        // selection mode keeps taps as the only gesture, like the system
-        // photos app.
-        } else if isSelecting {
-            AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
-                .overlay(alignment: .topLeading) {
-                    if isSelectable(asset) {
-                        Image(systemName: selection.contains(asset.id) ? "checkmark.circle.fill" : "circle")
-                            .font(.title3)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, selection.contains(asset.id) ? Color.accentColor : .black.opacity(0.25))
-                            .contentTransition(.symbolEffect(.replace))
-                            .animation(.snappy(duration: 0.22), value: selection.contains(asset.id))
-                            .padding(6)
-                    }
-                }
-                .onTapGesture {
-                    if isSelectable(asset) { toggle(asset) }
-                }
         } else if isScrubbingTiles {
             // a scrub relands the grid somewhere else every frame, and a tile
             // that carries its own uikit host, context menu and recognizer is
@@ -1149,12 +1156,21 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             // inside the grid's own renderer - stands in until the finger
             // lifts. images come straight from the memory cache, so the swap
             // costs no frame.
-            AssetTile(asset: asset, showsBackupBadge: mergesLocalPhotos)
+            AssetTile(
+                asset: asset,
+                showsBackupBadge: mergesLocalPhotos,
+                targetPixelSize: targetPixelSize
+            )
         } else {
             InteractiveAssetTile(
                 asset: asset,
                 showsBackupBadge: mergesLocalPhotos,
+                targetPixelSize: targetPixelSize,
+                isSelecting: isSelecting,
+                isSelected: selection.contains(asset.id),
+                isSelectable: isSelectable(asset),
                 registry: tileRegistry,
+                toggleSelection: { toggle(asset) },
                 menu: { UIMenu(children: menuElements(for: asset)) },
                 makeViewer: { startsAsContextPreview, bounds in
                     viewerController(
@@ -1436,8 +1452,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         }
     }
 
-    /// entry and exit run inside one animation so the toolbar swap fades in
-    /// place together with the bottom bar's move.
+    /// entry and exit run inside one animation so the toolbar swap, the tab
+    /// bar fade and the bottom controls fade move together.
     private func enterSelection() {
         withAnimation(.smooth(duration: 0.25)) {
             isSelecting = true
@@ -1447,9 +1463,10 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     private func exitSelection() {
         showsSelectedSheet = false
         withAnimation(.smooth(duration: 0.25)) {
-            selection.removeAll()
             isSelecting = false
+            selection.removeAll()
         }
+        selectedSheetAssets.removeAll()
     }
 
     private var isSelectionWorking: Bool {
@@ -2025,13 +2042,28 @@ private struct InteractiveAssetTile: UIViewRepresentable {
     @Environment(SessionStore.self) private var session
     let asset: Asset
     let showsBackupBadge: Bool
+    let targetPixelSize: CGFloat
+    let isSelecting: Bool
+    let isSelected: Bool
+    let isSelectable: Bool
     let registry: AssetTileRegistry
+    let toggleSelection: () -> Void
     let menu: () -> UIMenu
     let makeViewer: (_ startsAsContextPreview: Bool, _ bounds: CGSize) -> AssetViewerHostingController?
 
     func makeUIView(context: Context) -> UIView {
-        let view = configuration.makeContentView()
+        let view = UIView()
         view.backgroundColor = .clear
+        let contentView = configuration.makeContentView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(contentView)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            contentView.topAnchor.constraint(equalTo: view.topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        context.coordinator.contentView = contentView
         view.addInteraction(UIContextMenuInteraction(delegate: context.coordinator))
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -2040,29 +2072,69 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         tap.cancelsTouchesInView = false
         tap.delaysTouchesEnded = false
         view.addGestureRecognizer(tap)
-        context.coordinator.rendered = RenderedTile(asset: asset, showsBackupBadge: showsBackupBadge)
-        context.coordinator.register(view, assetID: asset.id, in: registry)
+        let indicator = UIImageView()
+        indicator.translatesAutoresizingMaskIntoConstraints = false
+        indicator.contentMode = .scaleAspectFit
+        indicator.isUserInteractionEnabled = false
+        view.addSubview(indicator)
+        NSLayoutConstraint.activate([
+            indicator.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 6),
+            indicator.topAnchor.constraint(equalTo: view.topAnchor, constant: 6),
+            indicator.widthAnchor.constraint(equalToConstant: 24),
+            indicator.heightAnchor.constraint(equalToConstant: 24),
+        ])
+        context.coordinator.selectionIndicator = indicator
+        context.coordinator.rendered = RenderedTile(
+            asset: asset,
+            showsBackupBadge: showsBackupBadge,
+            targetPixelSize: targetPixelSize
+        )
+        context.coordinator.register(
+            view,
+            asset: asset,
+            targetPixelSize: targetPixelSize,
+            in: registry
+        )
+        context.coordinator.updateSelectionAppearance()
         return view
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.host = self
-        context.coordinator.register(uiView, assetID: asset.id, in: registry)
         // every scroll phase change re-runs the grid body, and each tile hosts
         // a swiftui renderer of its own: handing back an identical
-        // configuration would redraw all of them for nothing. what the tile
-        // reads beyond these two - backup state, the session - it observes for
-        // itself and redraws on without being reconfigured.
-        let rendered = RenderedTile(asset: asset, showsBackupBadge: showsBackupBadge)
-        guard context.coordinator.rendered != rendered else { return }
-        context.coordinator.rendered = rendered
-        (uiView as? UIContentView)?.configuration = configuration
+        // configuration would redraw all of them for nothing. backup state
+        // and the session are observed by the hosted tile itself and redraw
+        // without being reconfigured.
+        let rendered = RenderedTile(
+            asset: asset,
+            showsBackupBadge: showsBackupBadge,
+            targetPixelSize: targetPixelSize
+        )
+        if context.coordinator.rendered != rendered {
+            context.coordinator.rendered = rendered
+            context.coordinator.register(
+                uiView,
+                asset: asset,
+                targetPixelSize: targetPixelSize,
+                in: registry
+            )
+            (context.coordinator.contentView as? UIContentView)?.configuration = configuration
+        }
+        context.coordinator.updateSelectionAppearance()
     }
 
     /// everything the hosted tile draws from.
     struct RenderedTile: Equatable {
         let asset: Asset
         let showsBackupBadge: Bool
+        let targetPixelSize: CGFloat
+    }
+
+    struct SelectionAppearance: Equatable {
+        let isSelecting: Bool
+        let isSelected: Bool
+        let isSelectable: Bool
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
@@ -2077,7 +2149,11 @@ private struct InteractiveAssetTile: UIViewRepresentable {
     /// session is re-injected.
     private var configuration: UIHostingConfiguration<some View, some View> {
         UIHostingConfiguration {
-            AssetTile(asset: asset, showsBackupBadge: showsBackupBadge)
+            AssetTile(
+                asset: asset,
+                showsBackupBadge: showsBackupBadge,
+                targetPixelSize: targetPixelSize
+            )
                 .environment(session)
         }
         .margins(.all, 0)
@@ -2087,31 +2163,84 @@ private struct InteractiveAssetTile: UIViewRepresentable {
         var host: InteractiveAssetTile
         /// inputs behind the configuration currently installed on the view.
         var rendered: RenderedTile?
+        weak var contentView: UIView?
+        weak var selectionIndicator: UIImageView?
         private var registry: AssetTileRegistry
         private var registeredAssetID: String?
+        private var registeredAsset: Asset?
+        private var registeredTargetPixelSize: CGFloat?
+        private var selectionAppearance: SelectionAppearance?
 
         init(host: InteractiveAssetTile, registry: AssetTileRegistry) {
             self.host = host
             self.registry = registry
         }
 
-        func register(_ view: UIView, assetID: String, in registry: AssetTileRegistry) {
-            if (self.registry !== registry || registeredAssetID != assetID),
+        func register(
+            _ view: UIView,
+            asset: Asset,
+            targetPixelSize: CGFloat,
+            in registry: AssetTileRegistry
+        ) {
+            if (self.registry !== registry || registeredAssetID != asset.id),
                let registeredAssetID {
                 self.registry.unregister(view, for: registeredAssetID)
             }
+            guard self.registry !== registry
+                    || registeredAssetID != asset.id
+                    || registeredAsset != asset
+                    || registeredTargetPixelSize != targetPixelSize
+            else { return }
             self.registry = registry
-            registeredAssetID = assetID
-            registry.register(view, asset: host.asset, session: host.session)
+            registeredAssetID = asset.id
+            registeredAsset = asset
+            registeredTargetPixelSize = targetPixelSize
+            registry.register(
+                view,
+                asset: asset,
+                session: host.session,
+                targetPixelSize: targetPixelSize
+            )
         }
 
         func unregister(_ view: UIView) {
             guard let registeredAssetID else { return }
             registry.unregister(view, for: registeredAssetID)
             self.registeredAssetID = nil
+            registeredAsset = nil
+            registeredTargetPixelSize = nil
+        }
+
+        func updateSelectionAppearance() {
+            guard let selectionIndicator else { return }
+            selectionIndicator.superview?.bringSubviewToFront(selectionIndicator)
+            let appearance = SelectionAppearance(
+                isSelecting: host.isSelecting,
+                isSelected: host.isSelected,
+                isSelectable: host.isSelectable
+            )
+            guard appearance != selectionAppearance else { return }
+            selectionAppearance = appearance
+            selectionIndicator.isHidden = !appearance.isSelecting || !appearance.isSelectable
+            guard !selectionIndicator.isHidden else { return }
+            let name = appearance.isSelected ? "checkmark.circle.fill" : "circle"
+            // uikit does not inherit the asset catalog accent, resolve the brand tint directly.
+            let secondary = appearance.isSelected
+                ? UIColor(resource: .brandTint)
+                : UIColor.black.withAlphaComponent(0.25)
+            let configuration = UIImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+                .applying(UIImage.SymbolConfiguration(paletteColors: [.white, secondary]))
+            selectionIndicator.image = UIImage(
+                systemName: name,
+                withConfiguration: configuration
+            )
         }
 
         @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            if host.isSelecting {
+                if host.isSelectable { host.toggleSelection() }
+                return
+            }
             guard let view = recognizer.view,
                   let bounds = view.window?.bounds.size,
                   let presenter = presentationAnchor(for: view)
@@ -2125,6 +2254,7 @@ private struct InteractiveAssetTile: UIViewRepresentable {
             _ interaction: UIContextMenuInteraction,
             configurationForMenuAtLocation location: CGPoint
         ) -> UIContextMenuConfiguration? {
+            guard !host.isSelecting else { return nil }
             guard let bounds = interaction.view?.window?.bounds.size else { return nil }
             let viewer = host.makeViewer(true, bounds)
             return UIContextMenuConfiguration(

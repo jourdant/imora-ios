@@ -73,7 +73,8 @@ struct RemoteImage: View {
             }
         }
         .onAppear {
-            if readyImage(key: key) != nil { onReady?() }
+            guard let onReady else { return }
+            if readyImage(key: key) != nil { onReady() }
         }
         .task(id: taskID) {
             if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
@@ -84,20 +85,6 @@ struct RemoteImage: View {
 
             let key = requestKey
             let start = ContinuousClock.now
-            if let thumbhash, placeholder?.key != key {
-                let decodeTask = Task.detached(priority: .utility) {
-                    Thumbhash.image(fromBase64: thumbhash)
-                }
-                let decoded = await withTaskCancellationHandler {
-                    await decodeTask.value
-                } onCancel: {
-                    decodeTask.cancel()
-                }
-                guard !Task.isCancelled, let decoded else { return }
-                placeholder = KeyedImage(key: key, image: decoded)
-            }
-
-            guard !Task.isCancelled else { return }
             let loaded = try? await ImageLoader.shared.image(
                 for: url,
                 targetPixelSize: targetPixelSize
@@ -118,6 +105,26 @@ struct RemoteImage: View {
                     onReady?()
                 }
             }
+        }
+        .task(id: taskID) {
+            guard let thumbhash, placeholder?.key != key else { return }
+            // disk hits normally finish before this delay, avoiding placeholder
+            // work for images that would never display it.
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled,
+                  image?.key != key,
+                  ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) == nil
+            else { return }
+            let decodeTask = Task.detached(priority: .utility) {
+                Thumbhash.image(fromBase64: thumbhash)
+            }
+            let decoded = await withTaskCancellationHandler {
+                await decodeTask.value
+            } onCancel: {
+                decodeTask.cancel()
+            }
+            guard !Task.isCancelled, image?.key != key, let decoded else { return }
+            placeholder = KeyedImage(key: key, image: decoded)
         }
         // the smaller render of the same photo - the one the grid showed - is
         // usually a disk cache hit, so it paints the view while the full size
@@ -273,6 +280,7 @@ struct AssetTile: View {
     /// backup status in the corner plus the upload progress overlay. only
     /// the main timeline shows these, matching the official client.
     var showsBackupBadge = false
+    var targetPixelSize: CGFloat = 640
 
     /// set when photokit cannot serve the paired device copy, so the tile
     /// stops asking and renders the server thumbnail instead.
@@ -293,12 +301,13 @@ struct AssetTile: View {
                 if let localId = deviceIdentifier {
                     LocalPhotoImage(
                         localIdentifier: localId,
+                        targetPixelSize: targetPixelSize,
                         onUnavailable: { localUnavailable = true }
                     )
                 } else if let client = session.client {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
-                        targetPixelSize: 640,
+                        targetPixelSize: targetPixelSize,
                         thumbhash: asset.thumbhash
                     )
                 }

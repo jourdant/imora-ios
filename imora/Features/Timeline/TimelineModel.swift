@@ -262,10 +262,27 @@ nonisolated enum TimelineRow: Identifiable, Hashable {
     }
 }
 
+/// device assets pre-shaped for the row merge: converted to grid assets,
+/// month-keyed and sorted once per photo-library change, so a rebuild never
+/// pays tens of thousands of calendar lookups again. paired items keep their
+/// server twin id so a loaded twin can hide them.
+nonisolated private struct LocalMergeSource {
+    struct Paired {
+        let remoteId: String
+        let asset: Asset
+    }
+
+    let unpairedByMonth: [String: [Asset]]
+    let pairedByMonth: [String: [Paired]]
+    let pairedRemoteIDs: Set<String>
+
+    var isEmpty: Bool { unpairedByMonth.isEmpty && pairedByMonth.isEmpty }
+}
+
 /// drives any bucketed grid screen: main timeline, favorites, archive, trash, person, album.
 @Observable
 final class TimelineModel {
-    private struct SectionProjection {
+    nonisolated private struct SectionProjection {
         let source: TimelineSection
         let columns: Int
         let placeholderRatio: Double?
@@ -291,6 +308,35 @@ final class TimelineModel {
             }
             return source == section && self.placeholderRatio == placeholderRatio
         }
+    }
+
+    /// everything a projection is computed from, snapshotted so the build can
+    /// run off the main actor while the model keeps mutating.
+    nonisolated private struct ProjectionInputs {
+        let sections: [TimelineSection]
+        let localSource: LocalMergeSource?
+        let columns: Int
+        let assetsPerDay: Double
+        let projectionCache: [String: SectionProjection]
+        let previousRows: [TimelineRow]
+        let rebuildAssets: Bool
+    }
+
+    /// everything a finished build hands back for one synchronous commit.
+    nonisolated private struct ProjectionBuild {
+        let rows: [TimelineRow]
+        let rowsChanged: Bool
+        let spans: [TimelineSectionSpan]
+        let monthByRowID: [String: String]
+        let firstAssetIDByRowID: [String: String]
+        let rowAssetLocationByID: [String: TimelineAssetProjection.Location]
+        let sectionProjectionByID: [String: SectionProjection]
+        let titleBandCount: Int
+        let tileRowCount: Int
+        let measuredAssetsPerDay: Double?
+        let flatAssets: [Asset]?
+        let flatAssetIndexByID: [String: Int]?
+        let bucketIDByAssetID: [String: String]?
     }
 
     let filter: TimelineFilter
@@ -333,14 +379,21 @@ final class TimelineModel {
     private var persistedAssetsPerDay = TimelineModel.defaultAssetsPerDay
 
     var columns: Int = 3 {
-        didSet { if columns != oldValue { rebuildRows() } }
+        didSet {
+            if columns != oldValue {
+                noteProjectionInputsChanged()
+                // the pinch owns its scroll restore, and the screen hook
+                // cannot compensate across two different tile sides.
+                rebuildRows(viaHook: false)
+            }
+        }
     }
 
-    /// screen-injected hook that decides how a realtime rows swap lands:
-    /// animated reflow when the change is visible, or an instant apply plus
-    /// scroll compensation when it happens above the viewport. nil applies
-    /// directly. the apply closure must run synchronously.
-    @ObservationIgnored var applyRowsUpdate: ((_ old: [TimelineRow], _ new: [TimelineRow], _ apply: () -> Void) -> Void)?
+    /// screen-injected hook that decides how a rows swap lands: animated
+    /// reflow when requested and the change is visible, or an instant apply
+    /// plus scroll compensation when it happens above the viewport. nil
+    /// applies directly. the apply closure must run synchronously.
+    @ObservationIgnored var applyRowsUpdate: ((_ old: [TimelineRow], _ new: [TimelineRow], _ animated: Bool, _ apply: () -> Void) -> Void)?
 
     private var client: ImmichClient?
     private var backup: BackupManager?
@@ -366,6 +419,13 @@ final class TimelineModel {
     private var pendingRebuildAnimated = false
     /// device assets paired with backup status, merged during row building.
     private var localItems: [LocalTimelineItem] = []
+    /// the items above pre-shaped for merging, rebuilt off the main actor
+    /// whenever they change.
+    private var localMergeSource: LocalMergeSource?
+    /// bumped by every mutation a projection is built from. a background
+    /// build that raced one is discarded instead of committed.
+    @ObservationIgnored private var projectionInputVersion: UInt64 = 0
+    private var rebuildID: UUID?
     private var resyncTask: Task<Void, Never>?
     private var resyncAgain = false
     private var resyncPending = false
@@ -500,11 +560,14 @@ final class TimelineModel {
     /// decode ran keeps its fresh days.
     private func applyRestoredBuckets(_ restored: [String: [Asset]]) {
         guard !restored.isEmpty else { return }
+        var changed = false
         for index in sections.indices where sections[index].days == nil {
             guard let assets = restored[sections[index].id] else { continue }
             sections[index].days = Self.groupByDay(assets, byUploadDate: filter.groupsByUploadDate)
             staleBucketIDs.insert(sections[index].id)
+            changed = true
         }
+        if changed { noteProjectionInputsChanged() }
     }
 
     /// persists a fetched bucket for offline browsing. fire and forget, off
@@ -562,6 +625,7 @@ final class TimelineModel {
         sections = fresh
         staleBucketIDs.formIntersection(buckets.map(\.timeBucket))
         if changed {
+            noteProjectionInputsChanged()
             rebuildRows(rebuildAssets: true)
         }
         // the first bucket lands before the prefetch, and it is what calibrates
@@ -598,6 +662,7 @@ final class TimelineModel {
                 cacheBucket(id, assets: resolution.assets)
             }
             guard changed else { return }
+            noteProjectionInputsChanged()
             if immediateRows {
                 rebuildRows(rebuildAssets: true)
             } else {
@@ -629,6 +694,7 @@ final class TimelineModel {
         else { return }
         staleBucketIDs.insert(id)
         sections[current].days = Self.groupByDay(cached, byUploadDate: filter.groupsByUploadDate)
+        noteProjectionInputsChanged()
         scheduleRebuild()
     }
 
@@ -663,7 +729,7 @@ final class TimelineModel {
             }
             guard !Task.isCancelled, !self.isViewerSuspended else { return }
             if self.rebuildPending {
-                self.rebuildRows(rebuildAssets: true)
+                self.scheduleRebuild()
             }
             // cleared here rather than left to the defer so the sweep sees a
             // finished pass; the defer then has nothing left to reset.
@@ -682,24 +748,135 @@ final class TimelineModel {
     private func sweepThumbnailsIfNeeded() {
         guard mergesLocal, hasLoaded, !hasSwept, prefetchTask == nil, let client else { return }
         hasSwept = true
-        let urls = flatAssets.compactMap { asset -> URL? in
-            guard asset.localIdentifier == nil,
-                  backup?.localIdentifierByRemoteId[asset.id] == nil
-            else { return nil }
-            return client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash)
+        // read from sections rather than flatAssets: rebuilds are debounced
+        // off the main actor, so the flat list can lag the last buckets at
+        // the moment the prefetch pass settles.
+        var urls: [URL] = []
+        for section in sections {
+            for day in section.days ?? [] {
+                for asset in day.assets where asset.localIdentifier == nil
+                    && backup?.localIdentifierByRemoteId[asset.id] == nil {
+                    urls.append(client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash))
+                }
+            }
         }
         ImageLoader.shared.sweepThumbnails(urls: urls)
     }
 
     // MARK: - rows
 
-    private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false) {
+    private func rebuildRows(rebuildAssets: Bool = false, animated: Bool = false, viaHook: Bool = true) {
         if rebuildAssets {
             rebuildTask?.cancel()
             rebuildTask = nil
+            rebuildID = nil
             rebuildPending = false
             pendingRebuildAnimated = false
         }
+        let build = Self.buildProjection(makeProjectionInputs(rebuildAssets: rebuildAssets))
+        commitProjection(build, animated: animated, viaHook: viaHook)
+    }
+
+    /// the debounced path: snapshots the inputs, builds off the main actor
+    /// and commits only if nothing moved underneath. a large library's full
+    /// rebuild takes long enough to drop frames, and the debounce fires every
+    /// bucket landing while the whole library prefetches.
+    private func rebuildRowsOffMain(animated: Bool) async {
+        var attempts = 0
+        while true {
+            let version = projectionInputVersion
+            let inputs = makeProjectionInputs(rebuildAssets: true)
+            let build = await Self.buildProjectionConcurrently(inputs)
+            if Task.isCancelled || isViewerSuspended || isRebuildDeferred {
+                // a superseding synchronous rebuild owns the fresh state and
+                // cleared the id first; anything else re-arms so the loaded
+                // data still projects once rebuilds may run again.
+                if rebuildID != nil || isViewerSuspended || isRebuildDeferred {
+                    scheduleRebuild(animated: animated)
+                }
+                return
+            }
+            if version == projectionInputVersion {
+                commitProjection(build, animated: animated)
+                return
+            }
+            attempts += 1
+            if attempts >= 3 {
+                // inputs keep moving under the build; one synchronous pass
+                // guarantees the grid still converges.
+                rebuildRows(rebuildAssets: true, animated: animated)
+                return
+            }
+        }
+    }
+
+    /// called by every mutation of sections, local items, columns or in-place
+    /// row patches, so an in-flight background build knows it went stale.
+    private func noteProjectionInputsChanged() {
+        projectionInputVersion &+= 1
+    }
+
+    private func makeProjectionInputs(rebuildAssets: Bool) -> ProjectionInputs {
+        ProjectionInputs(
+            sections: sections,
+            localSource: mergesLocal ? localMergeSource : nil,
+            columns: columns,
+            assetsPerDay: assetsPerDay,
+            projectionCache: sectionProjectionByID,
+            previousRows: rows,
+            rebuildAssets: rebuildAssets
+        )
+    }
+
+    private func commitProjection(_ build: ProjectionBuild, animated: Bool, viaHook: Bool = true) {
+        let commit = {
+            self.rows = build.rows
+            self.rowsLayoutVersion &+= 1
+            self.rowAssetLocationByID = build.rowAssetLocationByID
+            self.sectionProjectionByID = build.sectionProjectionByID
+            self.sectionSpans = build.spans
+            self.monthByRowID = build.monthByRowID
+            self.firstAssetIDByRowID = build.firstAssetIDByRowID
+            if let flatAssets = build.flatAssets,
+               let flatAssetIndexByID = build.flatAssetIndexByID,
+               let bucketIDByAssetID = build.bucketIDByAssetID {
+                self.flatAssets = flatAssets
+                self.flatAssetIndexByID = flatAssetIndexByID
+                self.bucketIDByAssetID = bucketIDByAssetID
+                self.projectedRemovalIDs.formIntersection(flatAssetIndexByID.keys)
+                self.flatAssetsVersion &+= 1
+            }
+            self.titleBandCount = build.titleBandCount
+            self.tileRowCount = build.tileRowCount
+            if let measured = build.measuredAssetsPerDay {
+                self.assetsPerDay = measured
+                // rebuilds are frequent; only a ratio that actually moved is
+                // worth writing out for the next launch.
+                if abs(measured - self.persistedAssetsPerDay) > 0.25,
+                   let key = Self.assetsPerDayKey(for: self.filter) {
+                    self.persistedAssetsPerDay = measured
+                    UserDefaults.standard.set(measured, forKey: key)
+                }
+            }
+        }
+        // every swap goes through the screen hook, not just animated ones: a
+        // bucket load that changes heights above the viewport needs the same
+        // scroll compensation a realtime change does, or the grid jumps.
+        if viaHook, build.rowsChanged, !rows.isEmpty, let applyRowsUpdate {
+            applyRowsUpdate(rows, build.rows, animated, commit)
+        } else {
+            commit()
+        }
+    }
+
+    @concurrent
+    nonisolated private static func buildProjectionConcurrently(
+        _ inputs: ProjectionInputs
+    ) async -> ProjectionBuild {
+        buildProjection(inputs)
+    }
+
+    nonisolated private static func buildProjection(_ inputs: ProjectionInputs) -> ProjectionBuild {
         var result: [TimelineRow] = []
         var spans: [TimelineSectionSpan] = []
         var monthByRowID: [String: String] = [:]
@@ -707,9 +884,9 @@ final class TimelineModel {
         var flattened: [Asset] = []
         var flattenedIndex: [String: Int] = [:]
         var bucketByAssetID: [String: String] = [:]
-        result.reserveCapacity(rows.count + 16)
-        if rebuildAssets {
-            flattened.reserveCapacity(sections.reduce(0) { $0 + $1.count })
+        result.reserveCapacity(inputs.previousRows.count + 16)
+        if inputs.rebuildAssets {
+            flattened.reserveCapacity(inputs.sections.reduce(0) { $0 + $1.count })
         }
 
         var titleBands = 0
@@ -719,19 +896,23 @@ final class TimelineModel {
         // one - or from the last launch - covers the months above them.
         var assetTally = 0
         var dayTally = 0
-        var ratio = assetsPerDay
+        var ratio = inputs.assetsPerDay
 
         var nextSectionProjectionByID: [String: SectionProjection] = [:]
-        let projectedSections = mergedSections()
+        let projectedSections = mergedSections(inputs.sections, local: inputs.localSource)
         nextSectionProjectionByID.reserveCapacity(projectedSections.count)
 
         for section in projectedSections {
             let projection: SectionProjection
-            if let cached = sectionProjectionByID[section.id],
-               cached.canReuse(for: section, columns: columns, placeholderRatio: ratio) {
+            if let cached = inputs.projectionCache[section.id],
+               cached.canReuse(for: section, columns: inputs.columns, placeholderRatio: ratio) {
                 projection = cached
             } else {
-                projection = makeSectionProjection(section, placeholderRatio: ratio)
+                projection = makeSectionProjection(
+                    section,
+                    columns: inputs.columns,
+                    placeholderRatio: ratio
+                )
             }
             nextSectionProjectionByID[section.id] = projection
 
@@ -746,7 +927,7 @@ final class TimelineModel {
             titleBands += projection.titleBandCount
             tileRows += projection.tileRowCount
 
-            if rebuildAssets, let days = section.days {
+            if inputs.rebuildAssets, let days = section.days {
                 for day in days {
                     for asset in day.assets {
                         flattenedIndex[asset.id] = flattened.count
@@ -761,43 +942,26 @@ final class TimelineModel {
             if dayTally > 0 { ratio = Double(assetTally) / Double(dayTally) }
         }
 
-        if dayTally > 0, assetTally > 0 {
-            assetsPerDay = ratio
-            // rebuilds are frequent; only a ratio that actually moved is
-            // worth writing out for the next launch.
-            if abs(ratio - persistedAssetsPerDay) > 0.25, let key = Self.assetsPerDayKey(for: filter) {
-                persistedAssetsPerDay = ratio
-                UserDefaults.standard.set(ratio, forKey: key)
-            }
-        }
-
-        let commit = {
-            self.rows = result
-            self.rowsLayoutVersion &+= 1
-            self.rowAssetLocationByID = TimelineAssetProjection.locations(in: result)
-            self.sectionProjectionByID = nextSectionProjectionByID
-            self.sectionSpans = spans
-            self.monthByRowID = monthByRowID
-            self.firstAssetIDByRowID = firstAssetIDByRowID
-            if rebuildAssets {
-                self.flatAssets = flattened
-                self.flatAssetIndexByID = flattenedIndex
-                self.bucketIDByAssetID = bucketByAssetID
-                self.projectedRemovalIDs.formIntersection(flattenedIndex.keys)
-                self.flatAssetsVersion &+= 1
-            }
-            self.titleBandCount = titleBands
-            self.tileRowCount = tileRows
-        }
-        if animated, rows != result, !rows.isEmpty, let applyRowsUpdate {
-            applyRowsUpdate(rows, result, commit)
-        } else {
-            commit()
-        }
+        return ProjectionBuild(
+            rows: result,
+            rowsChanged: result != inputs.previousRows,
+            spans: spans,
+            monthByRowID: monthByRowID,
+            firstAssetIDByRowID: firstAssetIDByRowID,
+            rowAssetLocationByID: TimelineAssetProjection.locations(in: result),
+            sectionProjectionByID: nextSectionProjectionByID,
+            titleBandCount: titleBands,
+            tileRowCount: tileRows,
+            measuredAssetsPerDay: dayTally > 0 && assetTally > 0 ? ratio : nil,
+            flatAssets: inputs.rebuildAssets ? flattened : nil,
+            flatAssetIndexByID: inputs.rebuildAssets ? flattenedIndex : nil,
+            bucketIDByAssetID: inputs.rebuildAssets ? bucketByAssetID : nil
+        )
     }
 
-    private func makeSectionProjection(
+    nonisolated private static func makeSectionProjection(
         _ section: TimelineSection,
+        columns: Int,
         placeholderRatio: Double
     ) -> SectionProjection {
         var rows: [TimelineRow] = []
@@ -889,7 +1053,7 @@ final class TimelineModel {
     /// imperfect packing are both priced in and the answer follows the column
     /// count through a pinch. a month cannot span more than 31 days, which is
     /// what keeps a busy month from being estimated as hundreds of tiny ones.
-    private static func placeholderEstimate(
+    nonisolated private static func placeholderEstimate(
         count: Int,
         columns: Int,
         assetsPerDay: Double
@@ -946,15 +1110,30 @@ final class TimelineModel {
             rebuildTask = nil
         }
         guard rebuildTask == nil else { return }
+        let id = UUID()
+        rebuildID = id
         rebuildTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
-            self.rebuildTask = nil
-            guard !self.isViewerSuspended, !self.isRebuildDeferred else { return }
+            guard !self.isViewerSuspended, !self.isRebuildDeferred else {
+                if self.rebuildID == id {
+                    self.rebuildTask = nil
+                    self.rebuildID = nil
+                }
+                return
+            }
             self.rebuildPending = false
             let animated = self.pendingRebuildAnimated
             self.pendingRebuildAnimated = false
-            self.rebuildRows(rebuildAssets: true, animated: animated)
+            await self.rebuildRowsOffMain(animated: animated)
+            // the task stays armed through the build so schedule calls made
+            // meanwhile coalesce into the pending flag; re-arm them now.
+            guard self.rebuildID == id else { return }
+            self.rebuildTask = nil
+            self.rebuildID = nil
+            if self.rebuildPending, !self.isViewerSuspended, !self.isRebuildDeferred {
+                self.scheduleRebuild()
+            }
         }
     }
 
@@ -1090,6 +1269,7 @@ final class TimelineModel {
             guard dirty else { return }
             var projectionChanged = sections != fresh
             sections = fresh
+            if projectionChanged { noteProjectionInputsChanged() }
             for id in toFetch {
                 guard !isViewerSuspended else {
                     resyncPending = true
@@ -1104,7 +1284,10 @@ final class TimelineModel {
                         resolution.assets,
                         byUploadDate: filter.groupsByUploadDate
                     )
-                    projectionChanged = projectionChanged || sections[index].days != days
+                    if sections[index].days != days {
+                        projectionChanged = true
+                        noteProjectionInputsChanged()
+                    }
                     sections[index].days = days
                     if resolution.isAuthoritative {
                         cacheBucket(id, assets: resolution.assets)
@@ -1113,11 +1296,9 @@ final class TimelineModel {
             }
             projectionChanged = await updateLocalItems() || projectionChanged
             guard projectionChanged else { return }
-            guard !isViewerSuspended else {
-                rebuildPending = true
-                return
-            }
-            rebuildRows(rebuildAssets: true, animated: true)
+            // debounced off-main rebuild, so a realtime burst on a large
+            // library never stalls the grid it is updating.
+            scheduleRebuild(animated: true)
         } catch {
             // stale is fine; the next event, tick or foreground pass retries.
         }
@@ -1128,11 +1309,7 @@ final class TimelineModel {
     /// re-reads device assets and their backup status, then rebuilds rows.
     func refreshLocalItems() async {
         guard await updateLocalItems() else { return }
-        if isViewerSuspended {
-            rebuildPending = true
-        } else {
-            rebuildRows(rebuildAssets: true, animated: true)
-        }
+        scheduleRebuild(animated: true)
     }
 
     @discardableResult
@@ -1140,50 +1317,96 @@ final class TimelineModel {
         guard mergesLocal, let backup else { return false }
         let items = await backup.localTimelineAssets()
         guard items != localItems else { return false }
+        let source = await Self.makeLocalMergeSource(items)
         localItems = items
+        localMergeSource = source
+        noteProjectionInputsChanged()
         return true
     }
 
-    private static let utcCalendar: Calendar = {
+    /// the once-per-change half of the merge: converting and month-keying
+    /// tens of thousands of device assets costs a calendar lookup each, which
+    /// used to run inside every rebuild.
+    @concurrent
+    nonisolated private static func makeLocalMergeSource(
+        _ items: [LocalTimelineItem]
+    ) async -> LocalMergeSource {
+        var unpaired: [String: [Asset]] = [:]
+        var paired: [String: [LocalMergeSource.Paired]] = [:]
+        var pairedRemoteIDs = Set<String>()
+        for item in items {
+            let asset = item.device.asAsset(backedUp: item.backedUp)
+            let key = monthKey(for: asset.localDate)
+            if let remoteId = item.remoteId {
+                paired[key, default: []].append(.init(remoteId: remoteId, asset: asset))
+                pairedRemoteIDs.insert(remoteId)
+            } else {
+                unpaired[key, default: []].append(asset)
+            }
+        }
+        for key in unpaired.keys {
+            unpaired[key]?.sort { $0.localDate > $1.localDate }
+        }
+        for key in paired.keys {
+            paired[key]?.sort { $0.asset.localDate > $1.asset.localDate }
+        }
+        return LocalMergeSource(
+            unpairedByMonth: unpaired,
+            pairedByMonth: paired,
+            pairedRemoteIDs: pairedRemoteIDs
+        )
+    }
+
+    nonisolated private static let utcCalendar: Calendar = {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone(identifier: "UTC")!
         return calendar
     }()
 
-    private static func monthKey(for date: Date) -> String {
+    nonisolated private static func monthKey(for date: Date) -> String {
         let comps = utcCalendar.dateComponents([.year, .month], from: date)
         return String(format: "%04d-%02d-01", comps.year ?? 0, comps.month ?? 0)
     }
 
-    private static func dayIndex(for date: Date) -> Int {
+    nonisolated private static func dayIndex(for date: Date) -> Int {
         Int((date.timeIntervalSince1970 / 86_400).rounded(.down))
     }
 
     /// server sections with device-only assets woven in. server data stays
-    /// untouched in `sections`; the merge is recomputed on every rebuild.
-    private func mergedSections() -> [TimelineSection] {
-        guard mergesLocal, !localItems.isEmpty else { return sections }
+    /// untouched in `sections`; the merge is recomputed on every rebuild from
+    /// the pre-shaped source.
+    nonisolated private static func mergedSections(
+        _ sections: [TimelineSection],
+        local: LocalMergeSource?
+    ) -> [TimelineSection] {
+        guard let local, !local.isEmpty else { return sections }
 
         // server assets already in the grid hide their device twins, so an
-        // upload swaps tiles without ever showing the photo twice.
-        var loadedServerIDs: Set<String> = []
-        for section in sections {
-            guard let days = section.days else { continue }
-            for day in days {
-                for asset in day.assets { loadedServerIDs.insert(asset.id) }
+        // upload swaps tiles without ever showing the photo twice. nothing
+        // paired means nothing can hide, and the whole walk is skipped.
+        var hiddenRemoteIDs = Set<String>()
+        if !local.pairedRemoteIDs.isEmpty {
+            for section in sections {
+                guard let days = section.days else { continue }
+                for day in days {
+                    for asset in day.assets where local.pairedRemoteIDs.contains(asset.id) {
+                        hiddenRemoteIDs.insert(asset.id)
+                    }
+                }
             }
         }
 
-        var byMonth: [String: [Asset]] = [:]
-        for item in localItems {
-            if let remoteId = item.remoteId, loadedServerIDs.contains(remoteId) { continue }
-            let asset = item.device.asAsset(backedUp: item.backedUp)
-            byMonth[Self.monthKey(for: asset.localDate), default: []].append(asset)
+        var byMonth = local.unpairedByMonth
+        for (key, entries) in local.pairedByMonth {
+            let visible = entries.filter { !hiddenRemoteIDs.contains($0.remoteId) }.map(\.asset)
+            guard !visible.isEmpty else { continue }
+            if let existing = byMonth[key] {
+                byMonth[key] = mergeSortedByLocalDate(existing, visible)
+            } else {
+                byMonth[key] = visible
+            }
         }
         guard !byMonth.isEmpty else { return sections }
-        for key in byMonth.keys {
-            byMonth[key]?.sort { $0.localDate > $1.localDate }
-        }
 
         var merged: [TimelineSection] = []
         var remainingMonths = Set(byMonth.keys)
@@ -1214,7 +1437,7 @@ final class TimelineModel {
         return merged
     }
 
-    private static func mergeSection(_ section: TimelineSection, locals: [Asset]) -> TimelineSection {
+    nonisolated private static func mergeSection(_ section: TimelineSection, locals: [Asset]) -> TimelineSection {
         guard var days = section.days else { return section }
 
         var localsByDay: [String: [Asset]] = [:]
@@ -1251,7 +1474,7 @@ final class TimelineModel {
 
     /// merges two lists already sorted newest-first, preserving each side's
     /// internal order on ties.
-    private static func mergeSortedByLocalDate(_ a: [Asset], _ b: [Asset]) -> [Asset] {
+    nonisolated private static func mergeSortedByLocalDate(_ a: [Asset], _ b: [Asset]) -> [Asset] {
         var result: [Asset] = []
         result.reserveCapacity(a.count + b.count)
         var i = 0
@@ -1302,6 +1525,7 @@ final class TimelineModel {
             }
         }
         guard !changedBucketIDs.isEmpty else { return }
+        noteProjectionInputsChanged()
         mutationOverlay.rejectFetchesStartedBeforeNextRequest(bucketIDs: changedBucketIDs)
         TimelineAssetProjection.patchRows(
             &rows,
@@ -1409,6 +1633,7 @@ final class TimelineModel {
             sourcesByAssetID: projectionSources(in: sections)
         )
         sections = []
+        noteProjectionInputsChanged()
         rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
         return snapshot
     }
@@ -1464,6 +1689,7 @@ final class TimelineModel {
             }
             sections[existingIndex].days = currentDays
         }
+        noteProjectionInputsChanged()
         rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
     }
 
@@ -1513,6 +1739,7 @@ final class TimelineModel {
             bucketIDByAssetID[id] = nil
         }
         sections.removeAll { $0.isLoaded && ($0.days?.isEmpty ?? false) }
+        noteProjectionInputsChanged()
         if operationID == nil {
             rebuildRows(rebuildAssets: true, animated: !isViewerSuspended)
         } else {
@@ -1579,6 +1806,7 @@ final class TimelineModel {
             bucketIDByAssetID[placement.asset.id] = placement.section.id
         }
         projectedRemovalIDs.subtract(wanted)
+        noteProjectionInputsChanged()
         scheduleOptimisticRebuild()
     }
 
@@ -1626,33 +1854,35 @@ final class TimelineModel {
 
     // MARK: - grouping helpers
 
-    private static let bucketParser: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter
-    }()
-
-    static func bucketDate(_ raw: String) -> Date? {
-        bucketParser.date(from: String(raw.prefix(10)))
+    /// parsed with the utc calendar rather than a shared dateformatter, which
+    /// is not thread safe now that projections build off the main actor.
+    nonisolated static func bucketDate(_ raw: String) -> Date? {
+        let parts = raw.prefix(10).split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2])
+        else { return nil }
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = day
+        return utcCalendar.date(from: comps)
     }
 
     /// short month plus year, the label format both immich clients use for
     /// their scrubbers.
-    private static func monthTitle(for raw: String) -> String {
+    nonisolated private static func monthTitle(for raw: String) -> String {
         guard let date = bucketDate(raw) else { return raw }
         return date.formatted(.dateTime.month(.abbreviated).year().utc())
     }
 
-    private static func year(for raw: String) -> Int {
+    nonisolated private static func year(for raw: String) -> Int {
         guard let date = bucketDate(raw) else { return Int(raw.prefix(4)) ?? 0 }
-        var calendar = Calendar.current
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-        return calendar.component(.year, from: date)
+        return utcCalendar.component(.year, from: date)
     }
 
-    private static func groupByDay(_ assets: [Asset], byUploadDate: Bool = false) -> [DayGroup] {
+    nonisolated private static func groupByDay(_ assets: [Asset], byUploadDate: Bool = false) -> [DayGroup] {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone(identifier: "UTC")!
         var groups: [DayGroup] = []
@@ -1684,7 +1914,7 @@ final class TimelineModel {
         return groups
     }
 
-    private static func dayTitle(_ date: Date, calendar: Calendar) -> String {
+    nonisolated private static func dayTitle(_ date: Date, calendar: Calendar) -> String {
         let now = Date()
         var localCalendar = Calendar.current
         localCalendar.timeZone = .current
@@ -1711,7 +1941,7 @@ final class TimelineModel {
         )
     }
 
-    private static func nowShifted() -> Date {
+    nonisolated private static func nowShifted() -> Date {
         Date().addingTimeInterval(TimeInterval(TimeZone.current.secondsFromGMT()))
     }
 }

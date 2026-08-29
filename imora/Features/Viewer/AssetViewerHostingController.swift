@@ -923,22 +923,37 @@ final class AssetTileRegistry {
         weak var view: UIView?
         weak var session: SessionStore?
         var asset: Asset
+        var targetPixelSize: CGFloat
 
-        init(_ view: UIView, asset: Asset, session: SessionStore) {
+        init(
+            _ view: UIView,
+            asset: Asset,
+            session: SessionStore,
+            targetPixelSize: CGFloat
+        ) {
             self.view = view
             self.asset = asset
             self.session = session
+            self.targetPixelSize = targetPixelSize
         }
     }
 
     private var tiles: [String: WeakTile] = [:]
     private var suppressedInteractionIDs: Set<String> = []
-    private var transitionImageTasks: [String: Task<Void, Never>] = [:]
 
-    func register(_ view: UIView, asset: Asset, session: SessionStore) {
-        tiles[asset.id] = WeakTile(view, asset: asset, session: session)
+    func register(
+        _ view: UIView,
+        asset: Asset,
+        session: SessionStore,
+        targetPixelSize: CGFloat
+    ) {
+        tiles[asset.id] = WeakTile(
+            view,
+            asset: asset,
+            session: session,
+            targetPixelSize: targetPixelSize
+        )
         view.isUserInteractionEnabled = !suppressedInteractionIDs.contains(asset.id)
-        primeTransitionImage(for: asset, session: session)
     }
 
     func unregister(_ view: UIView, for assetID: String) {
@@ -969,54 +984,50 @@ final class AssetTileRegistry {
         }
         let frame = view.convert(view.bounds, to: container)
         guard frame.intersects(container.bounds) else { return nil }
-        guard let image = cachedImage(for: tile.asset, session: session)
+        guard let image = cachedImage(
+            for: tile.asset,
+            targetPixelSize: tile.targetPixelSize,
+            session: session
+        )
             ?? renderedImage(of: view)
         else { return nil }
         return AssetViewerZoomSource(view: view, image: image, frame: frame)
     }
 
-    private func cachedImage(for asset: Asset, session: SessionStore) -> UIImage? {
+    private func cachedImage(
+        for asset: Asset,
+        targetPixelSize: CGFloat,
+        session: SessionStore
+    ) -> UIImage? {
         let pairedLocalID = asset.localIdentifier
             ?? session.backup?.localIdentifierByRemoteId[asset.id]
         if let pairedLocalID {
-            if let image = LocalImageLoader.shared.cachedImage(
-                localIdentifier: pairedLocalID,
-                targetPixelSize: 640,
-                contentMode: .aspectFit
-            ) {
-                return image
-            }
-            if let image = LocalImageLoader.shared.cachedImage(
-                localIdentifier: pairedLocalID,
-                targetPixelSize: 640,
-                contentMode: .aspectFill
-            ) {
-                return image
+            for size in [targetPixelSize, 640] {
+                if let image = LocalImageLoader.shared.cachedImage(
+                    localIdentifier: pairedLocalID,
+                    targetPixelSize: size,
+                    contentMode: .aspectFill
+                ) {
+                    return image
+                }
+                if let image = LocalImageLoader.shared.cachedImage(
+                    localIdentifier: pairedLocalID,
+                    targetPixelSize: size,
+                    contentMode: .aspectFit
+                ) {
+                    return image
+                }
             }
         }
         guard let client = session.client else { return nil }
         let url = client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash)
-        return ImageLoader.shared.cachedImage(for: url, targetPixelSize: 640)
-    }
-
-    private func primeTransitionImage(for asset: Asset, session: SessionStore) {
-        guard let pairedLocalID = asset.localIdentifier
-                ?? session.backup?.localIdentifierByRemoteId[asset.id],
-              LocalImageLoader.shared.cachedImage(
-                  localIdentifier: pairedLocalID,
-                  targetPixelSize: 640,
-                  contentMode: .aspectFit
-              ) == nil,
-              transitionImageTasks[pairedLocalID] == nil
-        else { return }
-        transitionImageTasks[pairedLocalID] = Task { @MainActor [weak self] in
-            _ = await LocalImageLoader.shared.image(
-                localIdentifier: pairedLocalID,
-                targetPixelSize: 640,
-                contentMode: .aspectFit
-            )
-            self?.transitionImageTasks[pairedLocalID] = nil
+        if let image = ImageLoader.shared.cachedImage(
+            for: url,
+            targetPixelSize: targetPixelSize
+        ) {
+            return image
         }
+        return ImageLoader.shared.cachedImage(for: url, targetPixelSize: 640)
     }
 
     private func renderedImage(of view: UIView) -> UIImage? {

@@ -9,13 +9,13 @@ import Photos
 /// photokit's caching manager, but both take the same window.
 @MainActor
 final class ThumbnailPrefetcher {
-    /// tiles kept warm past the fold - roughly two phone screens, about what a
-    /// fling covers before the network can answer.
-    private static let lookAhead = 60
+    /// tiles kept warm past the fold, about what a fast fling can reveal before
+    /// the network can answer.
+    private static let lookAhead = 36
     /// scrolling back up is common enough to keep a short tail warm too.
-    private static let lookBehind = 20
+    private static let lookBehind = 12
 
-    private let targetPixelSize: CGFloat
+    private var targetPixelSize: CGFloat
     private let localContentMode: PHImageContentMode
     private var remote: Set<URL> = []
     private var local: Set<String> = []
@@ -34,7 +34,16 @@ final class ThumbnailPrefetcher {
     }
 
     /// anchors on the first visible tile row and warms the assets around it.
-    func update(visibleRowIDs: [String], model: TimelineModel, client: ImmichClient?, backup: BackupManager?) {
+    func update(
+        visibleRowIDs: [String],
+        model: TimelineModel,
+        client: ImmichClient?,
+        backup: BackupManager?,
+        targetPixelSize: CGFloat? = nil
+    ) {
+        if let targetPixelSize {
+            updateTargetPixelSize(targetPixelSize)
+        }
         guard let client,
               let anchorID = visibleRowIDs.lazy.compactMap({ model.firstAssetIDByRowID[$0] }).first,
               let anchor = model.flatAssetIndex(for: anchorID)
@@ -74,7 +83,15 @@ final class ThumbnailPrefetcher {
 
     func cancel() {
         window = nil
+        windowVersion = -1
         apply(remote: [], local: [])
+    }
+
+    private func updateTargetPixelSize(_ value: CGFloat) {
+        let value = max(1, value.rounded(.up))
+        guard value != targetPixelSize else { return }
+        cancel()
+        targetPixelSize = value
     }
 
     private func apply(remote: Set<URL>, local: Set<String>) {
