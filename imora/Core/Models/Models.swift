@@ -36,7 +36,7 @@ nonisolated enum APIDate {
 
 extension Date.FormatStyle {
     /// asset dates are utc wall-clock values already shifted to local time; render them without zone conversion.
-    func utc() -> Date.FormatStyle {
+    nonisolated func utc() -> Date.FormatStyle {
         var copy = self
         copy.timeZone = TimeZone(identifier: "UTC")!
         return copy

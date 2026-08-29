@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 nonisolated enum ImmichError: LocalizedError {
     case invalidURL
@@ -574,7 +575,7 @@ nonisolated final class ImmichClient: Sendable {
     /// before showing share ui, and a fresh round trip each time doubled
     /// their time to content.
     func serverWebURL() async -> URL {
-        if let cachedWebURL { return cachedWebURL }
+        if let cached = cachedWebURL.withLock({ $0 }) { return cached }
         let fallback = apiURL.lastPathComponent == "api"
             ? apiURL.deletingLastPathComponent()
             : apiURL
@@ -589,11 +590,11 @@ nonisolated final class ImmichClient: Sendable {
         } else {
             resolved = fallback
         }
-        cachedWebURL = resolved
+        cachedWebURL.withLock { $0 = resolved }
         return resolved
     }
 
-    private var cachedWebURL: URL?
+    private let cachedWebURL = Mutex<URL?>(nil)
 
     /// account tag for offline caches, nil when the url has no host.
     var offlineAccountKey: String? {
