@@ -515,8 +515,8 @@ final class AssetViewerOpeningChromeCache {
     private var prewarmTask: Task<Void, Never>?
     private var generation = 0
 
-    private let maximumPreparedCount = 8
-    private let maximumVisibleCount = 8
+    private let maximumPreparedCount = 4
+    private let maximumVisibleCount = 4
     private let prewarmDelay = Duration.milliseconds(240)
     private let renderSettleDelay = Duration.milliseconds(34)
 

@@ -18,31 +18,34 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     /// scrolling back into view renders on its first frame, synchronously -
     /// photokit only ever answers through a callback.
     private let cache: NSCache<NSString, UIImage>
-    private let assets = OSAllocatedUnfairLock<[String: PHAsset]>(initialState: [:])
+    private let assets: NSCache<NSString, PHAsset>
     /// exported live photo motion files in least-recently-used order.
     private let motionFiles = OSAllocatedUnfairLock<[URL]>(initialState: [])
-    /// a window can be eighty identifiers wide and every miss is a synchronous
+    /// a window can hold dozens of identifiers and every miss is a synchronous
     /// library query, so the bookkeeping stays off the caller's thread. serial
     /// keeps a stop from overtaking the start it cancels.
     private let cachingQueue = DispatchQueue(label: "app.imora.local-image-caching", qos: .userInitiated)
 
     private init() {
         cache = NSCache()
-        cache.totalCostLimit = 96 << 20
+        cache.totalCostLimit = 48 << 20
+        assets = NSCache()
+        assets.countLimit = 512
     }
 
     /// asset lookups are cached; a library change invalidates them all.
     func noteLibraryChange() {
-        assets.withLock { $0.removeAll() }
+        assets.removeAllObjects()
         manager.stopCachingImagesForAllAssets()
     }
 
     private func fetchAsset(_ localIdentifier: String) -> PHAsset? {
-        if let cached = assets.withLock({ $0[localIdentifier] }) { return cached }
+        let key = localIdentifier as NSString
+        if let cached = assets.object(forKey: key) { return cached }
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil).firstObject else {
             return nil
         }
-        assets.withLock { $0[localIdentifier] = asset }
+        assets.setObject(asset, forKey: key)
         return asset
     }
 

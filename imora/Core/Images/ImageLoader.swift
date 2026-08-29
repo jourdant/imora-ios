@@ -29,7 +29,7 @@ nonisolated final class ImageLoader: Sendable {
             return DataLoader(configuration: config)
         }()
         configuration.dataCache = dataCache
-        configuration.imageCache = ImageCache(costLimit: 256 << 20)
+        configuration.imageCache = ImageCache(costLimit: 96 << 20)
         // the sanitized key drops the thumbnail size, so one download serves
         // every pixel size the grid and the viewer ask for.
         configuration.dataCachePolicy = .storeOriginalData
