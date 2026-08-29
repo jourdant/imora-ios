@@ -164,7 +164,7 @@ extension NotificationLevel {
         case .success: .green
         case .error: .red
         case .warning: .orange
-        case .info: .blue
+        case .info: .accentColor
         }
     }
 }

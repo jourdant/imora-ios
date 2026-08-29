@@ -139,7 +139,7 @@ struct AlbumsTab: View {
                     }
                     .buttonStyle(.plain)
                     .glassEffect(
-                        filter == item ? .regular.tint(.indigo.opacity(0.7)) : .regular,
+                        filter == item ? .regular.tint(.accentColor.opacity(0.7)) : .regular,
                         in: .capsule
                     )
                     .foregroundStyle(filter == item ? .white : .primary)

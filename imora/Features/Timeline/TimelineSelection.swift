@@ -211,7 +211,6 @@ struct SelectedAssetsSheet: View {
                         Image(systemName: "checkmark")
                     }
                     .buttonStyle(.glassProminent)
-                    .tint(.blue)
                     .accessibilityLabel("Done")
                     .accessibilityIdentifier("selection-done")
                 }
