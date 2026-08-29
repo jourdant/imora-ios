@@ -3008,17 +3008,17 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ scrollView: AssetZoomScrollView, coordinator: Coordinator) {
-        coordinator.resetToFit(scrollView)
+        // dismantle can run while the hosting hierarchy invalidates its
+        // attribute graph, where any synchronous swiftui state write
+        // re-enters the invalidation and traps on exclusivity. callbacks go
+        // inert and the delegate detaches before the mechanical reset.
+        coordinator.prepareForDismantle()
         scrollView.delegate = nil
         scrollView.onBoundsSizeChanged = nil
         scrollView.onHierarchyChanged = nil
+        coordinator.resetToFit(scrollView)
         coordinator.detachGestureHub()
         coordinator.detachCommandBridge()
-        coordinator.onMediaTap = {}
-        coordinator.onDoubleTapZoomChanged = { _ in }
-        coordinator.onZoomInteractionStarted = {}
-        coordinator.onZoomPresentationChanged = { _ in }
-        coordinator.onZoomChanged = { _ in }
         coordinator.hostingController.view.removeFromSuperview()
     }
 
@@ -3102,6 +3102,21 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
             doubleTapTargetZoomed = false
             if isActivePage { onZoomPresentationChanged(false) }
             onZoomChanged(false)
+        }
+
+        /// makes every swiftui-facing callback inert ahead of teardown and
+        /// resolves a pending information fit on the next tick, so nothing
+        /// writes swiftui state while the graph is invalidating.
+        func prepareForDismantle() {
+            onMediaTap = {}
+            onDoubleTapZoomChanged = { _ in }
+            onZoomInteractionStarted = {}
+            onZoomPresentationChanged = { _ in }
+            onZoomChanged = { _ in }
+            guard let pendingInformationFit else { return }
+            self.pendingInformationFit = nil
+            informationFitGeneration &+= 1
+            DispatchQueue.main.async { pendingInformationFit.completion(false) }
         }
 
         /// re-fits the asset after the page geometry changed, e.g. rotation.

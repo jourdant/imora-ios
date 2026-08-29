@@ -101,7 +101,11 @@ final class AssetViewerZoomCommandBridge {
     ) {
         guard let pendingFit else { return }
         target?.cancelRoutedZoomToFit()
-        pendingFit.completion(false)
+        // cancellation can fire inside a representable update or hierarchy
+        // teardown, where the completion writing swiftui state synchronously
+        // is unsafe. delivery is deferred one tick, the completion is
+        // request-scoped so a late cancel cannot clobber a newer fit.
+        DispatchQueue.main.async { pendingFit.completion(false) }
     }
 
     private func resolveFit(
