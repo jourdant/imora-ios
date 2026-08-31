@@ -8,7 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		000000000000000170000000 /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000160000000 /* Nuke */; };
-		000000000000000180000000 /* imoraShare.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000121 /* imoraShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		000000000000000180000000 /* ImoraShare.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000121 /* ImoraShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -17,7 +17,7 @@
 			containerPortal = 000000000000000000000000 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 000000000000000200000000;
-			remoteInfo = imoraShare;
+			remoteInfo = ImoraShare;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -27,39 +27,49 @@
 			dstPath = "";
 			dstSubfolder = PlugIns;
 			files = (
-				000000000000000180000000 /* imoraShare.appex in Embed Foundation Extensions */,
+				000000000000000180000000 /* ImoraShare.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		000000000000000000000120 /* imora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = imora.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		000000000000000000000121 /* imoraShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = imoraShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000120 /* Imora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Imora.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000121 /* ImoraShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ImoraShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		000000000000000000000012 /* Exceptions for "imoraShare" folder in "imoraShare" target */ = {
+		000000000000000000000012 /* Exceptions for "ImoraShare" folder in "ImoraShare" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 000000000000000200000000 /* imoraShare */;
+			target = 000000000000000200000000 /* ImoraShare */;
+		};
+		000000000000000000000013 /* Exceptions for "Imora" folder in "Imora" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 000000000000000100000000 /* Imora */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		000000000000000000000010 /* imora */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = imora;
-			sourceTree = "<group>";
-		};
-		000000000000000000000011 /* imoraShare */ = {
+		000000000000000000000010 /* Imora */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				000000000000000000000012 /* Exceptions for "imoraShare" folder in "imoraShare" target */,
+				000000000000000000000013 /* Exceptions for "Imora" folder in "Imora" target */,
 			);
-			path = imoraShare;
+			path = Imora;
+			sourceTree = "<group>";
+		};
+		000000000000000000000011 /* ImoraShare */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				000000000000000000000012 /* Exceptions for "ImoraShare" folder in "ImoraShare" target */,
+			);
+			path = ImoraShare;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -82,8 +92,8 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000010 /* imora */,
-				000000000000000000000011 /* imoraShare */,
+				000000000000000000000010 /* Imora */,
+				000000000000000000000011 /* ImoraShare */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -91,8 +101,8 @@
 		000000000000000000000020 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000120 /* imora.app */,
-				000000000000000000000121 /* imoraShare.appex */,
+				000000000000000000000120 /* Imora.app */,
+				000000000000000000000121 /* ImoraShare.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -100,9 +110,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		000000000000000100000000 /* imora */ = {
+		000000000000000100000000 /* Imora */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "imora" */;
+			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "Imora" */;
 			buildPhases = (
 				000000000000000120000000 /* Sources */,
 				000000000000000130000000 /* Frameworks */,
@@ -115,19 +125,19 @@
 				000000000000000190000000 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				000000000000000000000010 /* imora */,
+				000000000000000000000010 /* Imora */,
 			);
-			name = imora;
+			name = Imora;
 			packageProductDependencies = (
 				000000000000000160000000 /* Nuke */,
 			);
-			productName = MyApp;
-			productReference = 000000000000000000000120 /* imora.app */;
+			productName = Imora;
+			productReference = 000000000000000000000120 /* Imora.app */;
 			productType = "com.apple.product-type.application";
 		};
-		000000000000000200000000 /* imoraShare */ = {
+		000000000000000200000000 /* ImoraShare */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 000000000000000210000000 /* Build configuration list for PBXNativeTarget "imoraShare" */;
+			buildConfigurationList = 000000000000000210000000 /* Build configuration list for PBXNativeTarget "ImoraShare" */;
 			buildPhases = (
 				000000000000000220000000 /* Sources */,
 				000000000000000230000000 /* Frameworks */,
@@ -136,11 +146,11 @@
 			buildRules = (
 			);
 			fileSystemSynchronizedGroups = (
-				000000000000000000000011 /* imoraShare */,
+				000000000000000000000011 /* ImoraShare */,
 			);
-			name = imoraShare;
-			productName = imoraShare;
-			productReference = 000000000000000000000121 /* imoraShare.appex */;
+			name = ImoraShare;
+			productName = ImoraShare;
+			productReference = 000000000000000000000121 /* ImoraShare.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
@@ -161,7 +171,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 000000000000000010000000 /* Build configuration list for PBXProject "imora" */;
+			buildConfigurationList = 000000000000000010000000 /* Build configuration list for PBXProject "Imora" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -178,8 +188,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				000000000000000100000000 /* imora */,
-				000000000000000200000000 /* imoraShare */,
+				000000000000000100000000 /* Imora */,
+				000000000000000200000000 /* ImoraShare */,
 			);
 		};
 /* End PBXProject section */
@@ -213,13 +223,13 @@
 /* Begin PBXTargetDependency section */
 		000000000000000190000000 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 000000000000000200000000 /* imoraShare */;
+			target = 000000000000000200000000 /* ImoraShare */;
 			targetProxy = 000000000000000191000000 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		000000000000000011000000 /* Debug configuration for PBXProject "imora" */ = {
+		000000000000000011000000 /* Debug configuration for PBXProject "Imora" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -290,7 +300,7 @@
 			};
 			name = Debug;
 		};
-		000000000000000012000000 /* Release configuration for PBXProject "imora" */ = {
+		000000000000000012000000 /* Release configuration for PBXProject "Imora" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -353,12 +363,12 @@
 			};
 			name = Release;
 		};
-		000000000000000111000000 /* Debug configuration for PBXNativeTarget "imora" */ = {
+		000000000000000111000000 /* Debug configuration for PBXNativeTarget "Imora" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = imora.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Imora/Imora.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = WLAPHT4WXV;
@@ -366,7 +376,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_FILE = Imora/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -395,12 +405,12 @@
 			};
 			name = Debug;
 		};
-		000000000000000112000000 /* Release configuration for PBXNativeTarget "imora" */ = {
+		000000000000000112000000 /* Release configuration for PBXNativeTarget "Imora" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = imora.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Imora/Imora.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = WLAPHT4WXV;
@@ -408,7 +418,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_FILE = Imora/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -437,16 +447,16 @@
 			};
 			name = Release;
 		};
-		000000000000000211000000 /* Debug configuration for PBXNativeTarget "imoraShare" */ = {
+		000000000000000211000000 /* Debug configuration for PBXNativeTarget "ImoraShare" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = imoraShare/imoraShare.entitlements;
+				CODE_SIGN_ENTITLEMENTS = ImoraShare/ImoraShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = WLAPHT4WXV;
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = imoraShare/Info.plist;
+				INFOPLIST_FILE = ImoraShare/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
@@ -467,16 +477,16 @@
 			};
 			name = Debug;
 		};
-		000000000000000212000000 /* Release configuration for PBXNativeTarget "imoraShare" */ = {
+		000000000000000212000000 /* Release configuration for PBXNativeTarget "ImoraShare" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = imoraShare/imoraShare.entitlements;
+				CODE_SIGN_ENTITLEMENTS = ImoraShare/ImoraShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = WLAPHT4WXV;
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = imoraShare/Info.plist;
+				INFOPLIST_FILE = ImoraShare/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
@@ -500,27 +510,27 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		000000000000000010000000 /* Build configuration list for PBXProject "imora" */ = {
+		000000000000000010000000 /* Build configuration list for PBXProject "Imora" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000011000000 /* Debug configuration for PBXProject "imora" */,
-				000000000000000012000000 /* Release configuration for PBXProject "imora" */,
+				000000000000000011000000 /* Debug configuration for PBXProject "Imora" */,
+				000000000000000012000000 /* Release configuration for PBXProject "Imora" */,
 			);
 			defaultConfigurationName = Release;
 		};
-		000000000000000110000000 /* Build configuration list for PBXNativeTarget "imora" */ = {
+		000000000000000110000000 /* Build configuration list for PBXNativeTarget "Imora" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000111000000 /* Debug configuration for PBXNativeTarget "imora" */,
-				000000000000000112000000 /* Release configuration for PBXNativeTarget "imora" */,
+				000000000000000111000000 /* Debug configuration for PBXNativeTarget "Imora" */,
+				000000000000000112000000 /* Release configuration for PBXNativeTarget "Imora" */,
 			);
 			defaultConfigurationName = Release;
 		};
-		000000000000000210000000 /* Build configuration list for PBXNativeTarget "imoraShare" */ = {
+		000000000000000210000000 /* Build configuration list for PBXNativeTarget "ImoraShare" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000211000000 /* Debug configuration for PBXNativeTarget "imoraShare" */,
-				000000000000000212000000 /* Release configuration for PBXNativeTarget "imoraShare" */,
+				000000000000000211000000 /* Debug configuration for PBXNativeTarget "ImoraShare" */,
+				000000000000000212000000 /* Release configuration for PBXNativeTarget "ImoraShare" */,
 			);
 			defaultConfigurationName = Release;
 		};

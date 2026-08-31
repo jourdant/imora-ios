@@ -1,6 +1,6 @@
 import Foundation
 
-// NOTE: this file is duplicated verbatim in imoraShare/MultipartBody.swift.
+// NOTE: this file is duplicated verbatim in ImoraShare/MultipartBody.swift.
 // the share extension builds the same request bodies and the targets share no
 // module - change both or neither.
 

@@ -16,9 +16,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "000000000000000100000000"
-               BuildableName = "imora.app"
-               BlueprintName = "imora"
-               ReferencedContainer = "container:imora.xcodeproj">
+               BuildableName = "Imora.app"
+               BlueprintName = "Imora"
+               ReferencedContainer = "container:Imora.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -45,9 +45,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
-            BuildableName = "imora.app"
-            BlueprintName = "imora"
-            ReferencedContainer = "container:imora.xcodeproj">
+            BuildableName = "Imora.app"
+            BlueprintName = "Imora"
+            ReferencedContainer = "container:Imora.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -62,9 +62,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
-            BuildableName = "imora.app"
-            BlueprintName = "imora"
-            ReferencedContainer = "container:imora.xcodeproj">
+            BuildableName = "Imora.app"
+            BlueprintName = "Imora"
+            ReferencedContainer = "container:Imora.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

@@ -14,8 +14,8 @@
         {
           "blend-mode" : "normal",
           "hidden" : false,
-          "image-name" : "Frame 3.svg",
-          "name" : "Frame 3",
+          "image-name" : "app-mark.svg",
+          "name" : "app-mark",
           "opacity" : 1,
           "position" : {
             "scale" : 12,

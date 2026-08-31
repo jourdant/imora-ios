@@ -1,4 +1,4 @@
-# imora
+# Imora
 
 A native SwiftUI client for [Immich](https://immich.app), rebuilt from the ground up for iOS 26 with Liquid Glass.
 
@@ -16,7 +16,7 @@ This is a rewrite of the official Flutter mobile app as a fully native iOS exper
 - Notifications: a server inbox for album invites, album activity and server alerts with an unread badge on the timeline bell, swipe to mark read or delete, tap to jump to the album, plus iOS banners raised live from the realtime socket and caught up on launch - with per-type device switches, backup reports and the server's email notification settings
 - Backups you start yourself run as a `BGContinuedProcessingTask`, so they keep going after you leave the app and report progress in the Dynamic Island and on the Lock Screen with the system's own cancel button
 - Every upload goes through a background `URLSession`, so a transfer already handed to the system finishes even if the app is suspended or killed; completions that arrive with no run left to receive them are replayed into the backup index on the next launch
-- A share extension takes photos and videos from any app: they are staged in a shared app group, and imora uploads them from a screen showing a percentage per file, an overall bar and a View Photos button when it is done - leaving the app does not stop it
+- A share extension takes photos and videos from any app: they are staged in a shared app group, and Imora uploads them from a screen showing a percentage per file, an overall bar and a View Photos button when it is done - leaving the app does not stop it
 - Places: an Apple Maps photo map with client-side clustering, marker thumbnails, filters (favorites, archive, partners, shared albums, date range) and a grid of everything inside the visible area
 - Multi-select everywhere with a Liquid Glass action bar: favorite, archive, add to album, trash, restore
 - Thumbhash placeholders, thumbnail-sized decoding and a 1 GiB disk cache for fast scrolling, with grids prefetching a rolling window of tiles ahead of the fold
@@ -24,7 +24,7 @@ This is a rewrite of the official Flutter mobile app as a fully native iOS exper
 ## Requirements
 
 - Xcode 27 (iOS 26 SDK) or newer
-- An Immich server, v2.x/3.x API
+- An Immich server, v3.x API
 
 ## Dependencies
 
@@ -36,10 +36,10 @@ Everything else is system frameworks. Device thumbnails go through PhotoKit's ow
 
 ## Development
 
-Open `imora.xcodeproj` and run:
+Open `Imora.xcodeproj` and run:
 
 ```sh
-xcodebuild build -project imora.xcodeproj -scheme imora \
+xcodebuild build -project Imora.xcodeproj -scheme Imora \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.5'
 ```
 
@@ -48,7 +48,7 @@ In debug builds the login screen honors `IMORA_SERVER`, `IMORA_EMAIL` and `IMORA
 ## Architecture
 
 ```
-imora/
+Imora/
   App/            entry point, root tab shell
   Core/
     API/          ImmichClient (async REST), SessionStore
@@ -62,7 +62,7 @@ imora/
 ```
 
 Immich has no push transport: notifications arrive on the same socket the timeline
-uses, so imora raises them as local notifications while it runs and replays
+uses, so Imora raises them as local notifications while it runs and replays
 anything missed - capped at five - the next time the inbox is fetched.
 
 Backup progress is fed to `BGContinuedProcessingTask`, which draws the system
@@ -74,10 +74,10 @@ simulator rejects submission with `.unavailable`; the caller falls back to an
 in-app run, so this needs a device to see. The same machinery drives the share
 upload, through a `ContinuedWorkload` both jobs conform to.
 
-iOS forbids a share extension from opening its containing app, so `imoraShare`
+iOS forbids a share extension from opening its containing app, so `ImoraShare`
 copies what it is given into the app group, writes a `<uuid>.json` descriptor
 next to it - one file per drop, so the two processes never write the same file
-and need no coordination - and posts a notification. imora picks the inbox up
+and need no coordination - and posts a notification. Imora picks the inbox up
 every time it comes forward.
 
 Uploads run on one background `URLSession`, so the transfer belongs to the
