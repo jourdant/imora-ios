@@ -97,6 +97,10 @@ private struct ShareSheetView: View {
                 footer
             }
             .padding(24)
+            // ipad presents the extension in a wide sheet; the column keeps
+            // its phone proportions in the middle of it.
+            .frame(maxWidth: 420)
+            .frame(maxWidth: .infinity)
             .animation(.smooth(duration: 0.25), value: phase)
             .navigationTitle("Imora")
             .navigationBarTitleDisplayMode(.inline)
