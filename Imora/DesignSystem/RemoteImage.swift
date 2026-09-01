@@ -158,6 +158,10 @@ struct LocalPhotoImage: View {
     var loadsFallbackIfNeeded = false
     var requestContentMode: PHImageContentMode = .aspectFill
     var contentMode: ContentMode = .fill
+    /// false when the host has a server copy to fall back on: a paired asset
+    /// whose sharp render sits in icloud then shows the server thumbnail
+    /// instead of pulling the original down in the middle of a scroll.
+    var allowsNetwork = true
     /// photokit could not produce the asset - it was deleted from the library
     /// behind our back, or is an icloud original that will not download. hosts
     /// use this to fall back to the server copy instead of showing nothing.
@@ -166,6 +170,9 @@ struct LocalPhotoImage: View {
 
     @State private var image: KeyedImage?
     @State private var fallbackImage: KeyedImage?
+    /// photokit's stored thumbnail, on screen only until something sharper is
+    /// held for the same key.
+    @State private var previewImage: KeyedImage?
 
     private struct KeyedImage {
         let key: String
@@ -202,6 +209,7 @@ struct LocalPhotoImage: View {
             )
             ?? (fallbackImage?.key == fallbackKey ? fallbackImage?.image : nil)
             ?? cachedFallback
+            ?? (previewImage?.key == key ? previewImage?.image : nil)
         ZStack {
             if let display {
                 Image(uiImage: display)
@@ -220,29 +228,42 @@ struct LocalPhotoImage: View {
         .task(id: key) {
             guard image?.key != key else { return }
             let start = ContinuousClock.now
-            let loaded = await LocalImageLoader.shared.image(
+            var receivedFinal = false
+            let deliveries = LocalImageLoader.shared.deliveries(
                 localIdentifier: localIdentifier,
                 targetPixelSize: targetPixelSize,
-                contentMode: requestContentMode
+                contentMode: requestContentMode,
+                allowsNetwork: allowsNetwork
             )
-            guard !Task.isCancelled else { return }
-            guard let loaded else { return onUnavailable?() ?? () }
-            let keyed = KeyedImage(key: key, image: loaded)
-            // same rule as remoteimage: fast loads swap in place, slow ones
-            // fade so a late arrival never pops over the fallback.
-            if ContinuousClock.now - start < .milliseconds(120) {
-                image = keyed
-                onReady?()
-            } else {
-                withAnimation(
-                    .easeIn(duration: 0.15),
-                    completionCriteria: .logicallyComplete
-                ) {
-                    image = keyed
-                } completion: {
-                    onReady?()
+            for await delivery in deliveries {
+                guard !Task.isCancelled else { return }
+                switch delivery {
+                case .preview(let preview):
+                    // the library's own thumbnail: paints at once, no fade,
+                    // and never counts as ready - hosts wait for the render.
+                    previewImage = KeyedImage(key: key, image: preview)
+                case .final(let loaded):
+                    receivedFinal = true
+                    let keyed = KeyedImage(key: key, image: loaded)
+                    // same rule as remoteimage: fast loads swap in place, slow
+                    // ones fade so a late arrival never pops over the fallback.
+                    if ContinuousClock.now - start < .milliseconds(120) {
+                        image = keyed
+                        onReady?()
+                    } else {
+                        withAnimation(
+                            .easeIn(duration: 0.15),
+                            completionCriteria: .logicallyComplete
+                        ) {
+                            image = keyed
+                        } completion: {
+                            onReady?()
+                        }
+                    }
                 }
             }
+            guard !Task.isCancelled, !receivedFinal else { return }
+            onUnavailable?()
         }
         .task(id: fallbackKey) {
             guard loadsFallbackIfNeeded,
@@ -302,6 +323,10 @@ struct AssetTile: View {
                     LocalPhotoImage(
                         localIdentifier: localId,
                         targetPixelSize: targetPixelSize,
+                        // a device-only photo has nowhere else to come from;
+                        // a paired one falls back to the server thumbnail
+                        // rather than downloading its original from icloud.
+                        allowsNetwork: asset.isLocal,
                         onUnavailable: { localUnavailable = true }
                     )
                 } else if let client = session.client {

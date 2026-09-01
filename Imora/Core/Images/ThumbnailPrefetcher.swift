@@ -18,7 +18,13 @@ final class ThumbnailPrefetcher {
     private var targetPixelSize: CGFloat
     private let localContentMode: PHImageContentMode
     private var remote: Set<URL> = []
+    /// device-only assets: the library is their only source, so icloud may
+    /// be asked for them.
     private var local: Set<String> = []
+    /// device copies of server assets: rendered from the library when it has
+    /// them, never downloaded for a tile the server can serve. kept apart
+    /// because the caching manager only serves requests whose options match.
+    private var paired: Set<String> = []
     /// the asset range last warmed, with the `flatAssets` revision it was taken
     /// from. a fling reports visible rows far more often than the window it
     /// implies actually moves, and rebuilding it costs a url per asset.
@@ -61,30 +67,33 @@ final class ThumbnailPrefetcher {
 
         var remote: Set<URL> = []
         var local: Set<String> = []
+        var paired: Set<String> = []
         remote.reserveCapacity(upper - lower)
         for asset in assets[lower..<upper] {
             // tiles render the device copy when one is paired, so warm the
-            // same source the tile will actually ask for.
-            if let localIdentifier = asset.localIdentifier ?? backup?.localIdentifierByRemoteId[asset.id] {
+            // same source, with the same options, the tile will ask for.
+            if let localIdentifier = asset.localIdentifier {
                 local.insert(localIdentifier)
+            } else if let localIdentifier = backup?.localIdentifierByRemoteId[asset.id] {
+                paired.insert(localIdentifier)
             } else {
                 remote.insert(client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash))
             }
         }
-        apply(remote: remote, local: local)
+        apply(remote: remote, local: local, paired: paired)
     }
 
     /// warms an explicit window, for hosts that already know theirs: the
     /// viewer pages a flat list and picks its own thumbnail size.
     func warm(remote: Set<URL>, local: Set<String>) {
         window = nil
-        apply(remote: remote, local: local)
+        apply(remote: remote, local: local, paired: [])
     }
 
     func cancel() {
         window = nil
         windowVersion = -1
-        apply(remote: [], local: [])
+        apply(remote: [], local: [], paired: [])
     }
 
     private func updateTargetPixelSize(_ value: CGFloat) {
@@ -94,7 +103,7 @@ final class ThumbnailPrefetcher {
         targetPixelSize = value
     }
 
-    private func apply(remote: Set<URL>, local: Set<String>) {
+    private func apply(remote: Set<URL>, local: Set<String>, paired: Set<String>) {
         if remote != self.remote {
             let added = remote.subtracting(self.remote)
             let dropped = self.remote.subtracting(remote)
@@ -106,25 +115,34 @@ final class ThumbnailPrefetcher {
             }
             self.remote = remote
         }
+        self.local = syncLocal(local, from: self.local, allowsNetwork: true)
+        self.paired = syncLocal(paired, from: self.paired, allowsNetwork: false)
+    }
 
-        if local != self.local {
-            let added = local.subtracting(self.local)
-            let dropped = self.local.subtracting(local)
-            if !added.isEmpty {
-                LocalImageLoader.shared.startCaching(
-                    localIdentifiers: Array(added),
-                    targetPixelSize: targetPixelSize,
-                    contentMode: localContentMode
-                )
-            }
-            if !dropped.isEmpty {
-                LocalImageLoader.shared.stopCaching(
-                    localIdentifiers: Array(dropped),
-                    targetPixelSize: targetPixelSize,
-                    contentMode: localContentMode
-                )
-            }
-            self.local = local
+    private func syncLocal(
+        _ wanted: Set<String>,
+        from current: Set<String>,
+        allowsNetwork: Bool
+    ) -> Set<String> {
+        guard wanted != current else { return current }
+        let added = wanted.subtracting(current)
+        let dropped = current.subtracting(wanted)
+        if !added.isEmpty {
+            LocalImageLoader.shared.startCaching(
+                localIdentifiers: Array(added),
+                targetPixelSize: targetPixelSize,
+                contentMode: localContentMode,
+                allowsNetwork: allowsNetwork
+            )
         }
+        if !dropped.isEmpty {
+            LocalImageLoader.shared.stopCaching(
+                localIdentifiers: Array(dropped),
+                targetPixelSize: targetPixelSize,
+                contentMode: localContentMode,
+                allowsNetwork: allowsNetwork
+            )
+        }
+        return wanted
     }
 }

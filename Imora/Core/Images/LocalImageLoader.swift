@@ -3,6 +3,13 @@ import Photos
 import UIKit
 import os
 
+/// one step of a progressive photokit load: the library's own stored
+/// thumbnail while the sharp render is still being decoded, then the render.
+nonisolated enum LocalImageDelivery {
+    case preview(UIImage)
+    case final(UIImage)
+}
+
 /// photokit loading for device assets merged into the timeline. the heavy
 /// lifting - decoding, downscaling and keeping a window of tiles warm - is
 /// photokit's own caching manager, the local twin of the nuke pipeline behind
@@ -49,6 +56,28 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         return asset
     }
 
+    /// one library query for every identifier not already cached, instead of
+    /// one per tile: a prefetch window moves dozens of identifiers at a time
+    /// and each query is a round trip to the photos database.
+    private func fetchAssets(_ localIdentifiers: [String]) -> [PHAsset] {
+        var found: [PHAsset] = []
+        var missing: [String] = []
+        found.reserveCapacity(localIdentifiers.count)
+        for localIdentifier in localIdentifiers {
+            if let cached = assets.object(forKey: localIdentifier as NSString) {
+                found.append(cached)
+            } else {
+                missing.append(localIdentifier)
+            }
+        }
+        guard !missing.isEmpty else { return found }
+        PHAsset.fetchAssets(withLocalIdentifiers: missing, options: nil).enumerateObjects { asset, _, _ in
+            self.assets.setObject(asset, forKey: asset.localIdentifier as NSString)
+            found.append(asset)
+        }
+        return found
+    }
+
     private func key(
         _ localIdentifier: String,
         _ size: CGFloat,
@@ -58,14 +87,34 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     }
 
     /// the caching manager only serves a prefetched thumbnail when the request
-    /// that follows carries the same options, so both paths share these.
-    private static func requestOptions() -> PHImageRequestOptions {
+    /// that follows carries the same options, so every path shares these.
+    /// opportunistic delivery hands back the library's stored thumbnail at
+    /// once whenever the render at the asked size still has to be decoded,
+    /// which is what keeps a fling painted instead of grey.
+    private static func requestOptions(allowsNetwork: Bool) -> PHImageRequestOptions {
         let options = PHImageRequestOptions()
-        // one delivery per request, so the continuation resumes exactly once.
-        options.deliveryMode = .highQualityFormat
+        options.deliveryMode = .opportunistic
         options.resizeMode = .fast
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = allowsNetwork
         return options
+    }
+
+    private static func isDegraded(_ info: [AnyHashable: Any]?) -> Bool {
+        (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+    }
+
+    private static func isCancelled(_ info: [AnyHashable: Any]?) -> Bool {
+        (info?[PHImageCancelledKey] as? Bool) ?? false
+    }
+
+    private func store(
+        _ image: UIImage,
+        localIdentifier: String,
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode
+    ) {
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.setObject(image, forKey: key(localIdentifier, targetPixelSize, contentMode), cost: cost)
     }
 
     func cachedImage(
@@ -76,6 +125,7 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         cache.object(forKey: key(localIdentifier, targetPixelSize, contentMode))
     }
 
+    /// the sharp render alone, for callers that want exactly one image.
     /// concurrent so the photokit fetch never runs inline on the caller. under
     /// approachable concurrency a plain nonisolated async body stays on the
     /// caller's actor, which put a synchronous library query on the main
@@ -84,7 +134,8 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     func image(
         localIdentifier: String,
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode = .aspectFill
+        contentMode: PHImageContentMode = .aspectFill,
+        allowsNetwork: Bool = true
     ) async -> UIImage? {
         if let cached = cachedImage(
             localIdentifier: localIdentifier,
@@ -95,37 +146,109 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         }
         guard let asset = fetchAsset(localIdentifier) else { return nil }
         let size = CGSize(width: targetPixelSize, height: targetPixelSize)
+        // opportunistic delivery may answer twice; the stored thumbnail is
+        // skipped and the guard keeps the continuation to a single resume.
+        let resumed = OSAllocatedUnfairLock(initialState: false)
         let image = await withCheckedContinuation { continuation in
             manager.requestImage(
-                for: asset, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
-            ) { image, _ in
+                for: asset,
+                targetSize: size,
+                contentMode: contentMode,
+                options: Self.requestOptions(allowsNetwork: allowsNetwork)
+            ) { image, info in
+                guard !Self.isDegraded(info) else { return }
+                let first = resumed.withLock { resumed in
+                    defer { resumed = true }
+                    return !resumed
+                }
+                guard first else { return }
                 continuation.resume(returning: image)
             }
         }
         if let image {
-            let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
-            cache.setObject(
-                image,
-                forKey: key(localIdentifier, targetPixelSize, contentMode),
-                cost: cost
-            )
+            store(image, localIdentifier: localIdentifier, targetPixelSize: targetPixelSize, contentMode: contentMode)
         }
         return image
     }
 
+    /// progressive load for tiles: photokit's stored thumbnail lands first
+    /// when the render at `targetPixelSize` still has to be decoded, so a tile
+    /// paints on arrival and sharpens a moment later. only the sharp render is
+    /// cached. a stream that ends without one means photokit could not produce
+    /// it - the asset is gone, or sits in icloud with network access off.
+    func deliveries(
+        localIdentifier: String,
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode = .aspectFill,
+        allowsNetwork: Bool = true
+    ) -> AsyncStream<LocalImageDelivery> {
+        if let cached = cachedImage(
+            localIdentifier: localIdentifier,
+            targetPixelSize: targetPixelSize,
+            contentMode: contentMode
+        ) {
+            return AsyncStream { continuation in
+                continuation.yield(.final(cached))
+                continuation.finish()
+            }
+        }
+        let request = ImageRequestBox()
+        let manager = manager
+        return AsyncStream { continuation in
+            continuation.onTermination = { _ in request.cancel(manager) }
+            // the library lookup is synchronous photokit work, kept off the
+            // caller's actor like the single-image path.
+            Task.detached(priority: .userInitiated) { [self] in
+                guard !request.isCancelled, let asset = fetchAsset(localIdentifier) else {
+                    continuation.finish()
+                    return
+                }
+                let size = CGSize(width: targetPixelSize, height: targetPixelSize)
+                let requestID = manager.requestImage(
+                    for: asset,
+                    targetSize: size,
+                    contentMode: contentMode,
+                    options: Self.requestOptions(allowsNetwork: allowsNetwork)
+                ) { image, info in
+                    guard !Self.isCancelled(info), let image else {
+                        continuation.finish()
+                        return
+                    }
+                    if Self.isDegraded(info) {
+                        continuation.yield(.preview(image))
+                        return
+                    }
+                    store(
+                        image,
+                        localIdentifier: localIdentifier,
+                        targetPixelSize: targetPixelSize,
+                        contentMode: contentMode
+                    )
+                    continuation.yield(.final(image))
+                    continuation.finish()
+                }
+                request.register(requestID, manager: manager)
+            }
+        }
+    }
+
     // MARK: - prefetching
 
+    /// `allowsNetwork` has to match what the tiles will ask with, or the
+    /// caching manager treats their requests as strangers to its cache.
     func startCaching(
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode = .aspectFill
+        contentMode: PHImageContentMode = .aspectFill,
+        allowsNetwork: Bool = true
     ) {
         cachingQueue.async { [self] in
             setCaching(
                 true,
                 localIdentifiers: localIdentifiers,
                 targetPixelSize: targetPixelSize,
-                contentMode: contentMode
+                contentMode: contentMode,
+                allowsNetwork: allowsNetwork
             )
         }
     }
@@ -133,14 +256,16 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     func stopCaching(
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode = .aspectFill
+        contentMode: PHImageContentMode = .aspectFill,
+        allowsNetwork: Bool = true
     ) {
         cachingQueue.async { [self] in
             setCaching(
                 false,
                 localIdentifiers: localIdentifiers,
                 targetPixelSize: targetPixelSize,
-                contentMode: contentMode
+                contentMode: contentMode,
+                allowsNetwork: allowsNetwork
             )
         }
     }
@@ -149,19 +274,17 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         _ caching: Bool,
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode
+        contentMode: PHImageContentMode,
+        allowsNetwork: Bool
     ) {
-        let assets = localIdentifiers.compactMap(fetchAsset)
+        let assets = fetchAssets(localIdentifiers)
         guard !assets.isEmpty else { return }
         let size = CGSize(width: targetPixelSize, height: targetPixelSize)
+        let options = Self.requestOptions(allowsNetwork: allowsNetwork)
         if caching {
-            manager.startCachingImages(
-                for: assets, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
-            )
+            manager.startCachingImages(for: assets, targetSize: size, contentMode: contentMode, options: options)
         } else {
-            manager.stopCachingImages(
-                for: assets, targetSize: size, contentMode: contentMode, options: Self.requestOptions()
-            )
+            manager.stopCachingImages(for: assets, targetSize: size, contentMode: contentMode, options: options)
         }
     }
 
@@ -258,5 +381,37 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
             return files.removeFirst()
         }
         if let evicted { try? FileManager.default.removeItem(at: evicted) }
+    }
+}
+
+/// lock-guarded handle on one photokit image request, shared between the
+/// stream's termination handler and the task that starts the request. covers
+/// the race where the consumer gives up before the request id exists.
+private nonisolated final class ImageRequestBox: @unchecked Sendable {
+    private struct State {
+        var requestID: PHImageRequestID?
+        var cancelled = false
+    }
+
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+
+    var isCancelled: Bool {
+        lock.withLock { $0.cancelled }
+    }
+
+    func register(_ requestID: PHImageRequestID, manager: PHImageManager) {
+        let cancelNow = lock.withLock { state in
+            state.requestID = requestID
+            return state.cancelled
+        }
+        if cancelNow { manager.cancelImageRequest(requestID) }
+    }
+
+    func cancel(_ manager: PHImageManager) {
+        let requestID = lock.withLock { state -> PHImageRequestID? in
+            state.cancelled = true
+            return state.requestID
+        }
+        if let requestID { manager.cancelImageRequest(requestID) }
     }
 }
