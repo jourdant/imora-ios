@@ -43,6 +43,19 @@ nonisolated struct BackupEntry: Codable, Sendable, Equatable {
     }
 }
 
+/// everything the backup manager publishes about pairings, built in one pass
+/// inside the actor so the main actor only ever assigns finished maps.
+nonisolated struct BackupIndexSnapshot: Sendable {
+    /// every verified pairing, edited server copies included.
+    let localByRemote: [String: String]
+    /// inverse of the complete pairing map.
+    let remoteByLocal: [String: String]
+    /// pairings safe to render from the device.
+    let renderableLocalByRemote: [String: String]
+    /// remote ids of assets that exist on this device and are fully backed up.
+    let backedUpRemoteIds: Set<String>
+}
+
 /// account-scoped map of device assets to their server backup state, persisted as json.
 /// an actor so map mutations and file writes are serialized off the main actor.
 actor BackupIndex {
@@ -242,5 +255,19 @@ actor BackupIndex {
             }
         }
         return ids
+    }
+
+    func localSnapshot() -> BackupIndexSnapshot {
+        var remoteByLocal: [String: String] = [:]
+        remoteByLocal.reserveCapacity(remoteToLocal.count)
+        for (remoteId, localId) in remoteToLocal {
+            remoteByLocal[localId] = remoteId
+        }
+        return BackupIndexSnapshot(
+            localByRemote: remoteToLocal,
+            remoteByLocal: remoteByLocal,
+            renderableLocalByRemote: renderableRemoteToLocalMap(),
+            backedUpRemoteIds: backedUpRemoteIds()
+        )
     }
 }

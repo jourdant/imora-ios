@@ -283,12 +283,14 @@ final class BackupManager {
         }
     }
 
+    /// one hop for all four maps, built inside the actor: assembling them on
+    /// the main actor was a visible hitch per upload on a large library.
     private func refreshLocalSnapshots() async {
-        let pairs = await index.remoteToLocalMap()
-        backedUpRemoteIds = await index.backedUpRemoteIds()
-        pairedLocalIdentifierByRemoteId = pairs
-        remoteIdentifierByLocalId = Dictionary(uniqueKeysWithValues: pairs.map { ($0.value, $0.key) })
-        localIdentifierByRemoteId = await index.renderableRemoteToLocalMap()
+        let snapshot = await index.localSnapshot()
+        backedUpRemoteIds = snapshot.backedUpRemoteIds
+        pairedLocalIdentifierByRemoteId = snapshot.localByRemote
+        remoteIdentifierByLocalId = snapshot.remoteByLocal
+        localIdentifierByRemoteId = snapshot.renderableLocalByRemote
         onLocalChange?()
     }
 
@@ -502,9 +504,13 @@ final class BackupManager {
     }
 
     private func hashPhase(_ scanned: [DeviceAsset]) async throws {
+        // one index snapshot rather than an actor hop per asset: on a large
+        // library the hops alone kept the main actor busy for seconds on
+        // every launch, under whatever the user was scrolling.
+        let entries = await index.allEntries()
         var toHash: [DeviceAsset] = []
         for asset in scanned {
-            let entry = await index.entry(for: asset.localIdentifier)
+            let entry = entries[asset.localIdentifier]
             if entry == nil || entry?.matches(modificationDate: asset.modificationDate) != true {
                 toHash.append(asset)
             }
@@ -543,8 +549,9 @@ final class BackupManager {
         phase = .checking
         var pending: [DeviceAsset] = []
         var items: [BulkUploadCheckItem] = []
+        var entries = await index.allEntries()
         for asset in scanned {
-            guard let entry = await index.entry(for: asset.localIdentifier) else { continue }
+            guard let entry = entries[asset.localIdentifier] else { continue }
             if entry.unsupported {
                 summary.unsupported += 1
                 continue
@@ -581,8 +588,10 @@ final class BackupManager {
         }
 
         var uploadQueue: [DeviceAsset] = []
+        // re-read once: the bulk checks above changed what is proven.
+        entries = await index.allEntries()
         for asset in pending {
-            guard let entry = await index.entry(for: asset.localIdentifier) else { continue }
+            guard let entry = entries[asset.localIdentifier] else { continue }
             if entry.unsupported {
                 summary.unsupported += 1
             } else if entry.isBackedUp {
@@ -1056,9 +1065,10 @@ final class BackupManager {
         await index.load(serverHost: client.apiURL.host() ?? "", userId: user.id)
 
         let scanned = await PhotoLibraryService.scan()
+        let entries = await index.allEntries()
         var candidates: [DeviceAsset] = []
         for asset in scanned {
-            guard let entry = await index.entry(for: asset.localIdentifier),
+            guard let entry = entries[asset.localIdentifier],
                   !entry.unsupported,
                   entry.isBackedUp,
                   entry.matches(modificationDate: asset.modificationDate)
@@ -1072,7 +1082,7 @@ final class BackupManager {
         var rejected: Set<String> = []
         var items: [BulkUploadCheckItem] = []
         for asset in candidates {
-            guard let entry = await index.entry(for: asset.localIdentifier) else { continue }
+            guard let entry = entries[asset.localIdentifier] else { continue }
             items.append(BulkUploadCheckItem(id: asset.localIdentifier, checksum: entry.primaryChecksum))
             if entry.isLivePhoto, let motion = entry.motionChecksum {
                 items.append(BulkUploadCheckItem(id: asset.localIdentifier + Self.motionSuffix, checksum: motion))
