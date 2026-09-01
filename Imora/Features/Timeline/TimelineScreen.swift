@@ -30,6 +30,9 @@ private final class ScrollContext {
     var visibleRowIDs: [String] = []
     /// same rows as indices, the cheap equality check behind the ids above.
     var visibleRange: Range<Int> = 0..<0
+    /// the rows layout the ids were read from. a swap can leave the indices
+    /// alone while every row behind them is new.
+    var visibleLayoutVersion = -1
     var isIdle = true
     var viewportWidth: CGFloat = 0
     var viewportHeight: CGFloat = 0
@@ -610,8 +613,13 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         let visibleLow = min(layout.index(at: top), count - 1)
         let visibleHigh = min(layout.index(at: top + context.viewportHeight), count - 1) + 1
         let visible = visibleLow..<visibleHigh
-        if visible != context.visibleRange {
+        // refreshed on every rows swap, not only when the range moves: a
+        // bucket landing keeps the same indices while the rows behind them
+        // are all new, and stale ids would anchor the prefetch window and the
+        // scroll compensation to rows that no longer exist.
+        if visible != context.visibleRange || context.visibleLayoutVersion != layout.version {
             context.visibleRange = visible
+            context.visibleLayoutVersion = layout.version
             context.firstVisibleRowID = rows[visibleLow].id
             context.visibleRowIDs = rows[visible].map(\.id)
             // a scrub lands somewhere else every frame, and warming eighty
@@ -749,6 +757,9 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
                 scrollContext.viewportWidth = width
+                // whichever of the initial callbacks lands last completes
+                // the viewport, so each one windows the rows.
+                updateRowWindow()
                 if navigationTarget != nil {
                     Task { await revealPendingTimelineTarget() }
                 }
@@ -777,10 +788,10 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     targetPixelSize: thumbnailPixelSize(for: side)
                 )
             }
-            // keyed on the row tallies, so any change of layout - a bucket
-            // filling in, a pinch, a month appearing - re-measures the months
-            // and re-windows the rows, which may have shifted under a fixed
-            // scroll offset.
+            // keyed on the row tallies and the layout version, so any change
+            // of layout - a bucket filling in, a pinch, a month appearing -
+            // re-measures the months and re-windows the rows, which may have
+            // shifted under a fixed scroll offset.
             .onChange(of: ScrubberLayoutKey(model: model, side: side), initial: true) { _, _ in
                 let months = Self.scrubberMonths(spans: model.sectionSpans, side: side)
                 scrub.liveMonths = months
@@ -1090,9 +1101,11 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 withTransaction(transaction) {
                     apply()
                     // 0 is the rest position in this space, and the floor.
-                    position.wrappedValue.scrollTo(
-                        y: max(0, context.offsetY + newStart - oldStart)
-                    )
+                    let offset = max(0, context.offsetY + newStart - oldStart)
+                    position.wrappedValue.scrollTo(y: offset)
+                    // the geometry callback reports the same value a frame
+                    // later; the re-window that follows the swap reads it now.
+                    context.offsetY = offset
                 }
                 return
             }
@@ -2144,7 +2157,13 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
 
 /// every input to the month layout, in o(1): the two row tallies move whenever
 /// any month's height does, and the ends catch a month appearing or leaving.
+/// the layout version catches a rows swap that leaves every tally as it was -
+/// a placeholder replaced by exactly the rows it estimated - which still has
+/// to re-window, since the mounted range was sized for the old rows. without
+/// it a one-month album mounted nothing but its day title until the first
+/// scroll.
 private struct ScrubberLayoutKey: Equatable {
+    let layoutVersion: Int
     let titleBands: Int
     let tileRows: Int
     let count: Int
@@ -2153,6 +2172,7 @@ private struct ScrubberLayoutKey: Equatable {
     let side: CGFloat
 
     init(model: TimelineModel, side: CGFloat) {
+        layoutVersion = model.rowsLayoutVersion
         titleBands = model.titleBandCount
         tileRows = model.tileRowCount
         count = model.sectionSpans.count
