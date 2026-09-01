@@ -1030,6 +1030,20 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 exitSelection()
             }
         }
+        // escape leaves selection mode from a hardware keyboard. installed
+        // for the mode only, so the grid never holds the keyboard otherwise.
+        .background {
+            if isSelecting, !isPicking {
+                KeyCommandHost(
+                    isActive: true,
+                    commands: [
+                        KeyCommandBinding(title: "Cancel Selection", input: UIKeyCommand.inputEscape) {
+                            exitSelection()
+                        },
+                    ]
+                )
+            }
+        }
         .fullScreenCover(item: $pendingEditAsset) { asset in
             AssetEditScreen(asset: asset) { outcome in
                 guard case .saved(let detail) = outcome else { return }
@@ -2623,6 +2637,8 @@ private struct InteractiveAssetTile: UIViewRepresentable {
     func makeUIView(context: Context) -> InteractiveAssetTileView {
         let view = InteractiveAssetTileView()
         view.backgroundColor = .clear
+        // pointer feedback on ipad, the same highlight photos gives its grid.
+        view.hoverStyle = UIHoverStyle(effect: .highlight)
         updateInteractionState(of: view)
         let contentView = configuration.makeContentView()
         contentView.translatesAutoresizingMaskIntoConstraints = false

@@ -721,6 +721,15 @@ struct AssetViewerScreen: View {
         )
         .statusBarHidden(isContextPreview || !chromeVisible)
         .allowsHitTesting(!isContextPreview && !isDismissing)
+        // hardware keyboard on ipad: paging, info and closing without
+        // reaching for the screen. a text field on any sheet takes the
+        // keyboard back for as long as it is up.
+        .background {
+            KeyCommandHost(
+                isActive: loadsViewerContent && !isContextPreview && !isDismissing,
+                commands: keyboardCommands
+            )
+        }
         .onAppear {
             onChromeVisibilityChanged(chromeVisible)
             if let selectedAssetID { onSelectionChanged(selectedAssetID) }
@@ -1975,6 +1984,51 @@ struct AssetViewerScreen: View {
         Task { @MainActor in
             await Task.yield()
             TimelineNavigationRouter.shared.open(target)
+        }
+    }
+
+    // MARK: - keyboard
+
+    private var keyboardCommands: [KeyCommandBinding] {
+        [
+            KeyCommandBinding(title: "Previous Photo", input: UIKeyCommand.inputLeftArrow) {
+                stepSelection(by: -1)
+            },
+            KeyCommandBinding(title: "Next Photo", input: UIKeyCommand.inputRightArrow) {
+                stepSelection(by: 1)
+            },
+            KeyCommandBinding(title: "Play or Pause", input: " ") {
+                togglePlaybackFromKeyboard()
+            },
+            KeyCommandBinding(title: "Info", input: "i", modifiers: .command) {
+                toggleInfo()
+            },
+            KeyCommandBinding(title: "Close", input: UIKeyCommand.inputEscape) {
+                closeFromKeyboard()
+            },
+        ]
+    }
+
+    /// pages through the semantic selection; the pager follows it exactly as
+    /// it follows a swipe.
+    private func stepSelection(by offset: Int) {
+        guard let selectedAssetID, let index = indexByAssetID[selectedAssetID] else { return }
+        let target = index + offset
+        guard assets.indices.contains(target) else { return }
+        self.selectedAssetID = assets[target].id
+    }
+
+    private func togglePlaybackFromKeyboard() {
+        guard let current, current.isVideo || current.isLivePhoto else { return }
+        playback.togglePlayPause()
+    }
+
+    /// escape peels one layer: open information first, then the viewer.
+    private func closeFromKeyboard() {
+        if informationControlIsPresented {
+            setInfoVisible(false)
+        } else {
+            requestDismissal()
         }
     }
 

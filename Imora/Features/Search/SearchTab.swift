@@ -349,6 +349,7 @@ struct SearchResultsGrid: View {
                     AssetTile(asset: asset)
                         .transition(.opacity)
                         .matchedTransitionSource(id: asset.id, in: zoomNamespace)
+                        .hoverEffect()
                         .onTapGesture {
                             if let index = model.assets.firstIndex(where: { $0.id == asset.id }) {
                                 onTap(index)
