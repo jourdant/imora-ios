@@ -58,30 +58,7 @@ struct LibraryTab: View {
             }
             .navigationTitle("Library")
             .navigationDestination(for: LibraryDestination.self) { destination in
-                switch destination {
-                case .favorites:
-                    TimelineScreen(
-                        title: "Favorites",
-                        filter: TimelineFilter(isFavorite: true),
-                        emptyIcon: "heart",
-                        emptyMessage: "No favorites yet",
-                        showsLargeTitle: false
-                    )
-                case .archive:
-                    TimelineScreen(
-                        title: "Archive",
-                        filter: TimelineFilter(visibility: .archive),
-                        emptyIcon: "archivebox",
-                        emptyMessage: "Nothing archived",
-                        showsLargeTitle: false
-                    )
-                case .places:
-                    PlacesScreen()
-                case .people:
-                    PeopleScreen()
-                case .trash:
-                    TrashScreen()
-                }
+                LibraryDestinationScreen(destination: destination)
             }
             .navigationDestination(for: Person.self) { person in
                 PersonScreen(person: person)
@@ -241,6 +218,57 @@ nonisolated enum LibraryDestination: Hashable {
     case people
     case archive
     case trash
+}
+
+/// one library destination, shared by the library list's push and the ipad
+/// sidebar entries that open it directly.
+struct LibraryDestinationScreen: View {
+    let destination: LibraryDestination
+
+    var body: some View {
+        switch destination {
+        case .favorites:
+            TimelineScreen(
+                title: "Favorites",
+                filter: TimelineFilter(isFavorite: true),
+                emptyIcon: "heart",
+                emptyMessage: "No favorites yet",
+                showsLargeTitle: false
+            )
+        case .archive:
+            TimelineScreen(
+                title: "Archive",
+                filter: TimelineFilter(visibility: .archive),
+                emptyIcon: "archivebox",
+                emptyMessage: "Nothing archived",
+                showsLargeTitle: false
+            )
+        case .places:
+            PlacesScreen()
+        case .people:
+            PeopleScreen()
+        case .trash:
+            TrashScreen()
+        }
+    }
+}
+
+/// a library destination at the root of its own stack, for the sidebar on
+/// ipad, with the same pushes the library list offers beneath it.
+struct LibrarySectionTab: View {
+    let destination: LibraryDestination
+
+    var body: some View {
+        NavigationStack {
+            LibraryDestinationScreen(destination: destination)
+                .navigationDestination(for: Person.self) { person in
+                    PersonScreen(person: person)
+                }
+                .navigationDestination(for: PlaceLink.self) { place in
+                    PlaceScreen(city: place.city, coordinate: place.coordinate)
+                }
+        }
+    }
 }
 
 /// map of every geotagged photo on top, searchable list of cities below - the

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct MainTabView: View {
+    @Environment(SessionStore.self) private var session
     /// in-app navigation targets land here, so the shell owns both the inbox
     /// sheet and the tab switch an album deep link needs.
     @Bindable private var router = NotificationRouter.shared
@@ -9,6 +10,8 @@ struct MainTabView: View {
 
     enum TabKey: Hashable {
         case photos, albums, library, search
+        /// the library's destinations as sidebar entries of their own.
+        case favorites, people, places, archive, trash
     }
 
     var body: some View {
@@ -33,9 +36,13 @@ struct MainTabView: View {
                 Tab("Albums", systemImage: "rectangle.stack", value: TabKey.albums) {
                     AlbumsTab()
                 }
+                // the tab bar keeps the library as one entry that lists its
+                // destinations; the ipad sidebar spells them out below
+                // instead, the way photos lays its own sidebar out.
                 Tab("Library", systemImage: "books.vertical", value: TabKey.library) {
                     LibraryTab()
                 }
+                .defaultVisibility(.hidden, for: .sidebar)
                 if #available(iOS 27.0, *) {
                     Tab("Search", systemImage: "magnifyingglass", value: TabKey.search, role: .prominent) {
                         SearchTab()
@@ -45,7 +52,31 @@ struct MainTabView: View {
                         SearchTab()
                     }
                 }
+                TabSection("Library") {
+                    Tab("Favorites", systemImage: "heart", value: TabKey.favorites) {
+                        LibrarySectionTab(destination: .favorites)
+                    }
+                    if session.preferences?.peopleEnabled != false {
+                        Tab("People", systemImage: "person.2", value: TabKey.people) {
+                            LibrarySectionTab(destination: .people)
+                        }
+                    }
+                    Tab("Places", systemImage: "mappin.and.ellipse", value: TabKey.places) {
+                        LibrarySectionTab(destination: .places)
+                    }
+                    Tab("Archive", systemImage: "archivebox", value: TabKey.archive) {
+                        LibrarySectionTab(destination: .archive)
+                    }
+                    if session.features?.trash != false {
+                        Tab("Trash", systemImage: "trash", value: TabKey.trash) {
+                            LibrarySectionTab(destination: .trash)
+                        }
+                    }
+                }
+                .defaultVisibility(.hidden, for: .tabBar)
             }
+            // a plain tab bar on iphone, a tab bar with a sidebar on ipad.
+            .tabViewStyle(.sidebarAdaptable)
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .sheet(isPresented: $router.showsInbox) {
