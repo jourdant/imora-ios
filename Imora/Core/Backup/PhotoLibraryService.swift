@@ -84,8 +84,24 @@ nonisolated enum PhotoLibraryService {
 
     // MARK: - scanning
 
+    /// the last full scan with the library change token it was taken at.
+    /// a launch asks for the scan from several places within a second - the
+    /// reconcile run, the timeline merge, a library change notice - and each
+    /// walk of a large library is hundreds of milliseconds of photokit time
+    /// the grid's own thumbnail requests then queue behind.
+    private struct ScanMemo: @unchecked Sendable {
+        let token: PHPersistentChangeToken
+        let assets: [DeviceAsset]
+    }
+
+    private static let scanMemo = OSAllocatedUnfairLock<ScanMemo?>(initialState: nil)
+
     @concurrent
     static func scan() async -> [DeviceAsset] {
+        let token = PHPhotoLibrary.shared().currentChangeToken
+        if let memo = scanMemo.withLock({ $0 }), memo.token == token {
+            return memo.assets
+        }
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let result = PHAsset.fetchAssets(with: options)
@@ -95,6 +111,7 @@ nonisolated enum PhotoLibraryService {
             guard asset.mediaType == .image || asset.mediaType == .video else { return }
             assets.append(snapshot(of: asset))
         }
+        scanMemo.withLock { $0 = ScanMemo(token: token, assets: assets) }
         return assets
     }
 

@@ -304,6 +304,10 @@ final class SessionStore {
         hub.addListener(inbox)
         notifications = inbox
         state = .loggedIn
+        // the index is on disk and the account is cached, so the pairing maps
+        // that let tiles render from the device are ready before the server
+        // has answered; refreshUser primes again once the account is confirmed.
+        Task { await backup.primeLocalState() }
         Task { await refreshUser() }
         Task { await inbox.load() }
         backup.startIfIdle()

@@ -412,6 +412,8 @@ final class TimelineModel {
     private var prefetchID: UUID?
     private var rebuildTask: Task<Void, Never>?
     private var restoreTask: Task<Void, Never>?
+    /// the launch merge of device photos, running alongside the server load.
+    private var localRefreshTask: Task<Void, Never>?
     private var hasLoaded = false
     private var isViewerSuspended = false
     private var isRebuildDeferred = false
@@ -467,6 +469,7 @@ final class TimelineModel {
         resyncTask?.cancel()
         realtimeFlushTask?.cancel()
         restoreTask?.cancel()
+        localRefreshTask?.cancel()
     }
 
     /// rows cover both server sections and merged device photos.
@@ -508,6 +511,11 @@ final class TimelineModel {
         loadError = nil
         defer { isLoading = false }
 
+        // device photos come from the library, not the server, so their scan
+        // starts here and overlaps the disk restore and the network round
+        // trip instead of queueing behind both. it also covers a launch with
+        // the server away - device photos still belong in the grid then.
+        startLocalRefresh()
         // paint everything the offline store has before touching the network,
         // so the grid is browsable instantly - and stays that way offline.
         await restoreCachedBuckets(using: client)
@@ -515,7 +523,6 @@ final class TimelineModel {
         do {
             try await reloadSections(using: client)
             hasLoaded = true
-            await refreshLocalItems()
             // small libraries finish inside reloadSections with no prefetch
             // pass left to trigger the sweep, so it is offered here too.
             sweepThumbnailsIfNeeded()
@@ -523,8 +530,20 @@ final class TimelineModel {
             return
         } catch {
             loadError = error.localizedDescription
-            // device photos still belong in the grid when the server is away.
-            await refreshLocalItems()
+        }
+    }
+
+    /// the first merge of a launch. its rebuild skips the debounce: nothing
+    /// is on screen to animate from, and every millisecond of delay here is
+    /// device photos missing from a grid the server has already painted.
+    private func startLocalRefresh() {
+        guard mergesLocal, backup != nil, localRefreshTask == nil else { return }
+        localRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            let changed = await self.updateLocalItems()
+            self.localRefreshTask = nil
+            guard changed, !Task.isCancelled else { return }
+            self.scheduleRebuild(after: .zero, replacesPending: true)
         }
     }
 
@@ -1375,9 +1394,32 @@ final class TimelineModel {
         return calendar
     }()
 
+    /// year and month straight from the day count: these dates are already
+    /// shifted into utc space, where a day is exactly 86400 seconds, and the
+    /// calendar lookup this replaces was most of what merging a large device
+    /// library cost - once per asset, tens of thousands of times a launch.
     nonisolated private static func monthKey(for date: Date) -> String {
-        let comps = utcCalendar.dateComponents([.year, .month], from: date)
-        return String(format: "%04d-%02d-01", comps.year ?? 0, comps.month ?? 0)
+        let (year, month) = civilYearMonth(dayIndex: dayIndex(for: date))
+        return "\(zeroPadded(year, width: 4))-\(zeroPadded(month, width: 2))-01"
+    }
+
+    /// howard hinnant's civil-from-days, on days since 1970-01-01.
+    nonisolated private static func civilYearMonth(dayIndex: Int) -> (year: Int, month: Int) {
+        let shifted = dayIndex + 719_468
+        let era = (shifted >= 0 ? shifted : shifted - 146_096) / 146_097
+        let dayOfEra = shifted - era * 146_097
+        let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36_524 - dayOfEra / 146_096) / 365
+        let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+        let marchMonth = (5 * dayOfYear + 2) / 153
+        let month = marchMonth < 10 ? marchMonth + 3 : marchMonth - 9
+        let year = yearOfEra + era * 400 + (month <= 2 ? 1 : 0)
+        return (year, month)
+    }
+
+    nonisolated private static func zeroPadded(_ value: Int, width: Int) -> String {
+        let digits = String(value)
+        guard digits.count < width else { return digits }
+        return String(repeating: "0", count: width - digits.count) + digits
     }
 
     nonisolated private static func dayIndex(for date: Date) -> Int {
