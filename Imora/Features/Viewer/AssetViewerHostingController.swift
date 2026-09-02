@@ -1018,6 +1018,14 @@ final class AssetTileRegistry {
                     return image
                 }
             }
+            // a tile that only has its preview yet still hands over an
+            // uncropped picture. the snapshot below is the square tile, a
+            // crop the page fills its frame with and then zooms out of once
+            // the render lands.
+            if let preview = LocalImageLoader.shared.cachedPreview(localIdentifier: pairedLocalID),
+               Self.aspectMatches(preview, asset: asset) {
+                return preview
+            }
         }
         guard let client = session.client else { return nil }
         let url = client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash)
@@ -1028,6 +1036,12 @@ final class AssetTileRegistry {
             return image
         }
         return ImageLoader.shared.cachedImage(for: url, targetPixelSize: 640)
+    }
+
+    private static func aspectMatches(_ image: UIImage, asset: Asset) -> Bool {
+        guard asset.ratio > 0, image.size.height > 0 else { return false }
+        let ratio = Double(image.size.width / image.size.height)
+        return abs(ratio - asset.ratio) <= asset.ratio * 0.03
     }
 
     private func renderedImage(of view: UIView) -> UIImage? {

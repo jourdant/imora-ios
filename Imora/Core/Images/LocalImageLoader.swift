@@ -25,6 +25,11 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     /// scrolling back into view renders on its first frame, synchronously -
     /// photokit only ever answers through a callback.
     private let cache: NSCache<NSString, UIImage>
+    /// photokit's stored previews, one per asset whatever size was asked. the
+    /// opening transition needs an uncropped picture for a tile that only has
+    /// its preview yet - a snapshot of the square tile is a crop the viewer
+    /// visibly zooms out of once the render lands.
+    private let previews: NSCache<NSString, UIImage>
     private let assets: NSCache<NSString, PHAsset>
     /// exported live photo motion files in least-recently-used order.
     private let motionFiles = OSAllocatedUnfairLock<[URL]>(initialState: [])
@@ -36,6 +41,8 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     private init() {
         cache = NSCache()
         cache.totalCostLimit = 48 << 20
+        previews = NSCache()
+        previews.totalCostLimit = 12 << 20
         assets = NSCache()
         assets.countLimit = 512
     }
@@ -107,14 +114,25 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         (info?[PHImageCancelledKey] as? Bool) ?? false
     }
 
+    private static func cost(of image: UIImage) -> Int {
+        Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+    }
+
     private func store(
         _ image: UIImage,
         localIdentifier: String,
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode
     ) {
-        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
-        cache.setObject(image, forKey: key(localIdentifier, targetPixelSize, contentMode), cost: cost)
+        cache.setObject(
+            image,
+            forKey: key(localIdentifier, targetPixelSize, contentMode),
+            cost: Self.cost(of: image)
+        )
+    }
+
+    private func storePreview(_ image: UIImage, localIdentifier: String) {
+        previews.setObject(image, forKey: localIdentifier as NSString, cost: Self.cost(of: image))
     }
 
     func cachedImage(
@@ -123,6 +141,11 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         contentMode: PHImageContentMode = .aspectFill
     ) -> UIImage? {
         cache.object(forKey: key(localIdentifier, targetPixelSize, contentMode))
+    }
+
+    /// the last preview photokit handed over for the asset, at whatever size.
+    func cachedPreview(localIdentifier: String) -> UIImage? {
+        previews.object(forKey: localIdentifier as NSString)
     }
 
     /// the sharp render alone, for callers that want exactly one image.
@@ -156,7 +179,10 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                 contentMode: contentMode,
                 options: Self.requestOptions(allowsNetwork: allowsNetwork)
             ) { image, info in
-                guard !Self.isDegraded(info) else { return }
+                if Self.isDegraded(info) {
+                    if let image { self.storePreview(image, localIdentifier: localIdentifier) }
+                    return
+                }
                 let first = resumed.withLock { resumed in
                     defer { resumed = true }
                     return !resumed
@@ -215,10 +241,11 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                         return
                     }
                     if Self.isDegraded(info) {
+                        self.storePreview(image, localIdentifier: localIdentifier)
                         continuation.yield(.preview(image))
                         return
                     }
-                    store(
+                    self.store(
                         image,
                         localIdentifier: localIdentifier,
                         targetPixelSize: targetPixelSize,

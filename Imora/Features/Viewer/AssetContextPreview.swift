@@ -24,7 +24,8 @@ struct AssetContextPreview: View {
                     targetPixelSize: 1280,
                     fallbackTargetPixelSize: 640,
                     fallbackRequestContentMode: .aspectFit,
-                    requestContentMode: .aspectFit
+                    requestContentMode: .aspectFit,
+                    expectedAspectRatio: asset.ratio
                 )
             } else if let client = session.client {
                 RemoteImage(

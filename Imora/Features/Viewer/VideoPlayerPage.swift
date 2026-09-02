@@ -544,6 +544,7 @@ struct MediaSurfaceStack: View {
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
                         contentMode: .fill,
+                        expectedAspectRatio: aspectRatio,
                         onUnavailable: { onPosterUnavailable?() },
                         onReady: { onPosterReady?() }
                     )

@@ -2911,6 +2911,7 @@ private struct AssetPage: View {
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
                         contentMode: .fill,
+                        expectedAspectRatio: asset.ratio,
                         onUnavailable: { localUnavailable = true },
                         onReady: onMediaReady
                     )
