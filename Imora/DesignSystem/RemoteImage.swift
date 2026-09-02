@@ -11,6 +11,9 @@ struct RemoteImage: View {
     var fallbackURL: URL?
     var fallbackTargetPixelSize: CGFloat?
     var contentMode: ContentMode = .fill
+    /// false while the grid moves too fast for a fade per arriving tile to
+    /// read as anything but flicker. the thumbhash step goes with it.
+    var animatesLoads = true
     var onReady: (() -> Void)?
 
     @State private var image: KeyedImage?
@@ -53,6 +56,14 @@ struct RemoteImage: View {
         return nil
     }
 
+    /// the smaller render of the same photo is on screen, so the full one
+    /// replaces a picture rather than a placeholder.
+    private func showsFallback(key: String) -> Bool {
+        if let fallbackImage, fallbackImage.key == key { return true }
+        guard let fallbackURL else { return false }
+        return ImageLoader.shared.cachedImage(for: fallbackURL, targetPixelSize: fallbackPixelSize) != nil
+    }
+
     var body: some View {
         // one string build per pass instead of the five the computed keys used
         // to cost; a grid tile's key is a full url and this is its hot path.
@@ -92,7 +103,12 @@ struct RemoteImage: View {
             guard !Task.isCancelled, let loaded else { return }
             let keyed = KeyedImage(key: key, image: loaded)
 
-            if ContinuousClock.now - start < .milliseconds(120) {
+            // a fade only earns its place over a flat placeholder: over the
+            // smaller render of the same photo it reads as a pulse, and in a
+            // fast fling every arriving tile pulsing reads as flicker.
+            if !animatesLoads
+                || showsFallback(key: key)
+                || ContinuousClock.now - start < .milliseconds(120) {
                 image = keyed
                 onReady?()
             } else {
@@ -107,7 +123,7 @@ struct RemoteImage: View {
             }
         }
         .task(id: taskID) {
-            guard let thumbhash, placeholder?.key != key else { return }
+            guard animatesLoads, let thumbhash, placeholder?.key != key else { return }
             // disk hits normally finish before this delay, avoiding placeholder
             // work for images that would never display it.
             try? await Task.sleep(for: .milliseconds(50))
@@ -162,6 +178,18 @@ struct LocalPhotoImage: View {
     /// whose sharp render sits in icloud then shows the server thumbnail
     /// instead of pulling the original down in the middle of a scroll.
     var allowsNetwork = true
+    /// the asset's own aspect ratio, for hosts that frame the image by it.
+    /// photokit's stored preview can be a different crop of the picture, and
+    /// filling such a frame with one reads as a zoom that snaps back when the
+    /// render lands, so a preview that disagrees with it is skipped.
+    var expectedAspectRatio: Double?
+    /// false while the grid moves too fast for a fade per arriving tile to
+    /// read as anything but flicker.
+    var animatesLoads = true
+    /// a picture of the same asset the host already had on screen - the
+    /// server thumbnail a tile painted before the backup index paired it -
+    /// shown until photokit answers, so the swap never passes through grey.
+    var placeholderImage: UIImage?
     /// photokit could not produce the asset - it was deleted from the library
     /// behind our back, or is an icloud original that will not download. hosts
     /// use this to fall back to the server copy instead of showing nothing.
@@ -197,6 +225,20 @@ struct LocalPhotoImage: View {
         )
     }
 
+    /// a preview or a smaller render of the same picture is on screen, so the
+    /// sharp render replaces a picture rather than a placeholder.
+    private func showsSamePicture(key: String) -> Bool {
+        if previewImage?.key == key || placeholderImage != nil { return true }
+        if let fallbackKey, fallbackImage?.key == fallbackKey { return true }
+        return cachedFallback != nil
+    }
+
+    private static func accepts(_ preview: UIImage, aspectRatio: Double?) -> Bool {
+        guard let aspectRatio, aspectRatio > 0, preview.size.height > 0 else { return true }
+        let previewRatio = Double(preview.size.width / preview.size.height)
+        return abs(previewRatio - aspectRatio) <= aspectRatio * 0.03
+    }
+
     var body: some View {
         let key = requestKey
         // the photokit cache is only consulted when this view is not already
@@ -209,6 +251,7 @@ struct LocalPhotoImage: View {
             )
             ?? (fallbackImage?.key == fallbackKey ? fallbackImage?.image : nil)
             ?? cachedFallback
+            ?? placeholderImage
             ?? (previewImage?.key == key ? previewImage?.image : nil)
         ZStack {
             if let display {
@@ -241,13 +284,19 @@ struct LocalPhotoImage: View {
                 case .preview(let preview):
                     // the library's own thumbnail: paints at once, no fade,
                     // and never counts as ready - hosts wait for the render.
-                    previewImage = KeyedImage(key: key, image: preview)
+                    if Self.accepts(preview, aspectRatio: expectedAspectRatio) {
+                        previewImage = KeyedImage(key: key, image: preview)
+                    }
                 case .final(let loaded):
                     receivedFinal = true
                     let keyed = KeyedImage(key: key, image: loaded)
-                    // same rule as remoteimage: fast loads swap in place, slow
-                    // ones fade so a late arrival never pops over the fallback.
-                    if ContinuousClock.now - start < .milliseconds(120) {
+                    // the render lands in place whenever it replaces the same
+                    // picture: fading one rendition into another reads as a
+                    // glow. only a flat placeholder earns the fade, and only
+                    // while the grid is slow enough for fades to read.
+                    if !animatesLoads
+                        || showsSamePicture(key: key)
+                        || ContinuousClock.now - start < .milliseconds(120) {
                         image = keyed
                         onReady?()
                     } else {
@@ -294,9 +343,20 @@ struct LocalPhotoImage: View {
     }
 }
 
+/// what a grid is doing, for its tiles: a fling fast enough that a fade per
+/// arriving thumbnail reads as flicker turns the fades off. observable so only
+/// the tiles re-render when it flips, a couple of times per fling.
+@Observable @MainActor
+final class GridMotion {
+    var isFast = false
+}
+
 /// square grid tile for an asset, with video, favorite and backup badges.
 struct AssetTile: View {
     @Environment(SessionStore.self) private var session
+    /// present inside grids that report their motion; other hosts fade as
+    /// usual.
+    @Environment(GridMotion.self) private var motion: GridMotion?
     let asset: Asset
     /// backup status in the corner plus the upload progress overlay. only
     /// the main timeline shows these, matching the official client.
@@ -315,7 +375,20 @@ struct AssetTile: View {
         return asset.localIdentifier ?? session.backup?.localIdentifierByRemoteId[asset.id]
     }
 
+    /// the server thumbnail already in memory for a paired asset. a tile that
+    /// painted it before the backup index landed keeps showing it while
+    /// photokit answers, so the swap to the device render never passes
+    /// through grey or a fade between two renditions of the same picture.
+    private func serverThumbnail(client: ImmichClient) -> UIImage? {
+        guard !asset.isLocal else { return nil }
+        return ImageLoader.shared.cachedImage(
+            for: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
+            targetPixelSize: targetPixelSize
+        )
+    }
+
     var body: some View {
+        let animatesLoads = motion?.isFast != true
         Color.clear
             .aspectRatio(1, contentMode: .fit)
             .overlay {
@@ -327,13 +400,16 @@ struct AssetTile: View {
                         // a paired one falls back to the server thumbnail
                         // rather than downloading its original from icloud.
                         allowsNetwork: asset.isLocal,
+                        animatesLoads: animatesLoads,
+                        placeholderImage: session.client.flatMap(serverThumbnail),
                         onUnavailable: { localUnavailable = true }
                     )
                 } else if let client = session.client {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id, cacheKey: asset.thumbhash),
                         targetPixelSize: targetPixelSize,
-                        thumbhash: asset.thumbhash
+                        thumbhash: asset.thumbhash,
+                        animatesLoads: animatesLoads
                     )
                 }
             }

@@ -33,6 +33,12 @@ nonisolated final class ImageLoader: Sendable {
         // the sanitized key drops the thumbnail size, so one download serves
         // every pixel size the grid and the viewer ask for.
         configuration.dataCachePolicy = .storeOriginalData
+        // room for the tiles coming on screen while the prefetcher and the
+        // sweep hold their lanes: a fling asks for a screenful at once, and
+        // with six slots those requests queued behind loads nobody would
+        // see. thumbnails are small, so two decoders run comfortably.
+        configuration.dataLoadingQueue.maxConcurrentOperationCount = 10
+        configuration.imageDecodingQueue.maxConcurrentOperationCount = 2
         pipeline = ImagePipeline(configuration: configuration, delegate: authorization)
         prefetcher = ImagePrefetcher(pipeline: pipeline, maxConcurrentRequestCount: 4)
     }
@@ -51,7 +57,11 @@ nonisolated final class ImageLoader: Sendable {
     }
 
     func image(for url: URL, targetPixelSize: CGFloat) async throws -> UIImage {
-        try await pipeline.image(for: request(for: url, targetPixelSize: targetPixelSize))
+        var request = request(for: url, targetPixelSize: targetPixelSize)
+        // a tile on screen beats every prefetch and sweep request queued
+        // ahead of it; those run low and very low.
+        request.priority = .high
+        return try await pipeline.image(for: request)
     }
 
     // MARK: - prefetching
@@ -97,6 +107,10 @@ nonisolated final class ImageLoader: Sendable {
                     group.addTask { _ = try? await pipeline.data(for: request) }
                 }
                 for await _ in group {
+                    guard !Task.isCancelled else { continue }
+                    // held while a grid scrolls: the lanes would otherwise take
+                    // bandwidth from the tiles coming on screen.
+                    await self.waitWhileSweepPaused()
                     guard !Task.isCancelled, let request = nextRequest() else { continue }
                     group.addTask { _ = try? await pipeline.data(for: request) }
                 }
@@ -109,6 +123,19 @@ nonisolated final class ImageLoader: Sendable {
     }
 
     private let sweepTask = Mutex<Task<Void, Never>?>(nil)
+    private let sweepPaused = Mutex<Bool>(false)
+
+    /// grids pause the sweep for the length of a scroll, so its lanes never
+    /// compete with tiles the user is about to look at.
+    func setSweepPaused(_ paused: Bool) {
+        sweepPaused.withLock { $0 = paused }
+    }
+
+    private func waitWhileSweepPaused() async {
+        while sweepPaused.withLock({ $0 }), !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
 
     // MARK: - storage
 

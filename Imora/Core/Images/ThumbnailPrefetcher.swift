@@ -39,25 +39,35 @@ final class ThumbnailPrefetcher {
         self.localContentMode = localContentMode
     }
 
-    /// anchors on the first visible tile row and warms the assets around it.
+    /// anchors on both ends of the visible tile rows and warms the assets
+    /// around them, the long side of the window facing the way the grid is
+    /// going: 1 towards the bottom, -1 towards the top, 0 at rest.
     func update(
         visibleRowIDs: [String],
         model: TimelineModel,
         client: ImmichClient?,
         backup: BackupManager?,
-        targetPixelSize: CGFloat? = nil
+        targetPixelSize: CGFloat? = nil,
+        direction: Int = 0
     ) {
         if let targetPixelSize {
             updateTargetPixelSize(targetPixelSize)
         }
+        // both ends anchor the window, so the look-ahead starts past the
+        // fold rather than a screen short of it.
         guard let client,
-              let anchorID = visibleRowIDs.lazy.compactMap({ model.firstAssetIDByRowID[$0] }).first,
-              let anchor = model.flatAssetIndex(for: anchorID)
+              let firstID = visibleRowIDs.lazy.compactMap({ model.firstAssetIDByRowID[$0] }).first,
+              let lastID = visibleRowIDs.reversed().lazy.compactMap({ model.firstAssetIDByRowID[$0] }).first,
+              let first = model.flatAssetIndex(for: firstID),
+              let last = model.flatAssetIndex(for: lastID)
         else { return cancel() }
 
         let assets = model.flatAssets
-        let lower = max(0, anchor - Self.lookBehind)
-        let upper = min(assets.count, anchor + Self.lookAhead)
+        let (behind, ahead) = direction < 0
+            ? (Self.lookAhead, Self.lookBehind)
+            : (Self.lookBehind, Self.lookAhead)
+        let lower = max(0, min(first, last) - behind)
+        let upper = min(assets.count, max(first, last) + 1 + ahead)
         guard lower < upper else { return cancel() }
 
         let version = model.flatAssetsVersion

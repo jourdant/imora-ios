@@ -105,7 +105,9 @@ nonisolated enum PhotoLibraryService {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let result = PHAsset.fetchAssets(with: options)
-        var assets: [DeviceAsset] = []
+        // the enumeration is serial and synchronous without the concurrent
+        // option; the block's sendable signature just cannot say so.
+        nonisolated(unsafe) var assets: [DeviceAsset] = []
         assets.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in
             guard asset.mediaType == .image || asset.mediaType == .video else { return }

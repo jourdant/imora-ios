@@ -36,6 +36,15 @@ private final class ScrollContext {
     var isIdle = true
     var viewportWidth: CGFloat = 0
     var viewportHeight: CGFloat = 0
+    /// the previous offset sample and when it was taken, for the velocity.
+    var lastSampledOffsetY: CGFloat = 0
+    var lastSampleTime: CFTimeInterval = 0
+    /// points per second, smoothed over the last frames.
+    var velocity: CGFloat = 0
+    /// 1 towards the bottom, -1 towards the top, 0 while slow or at rest.
+    /// held with hysteresis so a wobble never flips the buffers back and
+    /// forth mid fling.
+    var direction = 0
 }
 
 /// exact top offset of every row, in row space. deterministic row heights
@@ -92,9 +101,21 @@ private final class RowWindow {
     var range: Range<Int> = 0..<0
 }
 
-/// how far past the viewport rows stay mounted, so a swipe reveals content
-/// that already exists and placeholder onAppear loads run ahead of arrival.
+/// how far past the viewport rows stay mounted at rest, so a swipe reveals
+/// content that already exists and placeholder onAppear loads run ahead of
+/// arrival.
 private let rowWindowBuffer: CGFloat = 360
+/// in motion the buffer leans the way the grid is going: rows ahead get the
+/// time to load that a fling would otherwise deny them, and the trail behind
+/// is released sooner. the row rate is set by the speed, not the buffer, so
+/// the lean costs nothing per second.
+private let rowWindowBufferAhead: CGFloat = 900
+private let rowWindowBufferBehind: CGFloat = 240
+/// speeds, in points per second, past which a fling counts as fast for the
+/// tiles and below which it stops counting. a fade per arriving tile reads as
+/// flicker beyond the first, and the gap keeps the flag from chattering.
+private let fastScrollSpeed: CGFloat = 2400
+private let fastScrollRelease: CGFloat = 1200
 
 /// the app's own lazy stack, replacing LazyVStack: every mounted row is
 /// placed at its exact offset inside a frame of exactly the layout's total
@@ -491,6 +512,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     @State private var preferredColumnCount: Int?
     @State private var pinchBaseColumns: Int?
     @State private var prefetcher = ThumbnailPrefetcher()
+    @State private var motion = GridMotion()
     @State private var tileRegistry = AssetTileRegistry()
     @State private var selectionSlideController = TimelineSelectionSlideController()
     @State private var isRunningServerCommand = false
@@ -631,16 +653,64 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     model: model,
                     client: session.client,
                     backup: session.backup,
-                    targetPixelSize: thumbnailPixelSize(for: side)
+                    targetPixelSize: thumbnailPixelSize(for: side),
+                    direction: context.direction
                 )
             }
         }
         prewarmOpeningChrome(in: rows, visibleRange: visible)
 
-        let mountedLow = min(layout.index(at: top - rowWindowBuffer), count - 1)
-        let mountedHigh = min(layout.index(at: top + context.viewportHeight + rowWindowBuffer), count - 1) + 1
+        let topBuffer: CGFloat
+        let bottomBuffer: CGFloat
+        switch context.direction {
+        case 1: (topBuffer, bottomBuffer) = (rowWindowBufferBehind, rowWindowBufferAhead)
+        case -1: (topBuffer, bottomBuffer) = (rowWindowBufferAhead, rowWindowBufferBehind)
+        default: (topBuffer, bottomBuffer) = (rowWindowBuffer, rowWindowBuffer)
+        }
+        let mountedLow = min(layout.index(at: top - topBuffer), count - 1)
+        let mountedHigh = min(layout.index(at: top + context.viewportHeight + bottomBuffer), count - 1) + 1
         let mounted = mountedLow..<mountedHigh
         if mounted != rowWindow.range { rowWindow.range = mounted }
+    }
+
+    /// velocity and direction from the offset samples. they steer the mount
+    /// buffers and the prefetch window, and flip the tiles' fade switch when
+    /// a fling is too fast for fades to read as anything but flicker.
+    private func noteScroll(to offsetY: CGFloat) {
+        let context = scrollContext
+        context.offsetY = offsetY
+        // only a finger or a fling counts. a programmatic jump - scroll
+        // compensation, a reveal, the scrubber - lands in one frame and would
+        // read as an impossible speed that nothing resets until the next
+        // real scroll ends.
+        guard !context.isIdle else { return }
+        let now = CACurrentMediaTime()
+        let elapsed = now - context.lastSampleTime
+        if context.lastSampleTime > 0, elapsed > 0, elapsed < 0.25 {
+            let sample = (offsetY - context.lastSampledOffsetY) / CGFloat(elapsed)
+            context.velocity = context.velocity * 0.5 + sample * 0.5
+        } else {
+            context.velocity = 0
+        }
+        context.lastSampledOffsetY = offsetY
+        context.lastSampleTime = now
+
+        let speed = abs(context.velocity)
+        if speed > 600 {
+            context.direction = context.velocity > 0 ? 1 : -1
+        } else if speed < 200 {
+            context.direction = 0
+        }
+        let fast = speed > (motion.isFast ? fastScrollRelease : fastScrollSpeed)
+        if motion.isFast != fast { motion.isFast = fast }
+    }
+
+    private func settleMotion() {
+        let context = scrollContext
+        context.velocity = 0
+        context.direction = 0
+        context.lastSampleTime = 0
+        if motion.isFast { motion.isFast = false }
     }
 
     private func prewarmOpeningChrome(
@@ -712,6 +782,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                         rowView(row, rowIndex: rowIndex, side: side)
                     }
                 }
+                .environment(motion)
                 .background {
                     TimelineSelectionSlideInstaller(
                         controller: selectionSlideController,
@@ -748,7 +819,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 )
             } action: { _, state in
                 scrub.update(with: state)
-                scrollContext.offsetY = state.offsetY
+                noteScroll(to: state.offsetY)
                 updateRowWindow()
             }
             .onChange(of: geometry.size.height, initial: true) { _, height in
@@ -804,11 +875,16 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             .onScrollPhaseChange { _, newPhase in
                 scrollContext.isIdle = newPhase == .idle
                 if newPhase == .idle {
+                    settleMotion()
+                    // the offline sweep resumes once the tiles on screen have
+                    // had the bandwidth to themselves.
+                    ImageLoader.shared.setSweepPaused(false)
                     updateRowWindow()
                     scheduleIndicatorHide()
                     // the scrubber owns the hold for the length of its drag.
                     if !scrub.isScrubbing { model.resumeRebuilds() }
                 } else {
+                    ImageLoader.shared.setSweepPaused(true)
                     AssetViewerOpeningChromeCache.shared.cancelPrewarming(
                         owner: openingChromePrewarmOwner
                     )
@@ -1014,6 +1090,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         .onDisappear {
             prefetcher.cancel()
             model.resumeRebuilds()
+            ImageLoader.shared.setSweepPaused(false)
         }
         .sheet(item: $pendingAlbumAssets) { ids in
             AlbumPickerSheet(
@@ -1115,11 +1192,15 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 withTransaction(transaction) {
                     apply()
                     // 0 is the rest position in this space, and the floor.
-                    let offset = max(0, context.offsetY + newStart - oldStart)
-                    position.wrappedValue.scrollTo(y: offset)
-                    // the geometry callback reports the same value a frame
-                    // later; the re-window that follows the swap reads it now.
-                    context.offsetY = offset
+                    // the cached offset is deliberately left alone: only the
+                    // geometry callback may write it. writing the requested
+                    // jump here once mounted rows around an offset the scroll
+                    // view never reached - at launch it can still be laying
+                    // the taller content out - and left the viewport empty
+                    // until the first finger movement reported the truth.
+                    position.wrappedValue.scrollTo(
+                        y: max(0, context.offsetY + newStart - oldStart)
+                    )
                 }
                 return
             }
@@ -1263,6 +1344,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 isSelectable: isSelectable(asset),
                 selectionPosition: selectionPosition,
                 registry: tileRegistry,
+                motion: motion,
                 toggleSelection: { toggle(asset) },
                 menu: { UIMenu(children: menuElements(for: asset)) },
                 makeViewer: { startsAsContextPreview, bounds in
@@ -2630,6 +2712,9 @@ private struct InteractiveAssetTile: UIViewRepresentable {
     let isSelectable: Bool
     let selectionPosition: SelectionGridPosition
     let registry: AssetTileRegistry
+    /// the hosted tile watches this itself; it is not part of the rendered
+    /// inputs, so a fling never reconfigures every tile.
+    let motion: GridMotion
     let toggleSelection: () -> Void
     let menu: () -> UIMenu
     let makeViewer: (_ startsAsContextPreview: Bool, _ bounds: CGSize) -> AssetViewerHostingController?
@@ -2742,6 +2827,7 @@ private struct InteractiveAssetTile: UIViewRepresentable {
                 targetPixelSize: targetPixelSize
             )
                 .environment(session)
+                .environment(motion)
         }
         .margins(.all, 0)
     }
@@ -2806,7 +2892,12 @@ private struct InteractiveAssetTile: UIViewRepresentable {
 
         func updateSelectionAppearance() {
             guard let selectionIndicator else { return }
-            selectionIndicator.superview?.bringSubviewToFront(selectionIndicator)
+            // every window shift updates every mounted tile; reordering
+            // subviews that are already in order is not free.
+            if let superview = selectionIndicator.superview,
+               superview.subviews.last !== selectionIndicator {
+                superview.bringSubviewToFront(selectionIndicator)
+            }
             let appearance = SelectionAppearance(
                 isSelecting: host.isSelecting,
                 isSelected: host.isSelected,
