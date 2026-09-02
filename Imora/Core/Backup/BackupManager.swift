@@ -358,10 +358,13 @@ final class BackupManager {
     /// every device asset paired with its backup status, newest first.
     func localTimelineAssets() async -> [LocalTimelineItem] {
         guard PhotoLibraryService.hasFullAccess, let userId else { return [] }
+        // the library walk and the index decode are independent, and at
+        // launch each is a few hundred milliseconds on a large library, so
+        // they overlap instead of queueing.
+        async let scanned = PhotoLibraryService.scan()
         await index.load(serverHost: client.apiURL.host() ?? "", userId: userId)
         let entries = await index.allEntries()
-        let scanned = await PhotoLibraryService.scan()
-        return scanned.map { asset in
+        return await scanned.map { asset in
             let entry = entries[asset.localIdentifier]
             return LocalTimelineItem(
                 device: asset,

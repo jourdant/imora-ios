@@ -414,6 +414,15 @@ final class TimelineModel {
     private var restoreTask: Task<Void, Never>?
     /// the launch merge of device photos, running alongside the server load.
     private var localRefreshTask: Task<Void, Never>?
+    /// set while the first paint of cached months is held for that merge, so
+    /// a merge landing in time joins the paint instead of painting again a
+    /// moment later.
+    private var holdsFirstPaint = false
+    /// the merge landed during the hold and is waiting for the paint.
+    private var localMergeAwaitsPaint = false
+    /// how long the first paint waits for the device merge. past this the
+    /// server months paint alone and the merge lands on its own, as before.
+    private static let firstPaintLocalWait: Duration = .milliseconds(500)
     private var hasLoaded = false
     private var isViewerSuspended = false
     private var isRebuildDeferred = false
@@ -515,10 +524,13 @@ final class TimelineModel {
         // starts here and overlaps the disk restore and the network round
         // trip instead of queueing behind both. it also covers a launch with
         // the server away - device photos still belong in the grid then.
+        holdsFirstPaint = mergesLocal
         startLocalRefresh()
         // paint everything the offline store has before touching the network,
         // so the grid is browsable instantly - and stays that way offline.
         await restoreCachedBuckets(using: client)
+        // a restore that had nothing to paint still releases the merge.
+        releaseFirstPaint(painted: false)
 
         do {
             try await reloadSections(using: client)
@@ -543,7 +555,32 @@ final class TimelineModel {
             let changed = await self.updateLocalItems()
             self.localRefreshTask = nil
             guard changed, !Task.isCancelled else { return }
-            self.scheduleRebuild(after: .zero, replacesPending: true)
+            if self.holdsFirstPaint {
+                self.localMergeAwaitsPaint = true
+            } else {
+                self.scheduleRebuild(after: .zero, replacesPending: true)
+            }
+        }
+    }
+
+    /// suspends until the launch merge has landed or the wait runs out.
+    private func waitForLocalRefresh(upTo limit: Duration) async {
+        guard localRefreshTask != nil else { return }
+        let deadline = ContinuousClock.now + limit
+        while localRefreshTask != nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+    }
+
+    /// ends the hold. a merge that landed meanwhile either rides the paint
+    /// the caller is about to make or, when there is none, gets its own.
+    private func releaseFirstPaint(painted: Bool) {
+        guard holdsFirstPaint else { return }
+        holdsFirstPaint = false
+        guard localMergeAwaitsPaint else { return }
+        localMergeAwaitsPaint = false
+        if !painted {
+            scheduleRebuild(after: .zero, replacesPending: true)
         }
     }
 
@@ -570,7 +607,13 @@ final class TimelineModel {
             head, filter: filter, account: account
         )
         applyRestoredBuckets(restoredHead)
-        if !restoredHead.isEmpty {
+        // one paint for both: the server months from disk and the device
+        // photos from the library land together whenever the scan is quick
+        // enough, instead of the grid filling in twice a moment apart.
+        await waitForLocalRefresh(upTo: Self.firstPaintLocalWait)
+        let paints = !restoredHead.isEmpty || localMergeAwaitsPaint
+        releaseFirstPaint(painted: paints)
+        if paints {
             rebuildRows(rebuildAssets: true)
         }
 
