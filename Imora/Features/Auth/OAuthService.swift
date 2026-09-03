@@ -92,8 +92,11 @@ final class OAuthService: NSObject, ASWebAuthenticationPresentationContextProvid
                 }
             }
             session.presentationContextProvider = self
-            session.start()
             activeSession = session
+            if !session.start() {
+                activeSession = nil
+                continuation.resume(throwing: ImmichError.unreachable)
+            }
         }
     }
 
