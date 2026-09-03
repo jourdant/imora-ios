@@ -825,6 +825,88 @@ nonisolated final class ImmichClient: Sendable {
         try await get("memories", query: [URLQueryItem(name: "for", value: Self.dayFormatter.string(from: date))])
     }
 
+    // MARK: - administration, users
+
+    /// every account, deleted ones included. the optional id narrows it to
+    /// one account, which is how the web reads a deleted user - the plain
+    /// GET /admin/users/{id} refuses those.
+    func adminUsers(id: String? = nil, withDeleted: Bool = true) async throws -> [AdminUser] {
+        var query: [URLQueryItem] = []
+        if let id { query.append(URLQueryItem(name: "id", value: id)) }
+        if withDeleted { query.append(URLQueryItem(name: "withDeleted", value: "true")) }
+        return try await get("admin/users", query: query)
+    }
+
+    func createAdminUser(_ fields: [String: AnyEncodable]) async throws -> AdminUser {
+        try await request("admin/users", method: "POST", body: fields)
+    }
+
+    /// partial update; a field set to an explicit null clears it, which is
+    /// how a pin code is reset and a quota made unlimited.
+    func updateAdminUser(id: String, fields: [String: AnyEncodable]) async throws -> AdminUser {
+        try await request("admin/users/\(id)", method: "PUT", body: fields)
+    }
+
+    /// queues the removal, or with force starts it right away. the response
+    /// is the account with its deletion date set.
+    func deleteAdminUser(id: String, force: Bool) async throws -> AdminUser {
+        try await request("admin/users/\(id)", method: "DELETE", body: ["force": force])
+    }
+
+    func restoreAdminUser(id: String) async throws -> AdminUser {
+        try await request("admin/users/\(id)/restore", method: "POST", body: Optional<Int>.none)
+    }
+
+    func adminUserPreferences(id: String) async throws -> AdminUserPreferences {
+        try await get("admin/users/\(id)/preferences")
+    }
+
+    func adminUserSessions(id: String) async throws -> [UserSession] {
+        try await get("admin/users/\(id)/sessions")
+    }
+
+    func adminUserStatistics(id: String) async throws -> AssetStatistics {
+        try await get("admin/users/\(id)/statistics")
+    }
+
+    /// upload activity per day between two date-only bounds.
+    func adminUserUploadHeatmap(id: String, from: String, to: String) async throws -> CalendarHeatmap {
+        try await get("admin/users/\(id)/calendar-heatmap", query: [
+            URLQueryItem(name: "from", value: from),
+            URLQueryItem(name: "to", value: to),
+            URLQueryItem(name: "type", value: "Upload"),
+        ])
+    }
+
+    // MARK: - administration, job queues
+
+    /// every queue with its counters. servers older than the queues api
+    /// answer 404 there and still serve the same numbers keyed by name on
+    /// the legacy jobs route.
+    func queues() async throws -> [Queue] {
+        do {
+            return try await get("queues")
+        } catch ImmichError.http(404, _) {
+            let legacy: [String: LegacyQueue] = try await get("jobs")
+            return legacy.map { name, queue in
+                Queue(name: name, isPaused: queue.queueStatus.isPaused, statistics: queue.jobCounts)
+            }
+            .sorted { $0.name < $1.name }
+        }
+    }
+
+    /// the legacy command route works on every server version. force is
+    /// tri-state on purpose: the face detection refresh sends no flag at all.
+    func runQueueCommand(name: String, command: QueueCommand, force: Bool?) async throws {
+        var body: [String: AnyEncodable] = ["command": AnyEncodable(command.rawValue)]
+        if let force { body["force"] = AnyEncodable(force) }
+        try await mutate("jobs/\(name)", method: "PUT", body: body)
+    }
+
+    func createJob(_ job: ManualJob) async throws {
+        try await mutate("jobs", method: "POST", body: ["name": job.rawValue])
+    }
+
     // MARK: - backup
 
     /// downloads an asset's original file into `directory` and returns its url.

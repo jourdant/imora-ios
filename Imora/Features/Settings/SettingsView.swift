@@ -84,6 +84,14 @@ struct SettingsView: View {
                             Text(about.version)
                         }
                     }
+                    if session.user?.isAdmin == true {
+                        NavigationLink {
+                            AdminScreen()
+                        } label: {
+                            Label("Administration", systemImage: "person.badge.key")
+                        }
+                        .accessibilityIdentifier("settings-administration")
+                    }
                 }
 
                 Section {

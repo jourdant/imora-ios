@@ -109,12 +109,18 @@ nonisolated struct ServerFeatures: Codable {
     let passwordLogin: Bool
     /// text recognition search, added server-side in v2.x.
     let ocr: Bool?
+    /// job queue gates the admin panel reads; older servers omit them.
+    let sidecar: Bool?
+    let duplicateDetection: Bool?
+    let email: Bool?
 }
 
 nonisolated struct ServerConfig: Codable {
     let oauthButtonText: String?
     let loginPageMessage: String?
     let externalDomain: String?
+    /// days a deleted account lingers before the server removes it.
+    let userDeleteDelay: Int?
 }
 
 nonisolated struct OAuthAuthorizeResponse: Codable {
@@ -158,6 +164,7 @@ nonisolated struct ServerStorage: Codable {
     let diskSize: String
     let diskUse: String
     let diskUsagePercentage: Double
+    let diskSizeRaw: Int64?
 }
 
 // MARK: - assets
