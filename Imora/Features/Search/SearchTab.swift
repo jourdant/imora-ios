@@ -504,6 +504,10 @@ struct SearchResultsGrid: View {
         return AssetContextPreview(asset: asset)
             .frame(width: 300, height: 300 / ratio)
             .clipShape(.rect(cornerRadius: 18))
+            // swiftui builds the preview in its own hosting controller, which
+            // does not inherit the grid's observables. reading the session
+            // without this traps the app.
+            .environment(session)
     }
 
     // MARK: - asset actions
