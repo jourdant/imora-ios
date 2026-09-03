@@ -329,12 +329,8 @@ final class SessionStore {
         self.backup = backup
         let hub = RealtimeHub(client: client)
         backup.onLocalChange = { [weak hub] in hub?.notifyLocalChange() }
-        backup.onRunFinished = { phase in
-            switch phase {
-            case .done(let summary): LocalNotifications.shared.deliverBackupReport(summary)
-            case .error(let message): LocalNotifications.shared.deliverBackupFailure(message)
-            default: break
-            }
+        backup.onRunFailed = { message in
+            LocalNotifications.shared.deliverBackupFailure(message)
         }
         ContinuedProcessing.backup.workload = backup
         hub.onRemoteEdit = { [weak backup] ids in backup?.noteRemoteEdits(ids) }

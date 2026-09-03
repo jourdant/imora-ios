@@ -69,12 +69,12 @@ struct NotificationSettingsScreen: View {
     private var alertsSection: some View {
         Section {
             Toggle(isOn: $local.backupReports) {
-                Label("Backup Results", systemImage: "arrow.triangle.2.circlepath.icloud")
+                Label("Backup Failures", systemImage: "arrow.triangle.2.circlepath.icloud")
             }
         } header: {
             Text("Alerts")
         } footer: {
-            Text("Backup results are the only banners Imora raises. Album invites and server messages stay in the in-app notification inbox.")
+            Text("Imora only raises a banner when a backup stops on an error. Album invites and server messages stay in the in-app notification inbox.")
         }
         .disabled(!local.isAuthorized)
     }

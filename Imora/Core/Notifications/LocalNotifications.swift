@@ -3,17 +3,18 @@ import UIKit
 import UserNotifications
 
 /// the system side of notifications. immich ships no apns transport, so the
-/// only native banners are the ones this device raises about its own work -
-/// backup runs and share-sheet uploads. server inbox entries stay in the
-/// in-app inbox, where a banner would only duplicate the list under the open
-/// app.
+/// only native banners are the ones this device raises about its own work:
+/// a backup that stopped on an error and share-sheet uploads. a finished
+/// backup stays silent, the uploads show up in the timeline on their own.
+/// server inbox entries stay in the in-app inbox, where a banner would only
+/// duplicate the list under the open app.
 @Observable
 final class LocalNotifications {
     static let shared = LocalNotifications()
 
     private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
 
-    /// device-local switch for the end-of-run backup banners. the server-side
+    /// device-local switch for the backup failure banner. the server-side
     /// email switches live in the account preferences instead.
     var backupReports: Bool { didSet { defaults.set(backupReports, forKey: Key.backupReports) } }
 
@@ -24,8 +25,8 @@ final class LocalNotifications {
         static let backupReports = "imora.notify.backupReports"
     }
 
-    /// backup reports share one identifier so a new run replaces the old
-    /// banner instead of stacking a second one.
+    /// backup banners share one identifier so a new run replaces the old
+    /// one instead of stacking a second.
     private static let backupRequestID = "imora.backup.report"
 
     private init() {
@@ -73,19 +74,6 @@ final class LocalNotifications {
     }
 
     // MARK: - delivery
-
-    /// end-of-run backup report, mirroring the official client's upload
-    /// finished notification.
-    func deliverBackupReport(_ summary: BackupSummary) {
-        guard backupReports, summary.uploaded > 0 || summary.failed > 0 else { return }
-        var parts: [String] = []
-        if summary.uploaded > 0 { parts.append("\(summary.uploaded) uploaded") }
-        if summary.failed > 0 { parts.append("\(summary.failed) failed") }
-        deliverBackup(
-            title: summary.failed > 0 ? "Backup finished with errors" : "Backup complete",
-            body: parts.joined(separator: ", ")
-        )
-    }
 
     func deliverBackupFailure(_ message: String) {
         guard backupReports else { return }

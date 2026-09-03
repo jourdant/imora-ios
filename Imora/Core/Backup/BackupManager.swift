@@ -112,11 +112,11 @@ final class BackupManager {
     private(set) var remoteIdentifierByLocalId: [String: String] = [:]
     /// wired by sessionstore to the realtime hub, which debounces.
     var onLocalChange: (() -> Void)?
-    /// wired by sessionstore to raise the end-of-run notification. carries the
-    /// terminal phase so a cancelled run stays silent. not called when the
-    /// server was unreachable - every launch and foreground retries, and each
-    /// retry would repeat the same banner.
-    var onRunFinished: ((BackupPhase) -> Void)?
+    /// wired by sessionstore to raise the failure banner. a finished run stays
+    /// silent, the uploads show up in the timeline on their own. not called
+    /// when the server was unreachable, since every launch and foreground
+    /// retries and each retry would repeat the same banner.
+    var onRunFailed: ((String) -> Void)?
     /// wired by the continued-processing task, which has to keep feeding the
     /// system progress ui or the scheduler expires it.
     var onContinuedProgress: (() -> Void)?
@@ -149,9 +149,6 @@ final class BackupManager {
     private var runAllowsUploads = true
     private var rerunRequested = false
     private var changeObserver: LibraryChangeObserver?
-    /// uploads that landed in the index without a run to count them, i.e. while
-    /// the app was suspended or gone.
-    private var adoptedUploads = 0
 
     /// host|userId, stamped onto every background upload so a completion can
     /// never be applied to a different account's index.
@@ -182,7 +179,6 @@ final class BackupManager {
         localChangedTask?.cancel()
         localChangedTask = nil
         BackgroundUploader.shared.setOrphanHandler(nil)
-        BackgroundUploader.shared.setEventsFinishedHandler(nil)
         // transfers outlive the process, so signing out has to stop them
         // explicitly or they would keep filling a stranger's library.
         BackgroundUploader.shared.cancelAll()
@@ -334,10 +330,6 @@ final class BackupManager {
             guard let manager = self else { return }
             Task { @MainActor in await manager.applyBackgroundUpload(completion) }
         }
-        BackgroundUploader.shared.setEventsFinishedHandler { [weak self] in
-            guard let manager = self else { return }
-            Task { @MainActor in manager.reportAdoptedUploads() }
-        }
         BackgroundUploader.shared.sweepAbandonedBodies()
     }
 
@@ -349,16 +341,7 @@ final class BackupManager {
         } else {
             await index.setPrimaryRemoteId(localId: completion.ticket.localId, completion.remoteId)
         }
-        adoptedUploads += 1
         localChanged()
-    }
-
-    /// the run that started these uploads is long gone, so the end-of-run
-    /// notification never fired for them.
-    private func reportAdoptedUploads() {
-        guard adoptedUploads > 0 else { return }
-        LocalNotifications.shared.deliverBackupReport(BackupSummary(uploaded: adoptedUploads))
-        adoptedUploads = 0
     }
 
     /// every device asset paired with its backup status, newest first.
@@ -483,7 +466,7 @@ final class BackupManager {
                 phase = .idle
             }
         }
-        if reportsOutcome { onRunFinished?(phase) }
+        if case .error(let message) = phase, reportsOutcome { onRunFailed?(message) }
         uploadStates.removeAll()
         localChanged()
         runTask = nil

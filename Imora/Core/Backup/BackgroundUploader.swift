@@ -44,7 +44,6 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
     private var buffers: [Int: Data] = [:]
     private var progressHandlers: [Int: @Sendable (Double) -> Void] = [:]
     private var orphanHandler: (@Sendable (Completion) -> Void)?
-    private var eventsFinishedHandler: (@Sendable () -> Void)?
     private var backgroundCompletion: LaunchCompletion?
     /// completions that arrived before anything was listening, e.g. during a
     /// relaunch where the delegate beat the signed-in account.
@@ -85,10 +84,6 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
             return pendingOrphans
         }
         for completion in queued { handler?(completion) }
-    }
-
-    func setEventsFinishedHandler(_ handler: (@Sendable () -> Void)?) {
-        lock.withLock { eventsFinishedHandler = handler }
     }
 
     /// stored by the app delegate when the system relaunches us to deliver
@@ -209,12 +204,10 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        let (finished, completion) = lock.withLock {
-            let handlers = (eventsFinishedHandler, backgroundCompletion)
-            backgroundCompletion = nil
-            return handlers
+        let completion = lock.withLock {
+            defer { backgroundCompletion = nil }
+            return backgroundCompletion
         }
-        finished?()
         // the system expects this on the main thread before it suspends us.
         if let completion { DispatchQueue.main.async { completion.run() } }
     }
