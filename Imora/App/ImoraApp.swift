@@ -56,6 +56,8 @@ struct RootView: View {
     var body: some View {
         Group {
             switch session.state {
+            case .restoring:
+                ProgressView("Restoring session...")
             case .loggedOut:
                 LoginFlowView()
             case .loggedIn:
@@ -64,6 +66,7 @@ struct RootView: View {
         }
         .animation(.smooth, value: session.state)
         .task {
+            session.restoreSessionIfAvailable()
             // never prompts at launch - access is asked from the timeline
             // banner or the backup settings instead. an already granted
             // session still primes here so device photos show even when
@@ -75,6 +78,7 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
+                session.restoreSessionIfAvailable()
                 // returning to the foreground picks up photos taken meanwhile
                 // and reconnects the realtime channel, which resyncs grids.
                 session.backup?.startIfIdle()
@@ -88,6 +92,11 @@ struct RootView: View {
             default:
                 break
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.protectedDataDidBecomeAvailableNotification
+        )) { _ in
+            session.restoreSessionIfAvailable()
         }
     }
 }

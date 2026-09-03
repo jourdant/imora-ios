@@ -6,6 +6,12 @@ import Security
 /// same session; reads stay group-less, which searches every group this
 /// process can see and also finds tokens written before the group existed.
 enum KeychainStore {
+    enum ReadResult {
+        case value(String)
+        case missing
+        case unavailable(OSStatus)
+    }
+
     private static let service = "app.imora.credentials"
 
     private static var accessGroup: String? {
@@ -20,6 +26,7 @@ enum KeychainStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData as String: Data(value.utf8),
         ]
         if let accessGroup {
@@ -33,7 +40,7 @@ enum KeychainStore {
         }
     }
 
-    static func get(_ key: String) -> String? {
+    static func get(_ key: String) -> ReadResult {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -42,10 +49,20 @@ enum KeychainStore {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
-        else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data,
+                  let value = String(data: data, encoding: .utf8)
+            else { return .missing }
+            return .value(value)
+        case errSecItemNotFound:
+            return .missing
+        case errSecInteractionNotAllowed:
+            return .unavailable(status)
+        default:
+            return .missing
+        }
     }
 
     static func delete(_ key: String) {

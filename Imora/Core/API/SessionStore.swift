@@ -12,11 +12,12 @@ nonisolated struct ProfileImageMutationToken {
 @Observable
 final class SessionStore {
     enum State: Equatable {
+        case restoring
         case loggedOut
         case loggedIn
     }
 
-    private(set) var state: State = .loggedOut
+    private(set) var state: State = .restoring
     private(set) var client: ImmichClient?
     private(set) var user: CurrentUser?
     private(set) var features: ServerFeatures?
@@ -57,8 +58,24 @@ final class SessionStore {
         profileImageCacheKey = UserDefaults.standard.string(
             forKey: Self.profileImageCacheKeyDefaultsKey
         )
-        guard let apiURL = serverURL, let token = KeychainStore.get(Self.tokenKey) else {
+        restoreSessionIfAvailable()
+    }
+
+    /// retries a keychain read that was blocked while protected data was unavailable.
+    func restoreSessionIfAvailable() {
+        guard state == .restoring else { return }
+        guard let apiURL = serverURL else {
             state = .loggedOut
+            return
+        }
+        let token: String
+        switch KeychainStore.get(Self.tokenKey) {
+        case .value(let storedToken):
+            token = storedToken
+        case .missing:
+            state = .loggedOut
+            return
+        case .unavailable:
             return
         }
         // re-setting moves tokens from before keychain sharing into the app
