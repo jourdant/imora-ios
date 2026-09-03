@@ -1002,14 +1002,17 @@ final class AssetTileRegistry {
         let pairedLocalID = asset.localIdentifier
             ?? session.backup?.localIdentifierByRemoteId[asset.id]
         if let pairedLocalID {
+            // the grid's own render comes first: uncropped, exactly what the
+            // tile is showing, so the page opens on the same picture.
+            if let image = LocalImageLoader.shared.cachedImage(
+                localIdentifier: pairedLocalID,
+                targetPixelSize: targetPixelSize,
+                contentMode: DeviceTileRender.contentMode,
+                coversTarget: DeviceTileRender.coversTile
+            ) {
+                return image
+            }
             for size in [targetPixelSize, 640] {
-                if let image = LocalImageLoader.shared.cachedImage(
-                    localIdentifier: pairedLocalID,
-                    targetPixelSize: size,
-                    contentMode: .aspectFill
-                ) {
-                    return image
-                }
                 if let image = LocalImageLoader.shared.cachedImage(
                     localIdentifier: pairedLocalID,
                     targetPixelSize: size,
@@ -1019,12 +1022,21 @@ final class AssetTileRegistry {
                 }
             }
             // a tile that only has its preview yet still hands over an
-            // uncropped picture. the snapshot below is the square tile, a
-            // crop the page fills its frame with and then zooms out of once
-            // the render lands.
+            // uncropped picture.
             if let preview = LocalImageLoader.shared.cachedPreview(localIdentifier: pairedLocalID),
                Self.aspectMatches(preview, asset: asset) {
                 return preview
+            }
+            // the render has left the cache: ask photokit for the stored
+            // thumbnail right now rather than snapshot the square tile, which
+            // is the crop the viewer would then visibly zoom out of.
+            if let image = LocalImageLoader.shared.immediateImage(
+                localIdentifier: pairedLocalID,
+                targetPixelSize: targetPixelSize,
+                contentMode: DeviceTileRender.contentMode,
+                coversTarget: DeviceTileRender.coversTile
+            ) {
+                return image
             }
         }
         guard let client = session.client else { return nil }

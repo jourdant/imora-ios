@@ -511,7 +511,12 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     /// their choice across window changes and only clamp the rendered value.
     @State private var preferredColumnCount: Int?
     @State private var pinchBaseColumns: Int?
-    @State private var prefetcher = ThumbnailPrefetcher()
+    // device tiles warm the same uncropped render they draw, so the caching
+    // manager serves the tile and the opening transition alike.
+    @State private var prefetcher = ThumbnailPrefetcher(
+        localContentMode: DeviceTileRender.contentMode,
+        localCoversTarget: DeviceTileRender.coversTile
+    )
     @State private var motion = GridMotion()
     @State private var tileRegistry = AssetTileRegistry()
     @State private var selectionSlideController = TimelineSelectionSlideController()

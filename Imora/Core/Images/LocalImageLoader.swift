@@ -10,6 +10,17 @@ nonisolated enum LocalImageDelivery {
     case final(UIImage)
 }
 
+/// how grids ask photokit for device tiles: uncropped, at the tile's own
+/// size, with the target covering the tile's short side. the tile, the
+/// opening transition and the page's first frame then all paint the same
+/// bitmap, so nothing zooms out once the full render lands. the square tile
+/// crops it visually. the caching manager stores decoded sources and only
+/// crops at delivery, so this costs no more than asking for the crop.
+nonisolated enum DeviceTileRender {
+    static let contentMode: PHImageContentMode = .aspectFit
+    static let coversTile = true
+}
+
 /// photokit loading for device assets merged into the timeline. the heavy
 /// lifting - decoding, downscaling and keeping a window of tiles warm - is
 /// photokit's own caching manager, the local twin of the nuke pipeline behind
@@ -88,9 +99,29 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     private func key(
         _ localIdentifier: String,
         _ size: CGFloat,
-        _ contentMode: PHImageContentMode
+        _ contentMode: PHImageContentMode,
+        coversTarget: Bool
     ) -> NSString {
-        "\(localIdentifier)#\(Int(size))#\(contentMode.rawValue)" as NSString
+        "\(localIdentifier)#\(Int(size))#\(contentMode.rawValue)\(coversTarget ? "#cover" : "")" as NSString
+    }
+
+    /// the photokit target for a request. a covering fit puts the tile's
+    /// size on the short side, so the uncropped render still fills a square
+    /// tile edge to edge instead of arriving a third smaller than the crop
+    /// would have. the strip beyond the square is all it costs over a crop.
+    private static func targetSize(
+        for asset: PHAsset,
+        pixels: CGFloat,
+        contentMode: PHImageContentMode,
+        coversTarget: Bool
+    ) -> CGSize {
+        guard coversTarget, contentMode == .aspectFit,
+              asset.pixelWidth > 0, asset.pixelHeight > 0
+        else { return CGSize(width: pixels, height: pixels) }
+        let ratio = CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
+        return ratio >= 1
+            ? CGSize(width: (pixels * ratio).rounded(.up), height: pixels)
+            : CGSize(width: pixels, height: (pixels / ratio).rounded(.up))
     }
 
     /// the caching manager only serves a prefetched thumbnail when the request
@@ -122,11 +153,12 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         _ image: UIImage,
         localIdentifier: String,
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode
+        contentMode: PHImageContentMode,
+        coversTarget: Bool
     ) {
         cache.setObject(
             image,
-            forKey: key(localIdentifier, targetPixelSize, contentMode),
+            forKey: key(localIdentifier, targetPixelSize, contentMode, coversTarget: coversTarget),
             cost: Self.cost(of: image)
         )
     }
@@ -138,9 +170,10 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
     func cachedImage(
         localIdentifier: String,
         targetPixelSize: CGFloat,
-        contentMode: PHImageContentMode = .aspectFill
+        contentMode: PHImageContentMode = .aspectFill,
+        coversTarget: Bool = false
     ) -> UIImage? {
-        cache.object(forKey: key(localIdentifier, targetPixelSize, contentMode))
+        cache.object(forKey: key(localIdentifier, targetPixelSize, contentMode, coversTarget: coversTarget))
     }
 
     /// the last preview photokit handed over for the asset, at whatever size.
@@ -158,17 +191,24 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         localIdentifier: String,
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode = .aspectFill,
+        coversTarget: Bool = false,
         allowsNetwork: Bool = true
     ) async -> UIImage? {
         if let cached = cachedImage(
             localIdentifier: localIdentifier,
             targetPixelSize: targetPixelSize,
-            contentMode: contentMode
+            contentMode: contentMode,
+            coversTarget: coversTarget
         ) {
             return cached
         }
         guard let asset = fetchAsset(localIdentifier) else { return nil }
-        let size = CGSize(width: targetPixelSize, height: targetPixelSize)
+        let size = Self.targetSize(
+            for: asset,
+            pixels: targetPixelSize,
+            contentMode: contentMode,
+            coversTarget: coversTarget
+        )
         // opportunistic delivery may answer twice; the stored thumbnail is
         // skipped and the guard keeps the continuation to a single resume.
         let resumed = OSAllocatedUnfairLock(initialState: false)
@@ -192,7 +232,13 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
             }
         }
         if let image {
-            store(image, localIdentifier: localIdentifier, targetPixelSize: targetPixelSize, contentMode: contentMode)
+            store(
+                image,
+                localIdentifier: localIdentifier,
+                targetPixelSize: targetPixelSize,
+                contentMode: contentMode,
+                coversTarget: coversTarget
+            )
         }
         return image
     }
@@ -206,12 +252,14 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         localIdentifier: String,
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode = .aspectFill,
+        coversTarget: Bool = false,
         allowsNetwork: Bool = true
     ) -> AsyncStream<LocalImageDelivery> {
         if let cached = cachedImage(
             localIdentifier: localIdentifier,
             targetPixelSize: targetPixelSize,
-            contentMode: contentMode
+            contentMode: contentMode,
+            coversTarget: coversTarget
         ) {
             return AsyncStream { continuation in
                 continuation.yield(.final(cached))
@@ -229,7 +277,12 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                     continuation.finish()
                     return
                 }
-                let size = CGSize(width: targetPixelSize, height: targetPixelSize)
+                let size = Self.targetSize(
+                    for: asset,
+                    pixels: targetPixelSize,
+                    contentMode: contentMode,
+                    coversTarget: coversTarget
+                )
                 let requestID = manager.requestImage(
                     for: asset,
                     targetSize: size,
@@ -249,7 +302,8 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                         image,
                         localIdentifier: localIdentifier,
                         targetPixelSize: targetPixelSize,
-                        contentMode: contentMode
+                        contentMode: contentMode,
+                        coversTarget: coversTarget
                     )
                     continuation.yield(.final(image))
                     continuation.finish()
@@ -257,6 +311,38 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                 request.register(requestID, manager: manager)
             }
         }
+    }
+
+    /// an uncropped picture of the asset right now, on the calling thread:
+    /// the library's stored thumbnail, fitted to the target. the opening
+    /// transition asks for this when the tile's render has left the cache,
+    /// because a snapshot of the square tile would hand the viewer a crop to
+    /// zoom out of. fast format and no network keep the block to a decode of
+    /// the thumbnail, a few milliseconds at most.
+    func immediateImage(
+        localIdentifier: String,
+        targetPixelSize: CGFloat,
+        contentMode: PHImageContentMode,
+        coversTarget: Bool
+    ) -> UIImage? {
+        guard let asset = fetchAsset(localIdentifier) else { return nil }
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+        options.isSynchronous = true
+        options.isNetworkAccessAllowed = false
+        let size = Self.targetSize(
+            for: asset,
+            pixels: targetPixelSize,
+            contentMode: contentMode,
+            coversTarget: coversTarget
+        )
+        var delivered: UIImage?
+        manager.requestImage(for: asset, targetSize: size, contentMode: contentMode, options: options) { image, _ in
+            delivered = image
+        }
+        if let delivered { storePreview(delivered, localIdentifier: localIdentifier) }
+        return delivered
     }
 
     // MARK: - prefetching
@@ -267,6 +353,7 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode = .aspectFill,
+        coversTarget: Bool = false,
         allowsNetwork: Bool = true
     ) {
         cachingQueue.async { [self] in
@@ -275,6 +362,7 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                 localIdentifiers: localIdentifiers,
                 targetPixelSize: targetPixelSize,
                 contentMode: contentMode,
+                coversTarget: coversTarget,
                 allowsNetwork: allowsNetwork
             )
         }
@@ -284,6 +372,7 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode = .aspectFill,
+        coversTarget: Bool = false,
         allowsNetwork: Bool = true
     ) {
         cachingQueue.async { [self] in
@@ -292,26 +381,45 @@ nonisolated final class LocalImageLoader: @unchecked Sendable {
                 localIdentifiers: localIdentifiers,
                 targetPixelSize: targetPixelSize,
                 contentMode: contentMode,
+                coversTarget: coversTarget,
                 allowsNetwork: allowsNetwork
             )
         }
     }
 
+    /// a covering fit gives every asset its own target, and the caching
+    /// manager takes one target per call, so the batch is split by target.
     private func setCaching(
         _ caching: Bool,
         localIdentifiers: [String],
         targetPixelSize: CGFloat,
         contentMode: PHImageContentMode,
+        coversTarget: Bool,
         allowsNetwork: Bool
     ) {
         let assets = fetchAssets(localIdentifiers)
         guard !assets.isEmpty else { return }
-        let size = CGSize(width: targetPixelSize, height: targetPixelSize)
         let options = Self.requestOptions(allowsNetwork: allowsNetwork)
-        if caching {
-            manager.startCachingImages(for: assets, targetSize: size, contentMode: contentMode, options: options)
-        } else {
-            manager.stopCachingImages(for: assets, targetSize: size, contentMode: contentMode, options: options)
+        var groups: [String: (size: CGSize, assets: [PHAsset])] = [:]
+        for asset in assets {
+            let size = Self.targetSize(
+                for: asset,
+                pixels: targetPixelSize,
+                contentMode: contentMode,
+                coversTarget: coversTarget
+            )
+            groups["\(Int(size.width))x\(Int(size.height))", default: (size, [])].assets.append(asset)
+        }
+        for group in groups.values {
+            if caching {
+                manager.startCachingImages(
+                    for: group.assets, targetSize: group.size, contentMode: contentMode, options: options
+                )
+            } else {
+                manager.stopCachingImages(
+                    for: group.assets, targetSize: group.size, contentMode: contentMode, options: options
+                )
+            }
         }
     }
 

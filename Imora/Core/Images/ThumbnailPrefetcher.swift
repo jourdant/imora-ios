@@ -17,6 +17,9 @@ final class ThumbnailPrefetcher {
 
     private var targetPixelSize: CGFloat
     private let localContentMode: PHImageContentMode
+    /// the caching manager only serves requests whose target matches, so
+    /// this has to agree with what the tiles ask for.
+    private let localCoversTarget: Bool
     private var remote: Set<URL> = []
     /// device-only assets: the library is their only source, so icloud may
     /// be asked for them.
@@ -33,10 +36,12 @@ final class ThumbnailPrefetcher {
 
     init(
         targetPixelSize: CGFloat = 640,
-        localContentMode: PHImageContentMode = .aspectFill
+        localContentMode: PHImageContentMode = .aspectFill,
+        localCoversTarget: Bool = false
     ) {
         self.targetPixelSize = targetPixelSize
         self.localContentMode = localContentMode
+        self.localCoversTarget = localCoversTarget
     }
 
     /// anchors on both ends of the visible tile rows and warms the assets
@@ -142,6 +147,7 @@ final class ThumbnailPrefetcher {
                 localIdentifiers: Array(added),
                 targetPixelSize: targetPixelSize,
                 contentMode: localContentMode,
+                coversTarget: localCoversTarget,
                 allowsNetwork: allowsNetwork
             )
         }
@@ -150,6 +156,7 @@ final class ThumbnailPrefetcher {
                 localIdentifiers: Array(dropped),
                 targetPixelSize: targetPixelSize,
                 contentMode: localContentMode,
+                coversTarget: localCoversTarget,
                 allowsNetwork: allowsNetwork
             )
         }

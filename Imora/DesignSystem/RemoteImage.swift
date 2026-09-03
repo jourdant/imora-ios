@@ -173,6 +173,9 @@ struct LocalPhotoImage: View {
     var fallbackRequestContentMode: PHImageContentMode = .aspectFill
     var loadsFallbackIfNeeded = false
     var requestContentMode: PHImageContentMode = .aspectFill
+    /// true for grid tiles: the fit render is asked for at the tile's size on
+    /// its short side, so it still fills the square without a crop.
+    var coversTarget = false
     var contentMode: ContentMode = .fill
     /// false when the host has a server copy to fall back on: a paired asset
     /// whose sharp render sits in icloud then shows the server thumbnail
@@ -208,7 +211,7 @@ struct LocalPhotoImage: View {
     }
 
     private var requestKey: String {
-        "\(localIdentifier)#\(Int(targetPixelSize))#\(requestContentMode.rawValue)"
+        "\(localIdentifier)#\(Int(targetPixelSize))#\(requestContentMode.rawValue)\(coversTarget ? "#cover" : "")"
     }
 
     private var fallbackKey: String? {
@@ -247,7 +250,8 @@ struct LocalPhotoImage: View {
             ?? LocalImageLoader.shared.cachedImage(
                 localIdentifier: localIdentifier,
                 targetPixelSize: targetPixelSize,
-                contentMode: requestContentMode
+                contentMode: requestContentMode,
+                coversTarget: coversTarget
             )
             ?? (fallbackImage?.key == fallbackKey ? fallbackImage?.image : nil)
             ?? cachedFallback
@@ -276,6 +280,7 @@ struct LocalPhotoImage: View {
                 localIdentifier: localIdentifier,
                 targetPixelSize: targetPixelSize,
                 contentMode: requestContentMode,
+                coversTarget: coversTarget,
                 allowsNetwork: allowsNetwork
             )
             for await delivery in deliveries {
@@ -323,7 +328,8 @@ struct LocalPhotoImage: View {
                   LocalImageLoader.shared.cachedImage(
                       localIdentifier: localIdentifier,
                       targetPixelSize: targetPixelSize,
-                      contentMode: requestContentMode
+                      contentMode: requestContentMode,
+                      coversTarget: coversTarget
                   ) == nil,
                   LocalImageLoader.shared.cachedImage(
                       localIdentifier: localIdentifier,
@@ -393,9 +399,14 @@ struct AssetTile: View {
             .aspectRatio(1, contentMode: .fit)
             .overlay {
                 if let localId = deviceIdentifier {
+                    // the uncropped render the viewer opens on, cropped by the
+                    // tile's own frame, so opening never swaps one crop for
+                    // another.
                     LocalPhotoImage(
                         localIdentifier: localId,
                         targetPixelSize: targetPixelSize,
+                        requestContentMode: DeviceTileRender.contentMode,
+                        coversTarget: DeviceTileRender.coversTile,
                         // a device-only photo has nowhere else to come from;
                         // a paired one falls back to the server thumbnail
                         // rather than downloading its original from icloud.
