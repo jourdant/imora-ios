@@ -1884,13 +1884,29 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
 
     private func dismissWithoutBlockingTimeline() {
         guard dismissalRequested, let presenter = presentingViewController else { return }
+        let wasPresenting = phase == .presenting
         phase = .dismissing
         if let transition = makeDetachedDismissal() {
             AssetViewerDetachedDismissalStore.run(transition)
         }
-        passTouchesToTimeline()
         presenter.dismiss(animated: false) { [weak self] in
             self?.finishIfDetached()
+        }
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.phase == .dismissing else { return }
+            guard self.presentingViewController != nil, !self.isBeingDismissed else {
+                self.passTouchesToTimeline()
+                return
+            }
+            AssetViewerDetachedDismissalStore.completeAll()
+            self.cancelDismissal()
+            self.dismissalRequested = true
+            if wasPresenting {
+                self.phase = .presenting
+                return
+            }
+            self.retryRequestedDismissalIfNeeded()
         }
     }
 
@@ -2023,7 +2039,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     }
 
     private func presentationFinished() {
-        guard phase == .presenting else { return }
+        guard phase == .presenting || (phase == .dismissing && dismissalRequested) else { return }
         guard presentingViewController != nil else {
             finish()
             return
@@ -2300,7 +2316,19 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
     }
 
     private func retryRequestedDismissalIfNeeded() {
-        guard dismissalRequested else { return }
+        guard dismissalRequested, phase == .presented else { return }
+        let coordinator = presentedViewController?.transitionCoordinator
+            ?? transitionCoordinator
+            ?? presentingViewController?.transitionCoordinator
+        if let coordinator {
+            let scheduled = coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.retryRequestedDismissalIfNeeded()
+                }
+            }
+            if scheduled { return }
+        }
         Task { @MainActor [weak self] in
             await Task.yield()
             guard let self,
