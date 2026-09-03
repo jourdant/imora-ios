@@ -389,7 +389,7 @@ private nonisolated enum SocketConnection {
         }
         // the server authenticates the handshake from the session cookie.
         request.setValue("immich_access_token=\(token)", forHTTPHeaderField: "Cookie")
-        request.timeoutInterval = 15
+        request.timeoutInterval = 60
         return URLSession.shared.webSocketTask(with: request)
     }
 
@@ -399,17 +399,22 @@ private nonisolated enum SocketConnection {
         from task: URLSessionWebSocketTask,
         timeout: Duration
     ) async throws -> URLSessionWebSocketTask.Message {
-        try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message?.self) { group in
-            group.addTask { try await task.receive() }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                return nil
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+                group.addTask { try await task.receive() }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    task.cancel(with: .goingAway, reason: nil)
+                    throw URLError(.timedOut)
+                }
+                defer { group.cancelAll() }
+                guard let message = try await group.next() else {
+                    throw URLError(.networkConnectionLost)
+                }
+                return message
             }
-            defer { group.cancelAll() }
-            guard let first = try await group.next(), let message = first else {
-                throw URLError(.timedOut)
-            }
-            return message
+        } onCancel: {
+            task.cancel(with: .goingAway, reason: nil)
         }
     }
 
