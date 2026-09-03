@@ -419,6 +419,9 @@ struct AssetViewerScreen: View {
     let openingMediaImage: UIImage?
     /// set when the grid behind is an album, which adds removal to the menu.
     let album: AlbumContext?
+    /// set by album grids the signed-in user owns, so the photo on screen can
+    /// become the album's cover. the album screen runs the request itself.
+    let onSetAlbumCover: ((String) async -> Bool)?
     /// set when the grid behind belongs to one person, which lets the photo on
     /// screen become their portrait.
     let personID: String?
@@ -501,6 +504,7 @@ struct AssetViewerScreen: View {
         openingMediaImage: UIImage? = nil,
         zoomCommandBridge: AssetViewerZoomCommandBridge? = nil,
         album: AlbumContext? = nil,
+        onSetAlbumCover: ((String) async -> Bool)? = nil,
         personID: String? = nil,
         onRequestDismissal: (() -> Void)? = nil,
         onLaunchMediaReady: @escaping () -> Void = {},
@@ -543,6 +547,7 @@ struct AssetViewerScreen: View {
             )
         )
         self.album = album
+        self.onSetAlbumCover = onSetAlbumCover
         self.personID = personID
         self.onRequestDismissal = onRequestDismissal
         self.onLaunchMediaReady = onLaunchMediaReady
@@ -629,6 +634,13 @@ struct AssetViewerScreen: View {
         guard let album, let asset = current, !asset.isLocal else { return false }
         guard let userID = session.user?.id else { return true }
         return asset.ownerId == userID || album.ownerID == userID
+    }
+
+    /// the album screen only hands the closure over to the album's owner, so
+    /// the only check left here is that the photo lives on the server.
+    private var canSetAlbumCover: Bool {
+        guard onSetAlbumCover != nil, let asset = current else { return false }
+        return !asset.isLocal && !asset.isTrashed
     }
 
     @ViewBuilder var body: some View {
@@ -1689,6 +1701,13 @@ struct AssetViewerScreen: View {
                         }
                         .accessibilityIdentifier("viewer-remove-from-album")
                     }
+                    if canSetAlbumCover {
+                        Button { Task { await setAlbumCover() } } label: {
+                            Label("Set as Album Cover", systemImage: "photo.badge.checkmark")
+                        }
+                        .accessibilityIdentifier("viewer-album-cover")
+                        .disabled(mutatingAssetIDs.contains(current.id))
+                    }
                     if actionAvailability?.canViewInTimeline == true {
                         Button { viewCurrentInTimeline() } label: {
                             Label("View in Timeline", systemImage: "photo.on.rectangle.angled")
@@ -2177,6 +2196,17 @@ struct AssetViewerScreen: View {
             toast = "Featured photo updated"
         } catch {
             ErrorToastCenter.shared.show("Couldn’t set the featured photo", error: error)
+        }
+    }
+
+    /// the album screen projects the cover and reports the failure, so only
+    /// the success is echoed here, where the album screen is covered.
+    private func setAlbumCover() async {
+        guard let onSetAlbumCover, let asset = current else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        if await onSetAlbumCover(asset.id) {
+            toast = "Album cover updated"
         }
     }
 

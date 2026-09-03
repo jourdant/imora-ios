@@ -1190,6 +1190,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         sourceRegistry: AssetTileRegistry,
         openingChromePresentation: AssetViewerOpeningChromePresentation? = nil,
         album: AlbumContext?,
+        onSetAlbumCover: ((String) async -> Bool)? = nil,
         personID: String?,
         willPresent: @escaping (ViewerRoute) -> Bool,
         didPresent: @escaping (UUID) -> Void,
@@ -1219,6 +1220,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
             displayState: state,
             dismissalRelay: relay,
             album: album,
+            onSetAlbumCover: onSetAlbumCover,
             personID: personID,
             onChange: onChange
         )
@@ -2347,6 +2349,7 @@ private struct AssetViewerHostRoot: View {
     let displayState: AssetViewerDisplayState
     let dismissalRelay: AssetViewerDismissalRelay
     let album: AlbumContext?
+    let onSetAlbumCover: ((String) async -> Bool)?
     let personID: String?
     let onChange: (AssetChange) -> Void
 
@@ -2367,6 +2370,7 @@ private struct AssetViewerHostRoot: View {
                     openingMediaImage: displayState.openingMediaImage,
                     zoomCommandBridge: displayState.zoomCommandBridge,
                     album: album,
+                    onSetAlbumCover: onSetAlbumCover,
                     personID: personID,
                     onRequestDismissal: { dismissalRelay.request() },
                     onLaunchMediaReady: { dismissalRelay.presentationMediaReady() },

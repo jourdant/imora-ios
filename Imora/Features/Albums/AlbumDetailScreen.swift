@@ -60,6 +60,7 @@ struct AlbumDetailScreen: View {
             onAlbumAssetCountDelta: { delta in
                 setAlbum(album.withAssetCountDelta(delta))
             },
+            onSetAlbumCover: isOwner ? { await setAlbumCover($0) } : nil,
             trailingItems: {
                 ToolbarItem(placement: .topBarTrailing) {
                     menu
@@ -273,6 +274,25 @@ struct AlbumDetailScreen: View {
             },
             request: { try await client.updateAlbum(id: original.id, order: next) }
         )
+    }
+
+    /// the cover only shows on the albums list, so the projection is what
+    /// flips the card there before the server confirms. the server takes it
+    /// from the owner alone, which is who the grid offers it to.
+    private func setAlbumCover(_ assetID: String) async -> Bool {
+        guard let client = session.client, !isAlbumMutationInFlight else { return false }
+        let original = album
+        isAlbumMutationInFlight = true
+        defer { isAlbumMutationInFlight = false }
+        let updated: Void? = await OptimisticAction.perform(
+            errorMessage: "Couldn’t set the album cover.",
+            apply: { setAlbum(original.withCover(assetID)) },
+            rollback: { setAlbum(original) },
+            request: { try await client.updateAlbum(id: original.id, thumbnailAssetId: assetID) }
+        )
+        guard updated != nil else { return false }
+        showFeedback("Album cover updated")
+        return true
     }
 
     private func deleteAlbum() async {

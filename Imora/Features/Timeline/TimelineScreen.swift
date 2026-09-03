@@ -463,6 +463,10 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     /// Keeps AlbumDetail's metadata header in lockstep with direct grid
     /// removals without coupling this reusable screen to album state.
     var onAlbumAssetCountDelta: ((Int) -> Void)?
+    /// album grids hand this over for their owner only. a single server photo
+    /// then offers itself as the cover from the tile menu, the selection menu
+    /// and the viewer; the album screen runs the request and projects it.
+    var onSetAlbumCover: ((String) async -> Bool)?
     /// one-shot picker: while set, a tap hands the photo back instead of
     /// opening it, and nothing else on a tile responds. person pages choose a
     /// featured photo this way.
@@ -532,6 +536,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         resyncTrigger: Int = 0,
         albumOwnerID: String? = nil,
         onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
+        onSetAlbumCover: ((String) async -> Bool)? = nil,
         onPickAsset: ((Asset) -> Void)? = nil,
         navigationTarget: Binding<TimelineNavigationTarget?> = .constant(nil),
         serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
@@ -549,6 +554,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         self.resyncTrigger = resyncTrigger
         self.albumOwnerID = albumOwnerID
         self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
+        self.onSetAlbumCover = onSetAlbumCover
         self.onPickAsset = onPickAsset
         _navigationTarget = navigationTarget
         _serverCommand = serverCommand
@@ -1001,6 +1007,9 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                             onFavorite: { await applyFavorite() },
                             onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
                             onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
+                            onSetAlbumCover: onSetAlbumCover != nil && selection.count == 1
+                                ? { await applySetAlbumCover() }
+                                : nil,
                             onAddToAlbum: { pendingAlbumAssets = Array(selection) },
                             onBackUp: selectionHasLocalAssets ? applyBackup : nil,
                             backUpTitle: isBackupOnlySelection ? "Back Up" : "Back Up Missing"
@@ -1419,6 +1428,15 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 Task { _ = await removeFromAlbum(ids: [serverID]) }
             })
         }
+        if canSetAlbumCover(asset), let serverID {
+            primary.append(UIAction(
+                title: "Set as Album Cover",
+                image: UIImage(systemName: "photo.badge.checkmark"),
+                attributes: mutationAttributes
+            ) { _ in
+                Task { _ = await setAlbumCover(id: serverID) }
+            })
+        }
         if availability.canArchive, let serverID {
             let isArchived = asset.visibility == .archive
             primary.append(UIAction(
@@ -1552,6 +1570,10 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         guard filter.albumId != nil, !asset.isLocal else { return false }
         guard let userID = session.user?.id else { return true }
         return asset.ownerId == userID || albumOwnerID == userID
+    }
+
+    private func canSetAlbumCover(_ asset: Asset) -> Bool {
+        onSetAlbumCover != nil && !asset.isLocal && !asset.isTrashed
     }
 
     /// device photos join selection only while they still need a backup, so
@@ -1760,6 +1782,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 ? nil
                 : AssetViewerOpeningChromePresentation(asset: asset, session: session),
             album: filter.albumId.map { AlbumContext(id: $0, ownerID: albumOwnerID) },
+            onSetAlbumCover: onSetAlbumCover,
             personID: filter.personId,
             willPresent: { route in beginViewerPresentation(route) },
             didPresent: { id in finishViewerOpening(id) },
@@ -2204,6 +2227,20 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         let removed = await removeFromAlbum(ids: Array(selection))
         selection.subtract(removed)
         if selection.isEmpty { exitSelection() }
+    }
+
+    private func applySetAlbumCover() async {
+        guard selection.count == 1, let id = selection.first else { return }
+        guard await setAlbumCover(id: id) else { return }
+        exitSelection()
+    }
+
+    /// the album screen owns the request; the grid only holds the photo
+    /// against a second action while it runs.
+    private func setAlbumCover(id: String) async -> Bool {
+        guard let onSetAlbumCover, beginServerMutation(ids: [id]) else { return false }
+        defer { finishServerMutation(ids: [id]) }
+        return await onSetAlbumCover(id)
     }
 
     /// uploads continue after the mode closes so tiles report progress

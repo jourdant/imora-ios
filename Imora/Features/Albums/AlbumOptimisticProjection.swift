@@ -92,6 +92,10 @@ nonisolated extension Album {
         copy(assetCount: max(0, assetCount + delta))
     }
 
+    func withCover(_ assetID: String) -> Album {
+        copy(albumThumbnailAssetId: assetID)
+    }
+
     func addingSharedUsers(_ users: [User]) -> Album {
         let existing = Set(albumUsers.map(\.user.id))
         let additions = users
@@ -109,6 +113,7 @@ nonisolated extension Album {
     private func copy(
         albumName: String? = nil,
         description: String? = nil,
+        albumThumbnailAssetId: String? = nil,
         assetCount: Int? = nil,
         albumUsers: [AlbumUser]? = nil,
         shared: Bool? = nil,
@@ -119,7 +124,7 @@ nonisolated extension Album {
             id: id,
             albumName: albumName ?? self.albumName,
             description: description ?? self.description,
-            albumThumbnailAssetId: albumThumbnailAssetId,
+            albumThumbnailAssetId: albumThumbnailAssetId ?? self.albumThumbnailAssetId,
             assetCount: assetCount ?? self.assetCount,
             albumUsers: albumUsers ?? self.albumUsers,
             shared: shared ?? self.shared,

@@ -17,6 +17,8 @@ struct SelectionMoreMenu: View {
     let onFavorite: () async -> Void
     let onArchive: () async -> Void
     var onRemoveFromAlbum: (() async -> Void)?
+    /// set on owned albums while exactly one photo is picked.
+    var onSetAlbumCover: (() async -> Void)?
     let onAddToAlbum: () -> Void
     /// set while the selection holds not-yet-backed-up device photos. only
     /// those upload; the title reads back up missing when server items are
@@ -48,6 +50,14 @@ struct SelectionMoreMenu: View {
                         Task { await onRemoveFromAlbum() }
                     } label: {
                         Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                    }
+                    if let onSetAlbumCover {
+                        Button {
+                            Task { await onSetAlbumCover() }
+                        } label: {
+                            Label("Set as Album Cover", systemImage: "photo.badge.checkmark")
+                        }
+                        .accessibilityIdentifier("selection-album-cover")
                     }
                 } else {
                     Button {
