@@ -84,7 +84,8 @@ nonisolated enum DeviceID {
 final class BackupManager {
     static let autoBackupKey = "imora.backupEnabled"
     private static let uploadWorkers = 3
-    private static let checkBatchSize = 100
+    private nonisolated static let verificationWorkers = 8
+    private nonisolated static let checkBatchSize = 100
 
     private(set) var phase: BackupPhase = .idle {
         didSet { onContinuedProgress?() }
@@ -556,23 +557,21 @@ final class BackupManager {
             }
         }
 
-        for batch in items.chunks(of: Self.checkBatchSize) {
+        let results = try await Self.bulkUploadCheck(items, client: client)
+        for result in results {
             try Task.checkCancellation()
-            let results = try await client.bulkUploadCheck(batch)
-            for result in results {
-                let isMotion = result.id.hasSuffix(Self.motionSuffix)
-                let localId = isMotion ? String(result.id.dropLast(Self.motionSuffix.count)) : result.id
-                if result.isConfirmedDuplicate, let assetId = result.assetId {
-                    // a trashed duplicate still proves the bytes exist for upload
-                    // purposes; cleanup re-verifies with the stricter rule.
-                    if isMotion {
-                        await index.setMotionRemoteId(localId: localId, assetId)
-                    } else {
-                        await index.setPrimaryRemoteId(localId: localId, assetId)
-                    }
-                } else if result.isUnsupported {
-                    await index.markUnsupported(localId: localId)
+            let isMotion = result.id.hasSuffix(Self.motionSuffix)
+            let localId = isMotion ? String(result.id.dropLast(Self.motionSuffix.count)) : result.id
+            if result.isConfirmedDuplicate, let assetId = result.assetId {
+                // a trashed duplicate still proves the bytes exist for upload
+                // purposes; cleanup re-verifies with the stricter rule.
+                if isMotion {
+                    await index.setMotionRemoteId(localId: localId, assetId)
+                } else {
+                    await index.setPrimaryRemoteId(localId: localId, assetId)
                 }
+            } else if result.isUnsupported {
+                await index.markUnsupported(localId: localId)
             }
         }
 
@@ -590,6 +589,33 @@ final class BackupManager {
             }
         }
         return uploadQueue
+    }
+
+    @concurrent
+    private static func bulkUploadCheck(
+        _ items: [BulkUploadCheckItem],
+        client: ImmichClient
+    ) async throws -> [BulkUploadCheckResult] {
+        let batches = items.chunks(of: checkBatchSize)
+        guard !batches.isEmpty else { return [] }
+        return try await withThrowingTaskGroup(of: [BulkUploadCheckResult].self) { group in
+            let initialCount = min(verificationWorkers, batches.count)
+            for batch in batches.prefix(initialCount) {
+                group.addTask { try await client.bulkUploadCheck(batch) }
+            }
+            var next = initialCount
+            var combined: [BulkUploadCheckResult] = []
+            combined.reserveCapacity(items.count)
+            while let results = try await group.next() {
+                combined.append(contentsOf: results)
+                if next < batches.count {
+                    let batch = batches[next]
+                    next += 1
+                    group.addTask { try await client.bulkUploadCheck(batch) }
+                }
+            }
+            return combined
+        }
     }
 
     private func uploadPhase(_ queue: [DeviceAsset]) async throws {
@@ -1075,38 +1101,38 @@ final class BackupManager {
                 items.append(BulkUploadCheckItem(id: asset.localIdentifier + Self.motionSuffix, checksum: motion))
             }
         }
-        for batch in items.chunks(of: Self.checkBatchSize) {
-            let results = try await client.bulkUploadCheck(batch)
-            for result in results {
-                let isMotion = result.id.hasSuffix(Self.motionSuffix)
-                let localId = isMotion ? String(result.id.dropLast(Self.motionSuffix.count)) : result.id
-                if result.isConfirmedDuplicate, result.isTrashed != true {
-                    continue
-                }
-                rejected.insert(localId)
-                // an accepted checksum means the server lost these bytes.
-                if result.action == "accept" {
-                    if isMotion {
-                        await index.clearMotionRemoteId(localId: localId)
-                    } else {
-                        await index.clearPrimaryRemoteId(localId: localId)
-                    }
+        let results = try await Self.bulkUploadCheck(items, client: client)
+        for result in results {
+            try Task.checkCancellation()
+            let isMotion = result.id.hasSuffix(Self.motionSuffix)
+            let localId = isMotion ? String(result.id.dropLast(Self.motionSuffix.count)) : result.id
+            if result.isConfirmedDuplicate, result.isTrashed != true {
+                continue
+            }
+            rejected.insert(localId)
+            // an accepted checksum means the server lost these bytes.
+            if result.action == "accept" {
+                if isMotion {
+                    await index.clearMotionRemoteId(localId: localId)
+                } else {
+                    await index.clearPrimaryRemoteId(localId: localId)
                 }
             }
         }
 
+        var livePhotos: [(localId: String, remoteId: String)] = []
         for asset in candidates where !rejected.contains(asset.localIdentifier) {
             if asset.isLivePhoto {
                 // checksum presence alone does not prove the server links the
                 // motion video; an unlinked still would silently lose it.
-                guard let entry = await index.entry(for: asset.localIdentifier),
-                      let remoteId = entry.primaryRemoteId,
-                      let detail = try? await client.assetDetail(id: remoteId),
-                      detail.livePhotoVideoId != nil
-                else { continue }
+                guard let remoteId = entries[asset.localIdentifier]?.primaryRemoteId else { continue }
+                livePhotos.append((asset.localIdentifier, remoteId))
+            } else {
+                verified.insert(asset.localIdentifier)
             }
-            verified.insert(asset.localIdentifier)
         }
+        verified.formUnion(await Self.linkedLivePhotos(livePhotos, client: client))
+        try Task.checkCancellation()
         await index.flush()
 
         return CleanupReport(
@@ -1123,6 +1149,36 @@ final class BackupManager {
         await index.flush()
         localChanged()
         return ids.count
+    }
+    @concurrent
+    private static func linkedLivePhotos(
+        _ photos: [(localId: String, remoteId: String)],
+        client: ImmichClient
+    ) async -> Set<String> {
+        guard !photos.isEmpty else { return [] }
+        return await withTaskGroup(of: (String, Bool).self) { group in
+            let initialCount = min(verificationWorkers, photos.count)
+            for photo in photos.prefix(initialCount) {
+                group.addTask {
+                    let detail = try? await client.assetDetail(id: photo.remoteId)
+                    return (photo.localId, detail?.livePhotoVideoId != nil)
+                }
+            }
+            var next = initialCount
+            var linked: Set<String> = []
+            while let (localId, isLinked) = await group.next() {
+                if isLinked { linked.insert(localId) }
+                if next < photos.count, !Task.isCancelled {
+                    let photo = photos[next]
+                    next += 1
+                    group.addTask {
+                        let detail = try? await client.assetDetail(id: photo.remoteId)
+                        return (photo.localId, detail?.livePhotoVideoId != nil)
+                    }
+                }
+            }
+            return linked
+        }
     }
 }
 
