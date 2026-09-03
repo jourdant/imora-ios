@@ -7,11 +7,13 @@ import SwiftUI
 struct LivePhotoPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
+    let aspectRatio: Double
     let deviceIdentifier: String?
     let isActive: Bool
     let forcesMute: Bool
     let playback: VideoPlayback
     let onMediaReady: () -> Void
+    let onImage: (UIImage) -> Void
     let ownsLaunchMedia: Bool
     let launchMediaBridge: AssetViewerLaunchMediaBridge
     let openingMediaImage: UIImage?
@@ -36,7 +38,7 @@ struct LivePhotoPage: View {
         // would otherwise keep the failed still on screen forever.
         ZoomableScrollView(
             assetID: asset.id,
-            contentID: "\(asset.id)#\(localIdentifier ?? "remote")",
+            contentID: "\(asset.id)#\(localIdentifier ?? "remote")#ratio-\(aspectRatio.bitPattern)",
             isActivePage: isActive,
             allowsDoubleTapZoom: allowsDoubleTapZoom,
             onMediaTap: onMediaTap,
@@ -47,7 +49,7 @@ struct LivePhotoPage: View {
         ) {
             MediaSurfaceStack(
                 assetID: asset.id,
-                aspectRatio: asset.ratio,
+                aspectRatio: aspectRatio,
                 mode: .livePhoto,
                 posterLocalIdentifier: localIdentifier,
                 posterURL: posterURL,
@@ -55,6 +57,7 @@ struct LivePhotoPage: View {
                 thumbhash: asset.thumbhash,
                 playback: playback,
                 onPosterReady: onMediaReady,
+                onPosterImage: onImage,
                 onPosterUnavailable: { localUnavailable = true }
             )
             .modifier(

@@ -472,6 +472,7 @@ struct AssetViewerScreen: View {
     @State private var mutatingAssetIDs: Set<String> = []
     @State private var optimisticRemovals: [String: ViewerRemoval] = [:]
     @State private var optimisticEdits: [String: AssetEditProjection] = [:]
+    @State private var measuredAspectRatios: [String: Double] = [:]
     @State private var editCacheKeys: [String: String] = [:]
     @State private var toast: String?
     @State private var isDismissing = false
@@ -984,6 +985,7 @@ struct AssetViewerScreen: View {
                         mutesVideo: isContextPreview,
                         playback: playback,
                         optimisticEdits: optimisticEdits,
+                        measuredAspectRatios: measuredAspectRatios,
                         editCacheKeys: editCacheKeys,
                         openingAssetID: openingAssetID,
                         launchMediaBridge: launchMediaBridge,
@@ -1006,7 +1008,8 @@ struct AssetViewerScreen: View {
                             ) {
                                 mediaPresentationZoomed = isZoomed
                             }
-                        }
+                        },
+                        onAspectRatioMeasured: recordMeasuredAspectRatio
                     ) { id, isZoomed in
                         guard id == selectedAssetID else { return }
                         if isZoomed { claimInteractiveMedia() }
@@ -1353,11 +1356,27 @@ struct AssetViewerScreen: View {
     }
 
     private func projectedAspectRatio(for asset: Asset) -> Double {
-        guard let projection = optimisticEdits[asset.id],
-              let image = UIImage(data: projection.imageData),
-              image.size.height > 0
-        else { return asset.ratio }
-        return Double(image.size.width / image.size.height)
+        if let projection = optimisticEdits[asset.id],
+           let image = UIImage(data: projection.imageData),
+           image.size.height > 0 {
+            return Double(image.size.width / image.size.height)
+        }
+        return measuredAspectRatios[asset.id] ?? asset.ratio
+    }
+
+    private func recordMeasuredAspectRatio(_ assetID: String, _ image: UIImage) {
+        guard image.size.width > 0, image.size.height > 0 else { return }
+        let ratio = Double(image.size.width / image.size.height)
+        guard ratio.isFinite else { return }
+        guard let index = indexByAssetID[assetID],
+              assets.indices.contains(index)
+        else { return }
+        let effectiveRatio = projectedAspectRatio(for: assets[index])
+        if effectiveRatio > 0,
+           abs(ratio - effectiveRatio) <= effectiveRatio * 0.03 {
+            return
+        }
+        measuredAspectRatios[assetID] = ratio
     }
 
     private func openPendingInformationDestination() {
@@ -2105,9 +2124,11 @@ struct AssetViewerScreen: View {
                     guard image.size.height > 0 else { return nil }
                     return Double(image.size.width / image.size.height)
                 }
-            assets[index].ratio = detail?.asAsset().ratio
-                ?? projectedRatio
+            let committedRatio = projectedRatio
+                ?? detail?.asAsset().ratio
                 ?? assets[index].ratio
+            assets[index].ratio = committedRatio
+            measuredAspectRatios[assetID] = committedRatio
         }
         optimisticEdits.removeValue(forKey: assetID)
         apply(.edited(assetID, thumbhash: detail?.thumbhash))
@@ -2496,6 +2517,7 @@ private struct AssetPager: View {
     let mutesVideo: Bool
     let playback: VideoPlayback
     let optimisticEdits: [String: AssetEditProjection]
+    let measuredAspectRatios: [String: Double]
     let editCacheKeys: [String: String]
     let openingAssetID: String?
     let launchMediaBridge: AssetViewerLaunchMediaBridge
@@ -2507,6 +2529,7 @@ private struct AssetPager: View {
     let onHorizontalInteractionStarted: () -> Void
     let onZoomInteractionStarted: () -> Void
     let onZoomPresentationChanged: (Bool) -> Void
+    let onAspectRatioMeasured: (String, UIImage) -> Void
     let onZoomChanged: (String, Bool) -> Void
     private let initialSelection: String?
 
@@ -2537,6 +2560,7 @@ private struct AssetPager: View {
         mutesVideo: Bool,
         playback: VideoPlayback,
         optimisticEdits: [String: AssetEditProjection],
+        measuredAspectRatios: [String: Double],
         editCacheKeys: [String: String],
         openingAssetID: String?,
         launchMediaBridge: AssetViewerLaunchMediaBridge,
@@ -2548,6 +2572,7 @@ private struct AssetPager: View {
         onHorizontalInteractionStarted: @escaping () -> Void,
         onZoomInteractionStarted: @escaping () -> Void,
         onZoomPresentationChanged: @escaping (Bool) -> Void,
+        onAspectRatioMeasured: @escaping (String, UIImage) -> Void,
         onZoomChanged: @escaping (String, Bool) -> Void
     ) {
         self.assets = assets
@@ -2560,6 +2585,7 @@ private struct AssetPager: View {
         self.mutesVideo = mutesVideo
         self.playback = playback
         self.optimisticEdits = optimisticEdits
+        self.measuredAspectRatios = measuredAspectRatios
         self.editCacheKeys = editCacheKeys
         self.openingAssetID = openingAssetID
         self.launchMediaBridge = launchMediaBridge
@@ -2571,6 +2597,7 @@ private struct AssetPager: View {
         self.onHorizontalInteractionStarted = onHorizontalInteractionStarted
         self.onZoomInteractionStarted = onZoomInteractionStarted
         self.onZoomPresentationChanged = onZoomPresentationChanged
+        self.onAspectRatioMeasured = onAspectRatioMeasured
         self.onZoomChanged = onZoomChanged
         initialSelection = selection.wrappedValue
         if let initialSelection = selection.wrappedValue {
@@ -2590,6 +2617,7 @@ private struct AssetPager: View {
                     let presentationAspectRatio = projectedAspectRatio(for: asset)
                     AssetPage(
                         asset: asset,
+                        aspectRatio: presentationAspectRatio,
                         isActive: asset.id == selection,
                         isNearby: isNearby(asset.id, centre: centreIndex),
                         mutesVideo: mutesVideo,
@@ -2611,7 +2639,8 @@ private struct AssetPager: View {
                         onMediaTap: onMediaTap,
                         onDoubleTapZoomChanged: onDoubleTapZoomChanged,
                         onZoomInteractionStarted: onZoomInteractionStarted,
-                        onZoomPresentationChanged: onZoomPresentationChanged
+                        onZoomPresentationChanged: onZoomPresentationChanged,
+                        onImage: { onAspectRatioMeasured(asset.id, $0) }
                     ) { isZoomed in
                         onZoomChanged(asset.id, isZoomed)
                     }
@@ -2727,11 +2756,12 @@ private struct AssetPager: View {
     }
 
     private func projectedAspectRatio(for asset: Asset) -> Double {
-        guard let projection = optimisticEdits[asset.id],
-              let image = UIImage(data: projection.imageData),
-              image.size.height > 0
-        else { return asset.ratio }
-        return Double(image.size.width / image.size.height)
+        if let projection = optimisticEdits[asset.id],
+           let image = UIImage(data: projection.imageData),
+           image.size.height > 0 {
+            return Double(image.size.width / image.size.height)
+        }
+        return measuredAspectRatios[asset.id] ?? asset.ratio
     }
 }
 
@@ -2777,7 +2807,7 @@ private struct AssetViewerLaunchMedia: View {
         AssetViewerFittedMedia(aspectRatio: asset.ratio) {
             Image(uiImage: openingImage)
                 .resizable()
-                .aspectRatio(contentMode: .fill)
+                .aspectRatio(contentMode: .fit)
         }
     }
 }
@@ -2785,6 +2815,7 @@ private struct AssetViewerLaunchMedia: View {
 private struct AssetPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
+    let aspectRatio: Double
     let isActive: Bool
     /// far pages drop their heavy content - zoom scroll view, hosting
     /// controller and decoded bitmaps - and become an empty frame. the swap
@@ -2803,6 +2834,7 @@ private struct AssetPage: View {
     let onDoubleTapZoomChanged: (Bool) -> Void
     let onZoomInteractionStarted: () -> Void
     let onZoomPresentationChanged: (Bool) -> Void
+    let onImage: (UIImage) -> Void
     let onZoomChanged: (Bool) -> Void
 
     /// photokit could not serve the device copy after all; the page falls back
@@ -2843,14 +2875,10 @@ private struct AssetPage: View {
                 onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
-                AssetViewerFittedMedia(
-                    aspectRatio: image.size.height > 0
-                        ? Double(image.size.width / image.size.height)
-                        : asset.ratio
-                ) {
+                AssetViewerFittedMedia(aspectRatio: aspectRatio) {
                     Image(uiImage: image)
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .aspectRatio(contentMode: .fit)
                         .onAppear(perform: onMediaReady)
                 }
                 .modifier(launchMediaModifier)
@@ -2858,11 +2886,13 @@ private struct AssetPage: View {
         } else if asset.isVideo {
             VideoPlayerPage(
                 asset: asset,
+                aspectRatio: aspectRatio,
                 deviceIdentifier: deviceIdentifier,
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
                 onMediaReady: onMediaReady,
+                onImage: onImage,
                 ownsLaunchMedia: ownsLaunchMedia,
                 launchMediaBridge: launchMediaBridge,
                 openingMediaImage: openingMediaImage,
@@ -2876,11 +2906,13 @@ private struct AssetPage: View {
         } else if asset.isLivePhoto {
             LivePhotoPage(
                 asset: asset,
+                aspectRatio: aspectRatio,
                 deviceIdentifier: deviceIdentifier,
                 isActive: isActive,
                 forcesMute: mutesVideo,
                 playback: playback,
                 onMediaReady: onMediaReady,
+                onImage: onImage,
                 ownsLaunchMedia: ownsLaunchMedia,
                 launchMediaBridge: launchMediaBridge,
                 openingMediaImage: openingMediaImage,
@@ -2894,7 +2926,7 @@ private struct AssetPage: View {
         } else if let localId = deviceIdentifier {
             ZoomableScrollView(
                 assetID: asset.id,
-                contentID: asset.id,
+                contentID: "\(asset.id)#ratio-\(aspectRatio.bitPattern)",
                 isActivePage: isActive,
                 allowsDoubleTapZoom: allowsDoubleTapZoom,
                 onMediaTap: onMediaTap,
@@ -2903,16 +2935,17 @@ private struct AssetPage: View {
                 onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
-                AssetViewerFittedMedia(aspectRatio: asset.ratio) {
+                AssetViewerFittedMedia(aspectRatio: aspectRatio) {
                     LocalPhotoImage(
                         localIdentifier: localId,
                         targetPixelSize: pagePixelSize,
                         fallbackTargetPixelSize: 640,
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
-                        contentMode: .fill,
+                        contentMode: .fit,
                         expectedAspectRatio: asset.ratio,
                         onUnavailable: { localUnavailable = true },
+                        onImage: onImage,
                         onReady: onMediaReady
                     )
                 }
@@ -2923,7 +2956,7 @@ private struct AssetPage: View {
             let cacheKey = editCacheKey ?? asset.thumbhash
             ZoomableScrollView(
                 assetID: asset.id,
-                contentID: "\(asset.id)#\(cacheKey ?? "")",
+                contentID: "\(asset.id)#\(cacheKey ?? "")#ratio-\(aspectRatio.bitPattern)",
                 isActivePage: isActive,
                 allowsDoubleTapZoom: allowsDoubleTapZoom,
                 onMediaTap: onMediaTap,
@@ -2932,14 +2965,15 @@ private struct AssetPage: View {
                 onZoomPresentationChanged: onZoomPresentationChanged,
                 onZoomChanged: onZoomChanged
             ) {
-                AssetViewerFittedMedia(aspectRatio: asset.ratio) {
+                AssetViewerFittedMedia(aspectRatio: aspectRatio) {
                     RemoteImage(
                         url: client.thumbnailURL(assetID: asset.id, size: "preview", cacheKey: cacheKey),
                         targetPixelSize: pagePixelSize,
                         thumbhash: asset.thumbhash,
                         fallbackURL: client.thumbnailURL(assetID: asset.id, cacheKey: cacheKey),
                         fallbackTargetPixelSize: 640,
-                        contentMode: .fill,
+                        contentMode: .fit,
+                        onImage: onImage,
                         onReady: onMediaReady
                     )
                 }
@@ -2984,7 +3018,11 @@ final class AssetZoomScrollView: UIScrollView {
         guard bounds.size != lastBoundsSize else { return }
         let hadValidSize = lastBoundsSize != .zero
         lastBoundsSize = bounds.size
-        if hadValidSize { onBoundsSizeChanged?() }
+        if hadValidSize {
+            DispatchQueue.main.async { [weak self] in
+                self?.onBoundsSizeChanged?()
+            }
+        }
     }
 
     private func reportHierarchyChange() {

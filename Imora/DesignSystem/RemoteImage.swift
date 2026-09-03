@@ -14,6 +14,7 @@ struct RemoteImage: View {
     /// false while the grid moves too fast for a fade per arriving tile to
     /// read as anything but flicker. the thumbhash step goes with it.
     var animatesLoads = true
+    var onImage: ((UIImage) -> Void)?
     var onReady: (() -> Void)?
 
     @State private var image: KeyedImage?
@@ -64,6 +65,11 @@ struct RemoteImage: View {
         return ImageLoader.shared.cachedImage(for: fallbackURL, targetPixelSize: fallbackPixelSize) != nil
     }
 
+    private func signalReady(_ image: UIImage) {
+        onImage?(image)
+        onReady?()
+    }
+
     var body: some View {
         // one string build per pass instead of the five the computed keys used
         // to cost; a grid tile's key is a full url and this is its hot path.
@@ -84,13 +90,12 @@ struct RemoteImage: View {
             }
         }
         .onAppear {
-            guard let onReady else { return }
-            if readyImage(key: key) != nil { onReady() }
+            if let image = readyImage(key: key) { signalReady(image) }
         }
         .task(id: taskID) {
             if let cached = ImageLoader.shared.cachedImage(for: url, targetPixelSize: targetPixelSize) {
                 image = KeyedImage(key: requestKey, image: cached)
-                onReady?()
+                signalReady(cached)
                 return
             }
 
@@ -110,7 +115,7 @@ struct RemoteImage: View {
                 || showsFallback(key: key)
                 || ContinuousClock.now - start < .milliseconds(120) {
                 image = keyed
-                onReady?()
+                signalReady(loaded)
             } else {
                 withAnimation(
                     .easeIn(duration: 0.15),
@@ -118,7 +123,7 @@ struct RemoteImage: View {
                 ) {
                     image = keyed
                 } completion: {
-                    onReady?()
+                    signalReady(loaded)
                 }
             }
         }
@@ -157,7 +162,7 @@ struct RemoteImage: View {
             )
             guard !Task.isCancelled, let loaded, image?.key != key else { return }
             fallbackImage = KeyedImage(key: key, image: loaded)
-            onReady?()
+            signalReady(loaded)
         }
     }
 }
@@ -197,6 +202,7 @@ struct LocalPhotoImage: View {
     /// behind our back, or is an icloud original that will not download. hosts
     /// use this to fall back to the server copy instead of showing nothing.
     var onUnavailable: (() -> Void)?
+    var onImage: ((UIImage) -> Void)?
     var onReady: (() -> Void)?
 
     @State private var image: KeyedImage?
@@ -236,6 +242,27 @@ struct LocalPhotoImage: View {
         return cachedFallback != nil
     }
 
+    private func readyImage(key: String) -> UIImage? {
+        if let image, image.key == key { return image.image }
+        if let cached = LocalImageLoader.shared.cachedImage(
+            localIdentifier: localIdentifier,
+            targetPixelSize: targetPixelSize,
+            contentMode: requestContentMode,
+            coversTarget: coversTarget
+        ) {
+            return cached
+        }
+        if let fallbackKey, let fallbackImage, fallbackImage.key == fallbackKey {
+            return fallbackImage.image
+        }
+        return cachedFallback
+    }
+
+    private func signalReady(_ image: UIImage) {
+        onImage?(image)
+        onReady?()
+    }
+
     private static func accepts(_ preview: UIImage, aspectRatio: Double?) -> Bool {
         guard let aspectRatio, aspectRatio > 0, preview.size.height > 0 else { return true }
         let previewRatio = Double(preview.size.width / preview.size.height)
@@ -271,6 +298,7 @@ struct LocalPhotoImage: View {
         }
         .onAppear {
             if display != nil { onReady?() }
+            if let image = readyImage(key: key) { onImage?(image) }
         }
         .task(id: key) {
             guard image?.key != key else { return }
@@ -303,7 +331,7 @@ struct LocalPhotoImage: View {
                         || showsSamePicture(key: key)
                         || ContinuousClock.now - start < .milliseconds(120) {
                         image = keyed
-                        onReady?()
+                        signalReady(loaded)
                     } else {
                         withAnimation(
                             .easeIn(duration: 0.15),
@@ -311,7 +339,7 @@ struct LocalPhotoImage: View {
                         ) {
                             image = keyed
                         } completion: {
-                            onReady?()
+                            signalReady(loaded)
                         }
                     }
                 }
@@ -344,7 +372,7 @@ struct LocalPhotoImage: View {
             )
             guard !Task.isCancelled, let loaded, image?.key != key else { return }
             fallbackImage = KeyedImage(key: fallbackKey, image: loaded)
-            onReady?()
+            signalReady(loaded)
         }
     }
 }

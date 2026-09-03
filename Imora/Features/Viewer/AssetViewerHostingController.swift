@@ -513,7 +513,10 @@ private final class AssetViewerTransitionAnimator: NSObject, UIViewControllerAni
 
         guard !UIAccessibility.isReduceMotionEnabled,
               let source = controller?.transitionZoomSource(in: container),
-              let targetFrame = controller?.transitionMediaFrame(in: container)
+              let targetFrame = controller?.transitionMediaFrame(
+                  in: container,
+                  imageAspectRatio: AssetViewerHostingController.aspectRatio(of: source.image)
+              )
         else {
             controller?.setTransitionMediaVisible(true)
             if let openingChrome {
@@ -1050,7 +1053,7 @@ final class AssetTileRegistry {
         return ImageLoader.shared.cachedImage(for: url, targetPixelSize: 640)
     }
 
-    private static func aspectMatches(_ image: UIImage, asset: Asset) -> Bool {
+    fileprivate static func aspectMatches(_ image: UIImage, asset: Asset) -> Bool {
         guard asset.ratio > 0, image.size.height > 0 else { return false }
         let ratio = Double(image.size.width / image.size.height)
         return abs(ratio - asset.ratio) <= asset.ratio * 0.03
@@ -1343,14 +1346,23 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         let image = cachedTransitionImage() ?? source.image
         if phase == .presenting,
            displayState.currentAssetID == route.sourceAssetID,
-           displayState.openingMediaImage == nil {
+           displayState.openingMediaImage == nil,
+           let asset = transitionAsset,
+           AssetTileRegistry.aspectMatches(image, asset: asset) {
             displayState.openingMediaImage = image
         }
         guard let sourceView = source.view else { return source }
         return AssetViewerZoomSource(view: sourceView, image: image, frame: source.frame)
     }
 
-    fileprivate func transitionMediaFrame(in coordinateSpace: UIView) -> CGRect? {
+    /// `imageAspectRatio` is the picture the zoom view actually carries. it
+    /// only matters before the page has registered its frame: the view fills
+    /// its frame, so a frame shaped by a stale asset ratio would crop it and
+    /// the page would then zoom out of that crop.
+    fileprivate func transitionMediaFrame(
+        in coordinateSpace: UIView,
+        imageAspectRatio: Double? = nil
+    ) -> CGRect? {
         let source = mediaFrameSources.source(for: displayState.currentAssetID)
         if let source,
            let pageFrame = presentationFrame(of: source.view, in: coordinateSpace) {
@@ -1361,8 +1373,18 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
 
         return layoutTransitionMediaFrame(
             in: coordinateSpace,
-            aspectRatio: source?.aspectRatio
+            aspectRatio: source?.aspectRatio ?? imageAspectRatio
         )
+    }
+
+    fileprivate static func aspectRatio(of image: UIImage) -> Double? {
+        guard image.size.width > 0, image.size.height > 0 else { return nil }
+        return Double(image.size.width / image.size.height)
+    }
+
+    /// the picture of the zoom view still on screen, if any.
+    private var presentationZoomImageAspectRatio: Double? {
+        (activePresentationZoomView?.image ?? presentationZoomView?.image).flatMap(Self.aspectRatio(of:))
     }
 
     private func layoutTransitionMediaFrame(
@@ -1447,7 +1469,7 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
                 in: $0,
                 aspectRatio: mediaFrameSources.source(
                     for: displayState.currentAssetID
-                )?.aspectRatio
+                )?.aspectRatio ?? presentationZoomImageAspectRatio
             )
         }
         if phase == .presenting,

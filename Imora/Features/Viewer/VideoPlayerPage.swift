@@ -394,11 +394,13 @@ final class VideoPlayback {
 struct VideoPlayerPage: View {
     @Environment(SessionStore.self) private var session
     let asset: Asset
+    let aspectRatio: Double
     let deviceIdentifier: String?
     let isActive: Bool
     let forcesMute: Bool
     let playback: VideoPlayback
     let onMediaReady: () -> Void
+    let onImage: (UIImage) -> Void
     let ownsLaunchMedia: Bool
     let launchMediaBridge: AssetViewerLaunchMediaBridge
     let openingMediaImage: UIImage?
@@ -418,7 +420,7 @@ struct VideoPlayerPage: View {
     var body: some View {
         ZoomableScrollView(
             assetID: asset.id,
-            contentID: "\(asset.id)#\(posterLocalIdentifier ?? "remote")",
+            contentID: "\(asset.id)#\(posterLocalIdentifier ?? "remote")#ratio-\(aspectRatio.bitPattern)",
             isActivePage: isActive,
             allowsDoubleTapZoom: allowsDoubleTapZoom,
             onMediaTap: onMediaTap,
@@ -429,7 +431,7 @@ struct VideoPlayerPage: View {
         ) {
             MediaSurfaceStack(
                 assetID: asset.id,
-                aspectRatio: asset.ratio,
+                aspectRatio: aspectRatio,
                 mode: .video,
                 posterLocalIdentifier: posterLocalIdentifier,
                 posterURL: posterURL,
@@ -437,6 +439,7 @@ struct VideoPlayerPage: View {
                 thumbhash: asset.thumbhash,
                 playback: playback,
                 onPosterReady: onMediaReady,
+                onPosterImage: onImage,
                 onPosterUnavailable: {
                     localUnavailable = true
                 }
@@ -517,6 +520,7 @@ struct MediaSurfaceStack: View {
     let thumbhash: String?
     let playback: VideoPlayback
     var onPosterReady: (() -> Void)?
+    var onPosterImage: ((UIImage) -> Void)?
     /// only a live photo needs this: its still is the asset, so losing the
     /// device copy would leave an empty page rather than a stale poster.
     var onPosterUnavailable: (() -> Void)?
@@ -543,9 +547,10 @@ struct MediaSurfaceStack: View {
                         fallbackTargetPixelSize: 640,
                         fallbackRequestContentMode: .aspectFit,
                         requestContentMode: .aspectFit,
-                        contentMode: .fill,
+                        contentMode: .fit,
                         expectedAspectRatio: aspectRatio,
                         onUnavailable: { onPosterUnavailable?() },
+                        onImage: { onPosterImage?($0) },
                         onReady: { onPosterReady?() }
                     )
                 } else if let posterURL {
@@ -555,7 +560,8 @@ struct MediaSurfaceStack: View {
                         thumbhash: thumbhash,
                         fallbackURL: posterFallbackURL,
                         fallbackTargetPixelSize: 640,
-                        contentMode: .fill,
+                        contentMode: .fit,
+                        onImage: { onPosterImage?($0) },
                         onReady: { onPosterReady?() }
                     )
                 }
