@@ -177,6 +177,8 @@ final class BackupManager {
     func shutdown() {
         runTask?.cancel()
         runTask = nil
+        let index = index
+        Task { await index.flush() }
         localChangedTask?.cancel()
         localChangedTask = nil
         BackgroundUploader.shared.setOrphanHandler(nil)
@@ -217,6 +219,12 @@ final class BackupManager {
         // stopping also withdraws any upload ask that raced this cancel.
         runAllowsUploads = false
         runTask?.cancel()
+        let index = index
+        Task { await index.flush() }
+    }
+
+    func flushPendingIndexChanges() async {
+        await index.flush()
     }
 
     /// starts a full run when auto backup is on, and a passive reconcile
@@ -302,7 +310,6 @@ final class BackupManager {
         for id in remoteIds { localIdentifierByRemoteId[id] = nil }
         Task { [weak self] in
             guard let self, await self.index.markRemoteEdited(remoteIds) else { return }
-            await self.index.save()
             self.localIdentifierByRemoteId = await self.index.renderableRemoteToLocalMap()
         }
     }
@@ -342,7 +349,6 @@ final class BackupManager {
         } else {
             await index.setPrimaryRemoteId(localId: completion.ticket.localId, completion.remoteId)
         }
-        await index.save()
         adoptedUploads += 1
         localChanged()
     }
@@ -452,7 +458,7 @@ final class BackupManager {
                 try await uploadPhase(pending)
             }
 
-            await index.save()
+            await index.flush()
             if uploadsAllowed {
                 phase = .done(summary)
             } else {
@@ -462,10 +468,10 @@ final class BackupManager {
                 chainFullRun = runAllowsUploads
             }
         } catch is CancellationError {
-            await index.save()
+            await index.flush()
             phase = .idle
         } catch {
-            await index.save()
+            await index.flush()
             if runAllowsUploads {
                 phase = .error(error.localizedDescription)
                 // the backup screen still shows the error; the banner is
@@ -540,10 +546,8 @@ final class BackupManager {
                 if lastFailure == nil { lastFailure = "\(error)" }
                 summary.failed += 1
             }
-            if (i + 1) % 50 == 0 { await index.save() }
             phase = .hashing(done: i + 1, total: toHash.count)
         }
-        await index.save()
     }
 
     /// asks the server about every hashed component we cannot prove yet, then
@@ -587,7 +591,6 @@ final class BackupManager {
                     await index.markUnsupported(localId: localId)
                 }
             }
-            await index.save()
         }
 
         var uploadQueue: [DeviceAsset] = []
@@ -761,9 +764,8 @@ final class BackupManager {
                 ), account: account) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
-                // persisted immediately so a failed still upload resumes here.
+                // recorded immediately so a failed still upload resumes here.
                 await index.setMotionRemoteId(localId: current.localIdentifier, result.id)
-                await index.save()
                 motionRemoteId = result.id
                 if !result.isDuplicate { uploadedSomething = true }
             }
@@ -787,7 +789,6 @@ final class BackupManager {
                     onProgress(current.localIdentifier, fraction)
                 }
                 await index.setPrimaryRemoteId(localId: current.localIdentifier, result.id)
-                await index.save()
                 if !result.isDuplicate { uploadedSomething = true }
             }
             return uploadedSomething ? .uploaded : .duplicate
@@ -857,7 +858,7 @@ final class BackupManager {
             throw ImmichError.http(400, message)
         }
 
-        await index.save()
+        await index.flush()
         await refreshLocalSnapshots()
         guard let remoteID = await index.entry(for: localIdentifier)?.primaryRemoteId else {
             throw SingleAssetBackupError.failed("the server did not return a backup identifier.")
@@ -953,7 +954,7 @@ final class BackupManager {
                 addNext()
             }
         }
-        await index.save()
+        await index.flush()
         await refreshLocalSnapshots()
         if let quotaMessage {
             throw ImmichError.http(400, quotaMessage)
@@ -987,7 +988,7 @@ final class BackupManager {
     func noteLocalDeletion(_ localIds: [String]) {
         Task {
             await index.remove(ids: localIds)
-            await index.save()
+            await index.flush()
             localChanged()
         }
     }
@@ -1043,7 +1044,7 @@ final class BackupManager {
             if detail.isEdited == true {
                 _ = await index.markRemoteEdited([asset.id])
             }
-            await index.save()
+            await index.flush()
             localChanged()
             return localId
         } catch {
@@ -1123,7 +1124,7 @@ final class BackupManager {
             }
             verified.insert(asset.localIdentifier)
         }
-        await index.save()
+        await index.flush()
 
         return CleanupReport(
             eligible: candidates.map(\.localIdentifier).filter { verified.contains($0) },
@@ -1136,7 +1137,7 @@ final class BackupManager {
     func performCleanup(ids: [String]) async throws -> Int {
         try await PhotoLibraryService.delete(localIdentifiers: ids)
         await index.remove(ids: ids)
-        await index.save()
+        await index.flush()
         localChanged()
         return ids.count
     }

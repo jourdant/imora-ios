@@ -89,6 +89,7 @@ struct RootView: View {
                 Task { await LocalNotifications.shared.refreshAuthorization() }
             case .background:
                 session.realtime?.setActive(false)
+                Task { await session.backup?.flushPendingIndexChanges() }
             default:
                 break
             }

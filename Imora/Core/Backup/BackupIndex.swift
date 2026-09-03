@@ -77,6 +77,8 @@ actor BackupIndex {
     /// longer what the server shows, so they must not be rendered.
     private var editedRemoteIds: Set<String> = []
     private var loaded = false
+    private var dirty = false
+    private var flushTask: Task<Void, Never>?
 
     init(fileURL: URL = BackupIndex.defaultFileURL) {
         self.fileURL = fileURL
@@ -91,6 +93,7 @@ actor BackupIndex {
     /// user is discarded - accounts must never share local-to-remote mappings.
     func load(serverHost: String, userId: String) {
         if loaded, serverHost == self.serverHost, userId == self.userId { return }
+        flush()
         self.serverHost = serverHost
         self.userId = userId
         entries = [:]
@@ -110,7 +113,10 @@ actor BackupIndex {
         }
     }
 
-    func save() {
+    func flush() {
+        flushTask?.cancel()
+        flushTask = nil
+        guard dirty else { return }
         let snapshot = Snapshot(
             serverHost: serverHost,
             userId: userId,
@@ -119,8 +125,28 @@ actor BackupIndex {
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+            dirty = false
+        } catch {
+            return
+        }
+    }
+
+    private func markDirty() {
+        dirty = true
+        guard flushTask == nil else { return }
+        flushTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            flushTask = nil
+            flush()
+        }
     }
 
     func entry(for localId: String) -> BackupEntry? {
@@ -162,6 +188,7 @@ actor BackupIndex {
         if let remoteId = entry.primaryRemoteId {
             remoteToLocal[remoteId] = localId
         }
+        markDirty()
     }
 
     func setPrimaryRemoteId(localId: String, _ remoteId: String) {
@@ -172,6 +199,7 @@ actor BackupIndex {
         entry.primaryRemoteId = remoteId
         entries[localId] = entry
         remoteToLocal[remoteId] = localId
+        markDirty()
     }
 
     func clearPrimaryRemoteId(localId: String) {
@@ -181,33 +209,40 @@ actor BackupIndex {
         }
         entry.primaryRemoteId = nil
         entries[localId] = entry
+        markDirty()
     }
 
     func setMotionRemoteId(localId: String, _ remoteId: String) {
         guard var entry = entries[localId] else { return }
         entry.motionRemoteId = remoteId
         entries[localId] = entry
+        markDirty()
     }
 
     func clearMotionRemoteId(localId: String) {
         guard var entry = entries[localId] else { return }
         entry.motionRemoteId = nil
         entries[localId] = entry
+        markDirty()
     }
 
     func markUnsupported(localId: String) {
         guard var entry = entries[localId] else { return }
         entry.unsupported = true
         entries[localId] = entry
+        markDirty()
     }
 
     func remove(ids: [String]) {
+        var changed = false
         for localId in ids {
-            if let remoteId = entries[localId]?.primaryRemoteId {
+            guard let entry = entries.removeValue(forKey: localId) else { continue }
+            if let remoteId = entry.primaryRemoteId {
                 remoteToLocal[remoteId] = nil
             }
-            entries[localId] = nil
+            changed = true
         }
+        if changed { markDirty() }
     }
 
     /// drops entries for assets no longer on the device. only ever called after a
@@ -241,6 +276,7 @@ actor BackupIndex {
         let known = remoteIds.filter { remoteToLocal[$0] != nil }
         guard !known.isSubset(of: editedRemoteIds) else { return false }
         editedRemoteIds.formUnion(known)
+        markDirty()
         return true
     }
 
