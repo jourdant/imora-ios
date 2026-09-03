@@ -25,6 +25,7 @@ final class SessionStore {
     private(set) var realtime: RealtimeHub?
     private(set) var notifications: NotificationInbox?
     private(set) var preferences: UserPreferences?
+    private(set) var loginNotice: String?
     /// Keeps a newly selected avatar visible while the server accepts and
     /// re-caches the same bytes. A rejected upload restores the prior value.
     var optimisticProfileImageData: Data? {
@@ -44,6 +45,7 @@ final class SessionStore {
 
     private static let serverKey = "imora.serverURL"
     private static let tokenKey = "accessToken"
+    private static let loginNoticeDefaultsKey = "imora.loginNotice"
     private static let profileImageCacheKeyDefaultsKey = "imora.profileImageCacheKey"
 
     var serverURL: URL? {
@@ -55,6 +57,7 @@ final class SessionStore {
     /// server confirms them in the background. an expired token only shows
     /// once the refresh comes back 401.
     init() {
+        loginNotice = UserDefaults.standard.string(forKey: Self.loginNoticeDefaultsKey)
         profileImageCacheKey = UserDefaults.standard.string(
             forKey: Self.profileImageCacheKeyDefaultsKey
         )
@@ -78,6 +81,17 @@ final class SessionStore {
         case .unavailable:
             return
         }
+        guard ImmichClient.supportsTransport(to: apiURL) else {
+            KeychainStore.delete(Self.tokenKey)
+            SessionCache.clear()
+            ShareTransfer.defaults?.removeObject(forKey: ShareTransfer.serverURLKey)
+            ShareTransfer.defaults?.removeObject(forKey: ShareTransfer.deviceIdKey)
+            let notice = "Your saved server uses HTTP outside your local network. Sign in again with HTTPS or a local-network address."
+            loginNotice = notice
+            UserDefaults.standard.set(notice, forKey: Self.loginNoticeDefaultsKey)
+            state = .loggedOut
+            return
+        }
         // re-setting moves tokens from before keychain sharing into the app
         // group access group, and the mirror keeps the extension current.
         KeychainStore.set(token, for: Self.tokenKey)
@@ -89,6 +103,8 @@ final class SessionStore {
     }
 
     func logIn(apiURL: URL, response: LoginResponse) async {
+        loginNotice = nil
+        UserDefaults.standard.removeObject(forKey: Self.loginNoticeDefaultsKey)
         UserDefaults.standard.set(apiURL, forKey: Self.serverKey)
         KeychainStore.set(response.accessToken, for: Self.tokenKey)
         mirrorForShareExtension(apiURL: apiURL)
@@ -96,6 +112,12 @@ final class SessionStore {
         let client = ImmichClient(apiURL: apiURL, accessToken: response.accessToken)
         let user = try? await client.currentUser()
         adopt(client: client, user: user)
+    }
+
+    func consumeLoginNotice() -> String? {
+        defer { loginNotice = nil }
+        UserDefaults.standard.removeObject(forKey: Self.loginNoticeDefaultsKey)
+        return loginNotice
     }
 
     func logOut(reportRemoteFailure: Bool = true) async {

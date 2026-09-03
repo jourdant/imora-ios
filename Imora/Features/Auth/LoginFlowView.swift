@@ -5,6 +5,7 @@ private let brandTint = Color(.brandTint)
 
 struct LoginFlowView: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
 
     private enum Step: Equatable {
         case server
@@ -57,6 +58,15 @@ struct LoginFlowView: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .background(Color(.systemBackground))
+        .onAppear { presentLoginNoticeIfNeeded() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { presentLoginNoticeIfNeeded() }
+        }
+    }
+
+    private func presentLoginNoticeIfNeeded() {
+        guard scenePhase == .active, errorMessage == nil else { return }
+        errorMessage = session.consumeLoginNotice()
     }
 
     private var header: some View {
@@ -116,6 +126,17 @@ struct LoginFlowView: View {
     private var oauthAvailable: Bool { features?.oauth ?? false }
 
     @ViewBuilder private var credentialsForm: some View {
+        if case .credentials(let apiURL) = step,
+           apiURL.scheme?.lowercased() == "http" {
+            Label(
+                "This local connection is not encrypted. Your password and session token are visible to devices on the network.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
         if passwordLoginAvailable {
             AuthField(
                 systemImage: "envelope",

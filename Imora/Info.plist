@@ -10,7 +10,7 @@
 	<string>$(IMORA_APP_GROUP)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
+		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
 	<key>UIBackgroundModes</key>

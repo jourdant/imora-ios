@@ -3,6 +3,7 @@ import Synchronization
 
 nonisolated enum ImmichError: LocalizedError {
     case invalidURL
+    case insecureTransport
     case unreachable
     case http(Int, String)
     case decoding(String)
@@ -10,6 +11,7 @@ nonisolated enum ImmichError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL: "the server address is not a valid url."
+        case .insecureTransport: "the server must use https unless it is on your local network."
         case .unreachable: "could not reach the server. check the address and your connection."
         case .http(let code, let message):
             switch code {
@@ -65,6 +67,7 @@ nonisolated final class ImmichClient: Sendable {
         if !raw.contains("://") { raw = "https://" + raw }
         while raw.hasSuffix("/") { raw.removeLast() }
         guard var url = URL(string: raw), url.host() != nil else { throw ImmichError.invalidURL }
+        guard supportsTransport(to: url) else { throw ImmichError.insecureTransport }
 
         let probe = URLSession(configuration: .ephemeral)
         // if the user already pointed at /api, trust it after a ping.
@@ -79,8 +82,56 @@ nonisolated final class ImmichClient: Sendable {
         } else {
             url = url.appending(path: "api")
         }
+        guard supportsTransport(to: url) else { throw ImmichError.insecureTransport }
         guard await ping(url, session: probe) else { throw ImmichError.unreachable }
         return url
+    }
+
+    static func supportsTransport(to url: URL) -> Bool {
+        switch url.scheme?.lowercased() {
+        case "https":
+            return true
+        case "http":
+            guard let host = url.host() else { return false }
+            return isLocalNetworkHost(host)
+        default:
+            return false
+        }
+    }
+
+    private static func isLocalNetworkHost(_ rawHost: String) -> Bool {
+        let host = rawHost
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        if host == "localhost"
+            || host.hasSuffix(".local")
+            || !host.contains(".") && !host.contains(":") {
+            return true
+        }
+
+        let components = host.split(separator: ".", omittingEmptySubsequences: false)
+        let octets = components.compactMap { UInt8($0) }
+        if components.count == 4, octets.count == 4 {
+            return octets[0] == 10
+                || octets[0] == 127
+                || octets[0] == 169 && octets[1] == 254
+                || octets[0] == 172 && (16...31).contains(octets[1])
+                || octets[0] == 192 && octets[1] == 168
+        }
+
+        let address = host.split(separator: "%", maxSplits: 1).first.map(String.init) ?? host
+        if address == "::1" { return true }
+        if address.hasPrefix("::ffff:") {
+            return isLocalNetworkHost(String(address.dropFirst("::ffff:".count)))
+        }
+        guard let firstComponent = address.split(
+            separator: ":",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        ).first,
+            let first = UInt16(firstComponent, radix: 16)
+        else { return false }
+        return first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
     }
 
     private static func fetchWellKnown(base: URL, session: URLSession) async throws -> URL? {
