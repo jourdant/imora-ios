@@ -38,6 +38,9 @@ struct LibraryTab: View {
                     NavigationLink(value: LibraryDestination.archive) {
                         Label("Archive", systemImage: "archivebox")
                     }
+                    NavigationLink(value: LibraryDestination.locked) {
+                        Label("Locked Folder", systemImage: "lock")
+                    }
                     if session.features?.trash != false {
                         NavigationLink(value: LibraryDestination.trash) {
                             Label("Trash", systemImage: "trash")
@@ -77,6 +80,11 @@ struct LibraryTab: View {
                 if phase == .active, !people.isEmpty {
                     Task { await loadPeople() }
                 }
+            }
+            // popping out of the locked folder locks it, on top of the
+            // folder's own disappearance.
+            .onChange(of: path.count) { _, _ in
+                session.lockedFolder?.lock()
             }
         }
     }
@@ -217,6 +225,7 @@ nonisolated enum LibraryDestination: Hashable {
     case places
     case people
     case archive
+    case locked
     case trash
 }
 
@@ -247,6 +256,8 @@ struct LibraryDestinationScreen: View {
             PlacesScreen()
         case .people:
             PeopleScreen()
+        case .locked:
+            LockedFolderScreen()
         case .trash:
             TrashScreen()
         }

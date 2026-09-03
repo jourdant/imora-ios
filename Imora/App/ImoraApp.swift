@@ -89,9 +89,22 @@ struct RootView: View {
                 // what surfaces anything raised in the meantime.
                 Task { await session.notifications?.load() }
                 Task { await LocalNotifications.shared.refreshAuthorization() }
+                PrivacyShieldWindow.shared.hide()
+                // an inactive-only excursion keeps the folder open, so the
+                // server's expiry is re-read on the way back.
+                if session.lockedFolder?.isUnlocked == true {
+                    Task { await session.lockedFolder?.refreshStatus() }
+                }
             case .background:
                 session.realtime?.setActive(false)
+                session.lockedFolder?.lock()
                 Task { await session.backup?.flushPendingIndexChanges() }
+            case .inactive:
+                // the shield stays up through the background lock, so the
+                // app switcher snapshot never holds the grid.
+                if let locked = session.lockedFolder, locked.isUnlocked, locked.isScreenVisible {
+                    PrivacyShieldWindow.shared.show()
+                }
             default:
                 break
             }

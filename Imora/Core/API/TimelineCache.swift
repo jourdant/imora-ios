@@ -39,9 +39,12 @@ nonisolated enum TimelineCache {
 
     /// only the grids reachable straight from a launch are cached. album,
     /// person and map grids are opened deliberately and would leave files
-    /// behind for every one ever visited.
+    /// behind for every one ever visited. the locked folder never touches
+    /// disk, the pin being the whole point.
     static func key(for filter: TimelineFilter) -> String? {
-        guard filter.albumId == nil, filter.personId == nil, filter.bbox == nil, filter.userId == nil else {
+        guard filter.albumId == nil, filter.personId == nil, filter.bbox == nil, filter.userId == nil,
+              filter.visibility != .locked
+        else {
             return nil
         }
         let parts = filter.queryItems.map { "\($0.name)=\($0.value ?? "")" }

@@ -173,6 +173,32 @@ nonisolated final class ImmichClient: Sendable {
         _ = try await send(path: "auth/logout", method: "POST") as Data
     }
 
+    // MARK: - locked folder session
+
+    func authStatus() async throws -> AuthStatus { try await get("auth/status") }
+
+    /// elevates this session; a wrong pin comes back as a 4xx.
+    func unlockSession(pinCode: String) async throws {
+        try await mutate("auth/session/unlock", method: "POST", body: ["pinCode": pinCode])
+    }
+
+    func lockSession() async throws {
+        try await mutate("auth/session/lock", method: "POST", body: Optional<Int>.none)
+    }
+
+    func setupPinCode(_ pinCode: String) async throws {
+        try await mutate("auth/pin-code", method: "POST", body: ["pinCode": pinCode])
+    }
+
+    func changePinCode(current: String, new: String) async throws {
+        try await mutate("auth/pin-code", method: "PUT", body: ["pinCode": current, "newPinCode": new])
+    }
+
+    /// the reset needs the account password, the pin being what was forgotten.
+    func resetPinCode(password: String) async throws {
+        try await mutate("auth/pin-code", method: "DELETE", body: ["password": password])
+    }
+
     // MARK: - oauth
 
     /// unauthenticated fetch used by the login screen to pick the sign-in method.

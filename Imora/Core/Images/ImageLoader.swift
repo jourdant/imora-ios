@@ -48,6 +48,12 @@ nonisolated final class ImageLoader: Sendable {
         authorization.headers.withLock { $0 = headers }
     }
 
+    /// keeps these assets' bytes out of the disk cache from now on. the
+    /// locked folder registers its assets so the pin protects them at rest.
+    func markEphemeral(assetIDs: [String]) {
+        authorization.ephemeralAssetIDs.withLock { $0.formUnion(assetIDs) }
+    }
+
     func requestKey(for url: URL, targetPixelSize: CGFloat) -> String {
         "\(url.absoluteString)#\(Self.normalizedPixelSize(targetPixelSize))"
     }
@@ -182,6 +188,25 @@ nonisolated final class ImageLoader: Sendable {
 /// signing back in still hits a warm cache.
 private final class AuthorizingDelegate: ImagePipeline.Delegate {
     let headers = Mutex<[String: String]>([:])
+    let ephemeralAssetIDs = Mutex<Set<String>>([])
+
+    /// nuke asks before every disk read and write; nil keeps a locked asset
+    /// memory only.
+    nonisolated func dataCache(for request: ImageRequest, pipeline: ImagePipeline) -> (any DataCaching)? {
+        if let id = Self.assetID(in: request.url), ephemeralAssetIDs.withLock({ $0.contains(id) }) {
+            return nil
+        }
+        return pipeline.configuration.dataCache
+    }
+
+    /// the asset id follows the assets segment in every media url.
+    private nonisolated static func assetID(in url: URL?) -> String? {
+        guard let components = url?.pathComponents,
+              let index = components.firstIndex(of: "assets"),
+              components.indices.contains(index + 1)
+        else { return nil }
+        return components[index + 1]
+    }
 
     @ImagePipelineActor
     func willLoadData(

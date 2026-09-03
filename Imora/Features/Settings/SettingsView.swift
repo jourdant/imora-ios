@@ -60,6 +60,13 @@ struct SettingsView: View {
                     .accessibilityIdentifier("settings-privacy")
 
                     NavigationLink {
+                        LockedFolderSettingsScreen()
+                    } label: {
+                        Label("Locked Folder", systemImage: "lock")
+                    }
+                    .accessibilityIdentifier("settings-locked-folder")
+
+                    NavigationLink {
                         StorageScreen()
                     } label: {
                         Label("Storage", systemImage: "internaldrive")

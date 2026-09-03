@@ -115,6 +115,17 @@ nonisolated struct ServerFeatures: Codable {
     let email: Bool?
 }
 
+/// GET /auth/status. pinCode and password say whether the account has one,
+/// isElevated whether this session may read locked assets, and pinExpiresAt
+/// when that elevation lapses.
+nonisolated struct AuthStatus: Decodable, Sendable {
+    let isElevated: Bool
+    let pinCode: Bool
+    let password: Bool
+    let expiresAt: String?
+    let pinExpiresAt: String?
+}
+
 nonisolated struct ServerConfig: Codable {
     let oauthButtonText: String?
     let loginPageMessage: String?

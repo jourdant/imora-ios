@@ -379,6 +379,7 @@
 				INFOPLIST_FILE = Imora/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Imora;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Imora uses Face ID to open your locked folder without typing the PIN.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Imora connects to your Immich server, which is often a machine on your own network.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Imora shows where you are on the photo map. Your location never leaves the device.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Imora backs up your photo library to your Immich server and removes device copies only when you ask it to.";
@@ -426,6 +427,7 @@
 				INFOPLIST_FILE = Imora/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Imora;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Imora uses Face ID to open your locked folder without typing the PIN.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Imora connects to your Immich server, which is often a machine on your own network.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Imora shows where you are on the photo map. Your location never leaves the device.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Imora backs up your photo library to your Immich server and removes device copies only when you ask it to.";

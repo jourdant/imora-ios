@@ -357,6 +357,9 @@ final class TimelineModel {
     private(set) var firstAssetIDByRowID: [String: String] = [:]
     private(set) var isLoading = false
     private(set) var loadError: String?
+    /// the locked grid re-gates on a rejected elevation instead of showing
+    /// the login wording the 401 description carries.
+    @ObservationIgnored var onUnauthorized: (() -> Void)?
     private(set) var flatAssets: [Asset] = []
     private(set) var projectedRemovalIDs = Set<String>()
     /// bumped when flat asset ordering changes. metadata patches keep the
@@ -541,8 +544,20 @@ final class TimelineModel {
         } catch is CancellationError {
             return
         } catch {
+            noteRejection(error)
             loadError = error.localizedDescription
         }
+    }
+
+    private func noteRejection(_ error: Error) {
+        guard case ImmichError.http(let status, _) = error, status == 401 || status == 403 else { return }
+        onUnauthorized?()
+    }
+
+    /// locked assets stay out of the thumbnail disk cache.
+    private func markEphemeralIfLocked(_ assets: [Asset]) {
+        guard filter.visibility == .locked else { return }
+        ImageLoader.shared.markEphemeral(assetIDs: assets.map(\.id))
     }
 
     /// the first merge of a launch. its rebuild skips the debounce: nothing
@@ -726,6 +741,7 @@ final class TimelineModel {
             else { return }
             guard let resolution = mutationOverlay.resolve(assets, for: fetch) else { return }
             staleBucketIDs.remove(id)
+            markEphemeralIfLocked(resolution.assets)
             let days = Self.groupByDay(
                 resolution.assets,
                 byUploadDate: filter.groupsByUploadDate
@@ -745,6 +761,7 @@ final class TimelineModel {
         } catch is CancellationError {
             // leave the placeholder; a retry happens next time it scrolls in.
         } catch {
+            noteRejection(error)
             // offline, most likely. the disk copy beats an empty placeholder,
             // and a live retry happens next time the row scrolls into view.
             await fallBackToCachedBucket(id)
@@ -1354,6 +1371,7 @@ final class TimelineModel {
                    let resolution = mutationOverlay.resolve(assets, for: fetch),
                    let index = sections.firstIndex(where: { $0.id == id }) {
                     staleBucketIDs.remove(id)
+                    markEphemeralIfLocked(resolution.assets)
                     let days = Self.groupByDay(
                         resolution.assets,
                         byUploadDate: filter.groupsByUploadDate
@@ -1375,6 +1393,7 @@ final class TimelineModel {
             scheduleRebuild(animated: true)
         } catch {
             // stale is fine; the next event, tick or foreground pass retries.
+            noteRejection(error)
         }
     }
 

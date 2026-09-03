@@ -1320,6 +1320,34 @@ final class AssetViewerHostingController: UIHostingController<AnyView>, UIAdapti
         scheduleViewerRootInstallation(after: .milliseconds(4))
     }
 
+    /// closes every viewer the app has up. the locked folder calls this when
+    /// it locks: its viewer is a uikit modal that outlives the swiftui grid
+    /// it was opened from.
+    static func dismissPresentedViewers() {
+        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+            for window in scene.windows {
+                guard let root = window.rootViewController else { continue }
+                for viewer in viewers(under: root) {
+                    viewer.requestDismissal()
+                }
+            }
+        }
+    }
+
+    private static func viewers(under controller: UIViewController) -> [AssetViewerHostingController] {
+        var found: [AssetViewerHostingController] = []
+        if let viewer = controller as? AssetViewerHostingController {
+            found.append(viewer)
+        }
+        if let presented = controller.presentedViewController {
+            found += viewers(under: presented)
+        }
+        for child in controller.children {
+            found += viewers(under: child)
+        }
+        return found
+    }
+
     func requestDismissal() {
         guard phase == .presenting || phase == .presented else { return }
         guard !dismissalRequested else { return }

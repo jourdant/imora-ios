@@ -471,6 +471,8 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
     /// opening it, and nothing else on a tile responds. person pages choose a
     /// featured photo this way.
     var onPickAsset: ((Asset) -> Void)?
+    /// the locked folder re-gates when the server refuses its elevation.
+    var onUnauthorized: (() -> Void)?
     @Binding private var navigationTarget: TimelineNavigationTarget?
     @Binding private var serverCommand: TimelineServerCommand?
     let header: Header
@@ -538,6 +540,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         onAlbumAssetCountDelta: ((Int) -> Void)? = nil,
         onSetAlbumCover: ((String) async -> Bool)? = nil,
         onPickAsset: ((Asset) -> Void)? = nil,
+        onUnauthorized: (() -> Void)? = nil,
         navigationTarget: Binding<TimelineNavigationTarget?> = .constant(nil),
         serverCommand: Binding<TimelineServerCommand?> = .constant(nil),
         @ToolbarContentBuilder trailingItems: () -> Trailing = {
@@ -556,6 +559,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         self.onAlbumAssetCountDelta = onAlbumAssetCountDelta
         self.onSetAlbumCover = onSetAlbumCover
         self.onPickAsset = onPickAsset
+        self.onUnauthorized = onUnauthorized
         _navigationTarget = navigationTarget
         _serverCommand = serverCommand
         self.trailingItems = trailingItems()
@@ -1080,6 +1084,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                         model: weakModel, context: context, position: position
                     )
                 }
+                model.onUnauthorized = onUnauthorized
                 await model.load()
                 await revealPendingTimelineTarget()
             }

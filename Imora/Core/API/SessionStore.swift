@@ -23,6 +23,7 @@ final class SessionStore {
     private(set) var features: ServerFeatures?
     private(set) var backup: BackupManager?
     private(set) var realtime: RealtimeHub?
+    private(set) var lockedFolder: LockedFolderSession?
     private(set) var notifications: NotificationInbox?
     private(set) var preferences: UserPreferences?
     private(set) var loginNotice: String?
@@ -127,6 +128,8 @@ final class SessionStore {
         SessionCache.clear()
         realtime?.shutdown()
         realtime = nil
+        lockedFolder?.shutdown()
+        lockedFolder = nil
         backup?.shutdown()
         backup = nil
         notifications?.clear()
@@ -323,6 +326,7 @@ final class SessionStore {
         }
         self.client = client
         self.user = user
+        lockedFolder = LockedFolderSession(client: client)
         ImageLoader.shared.configure(headers: client.authHeaders)
         let backup = BackupManager(client: client)
         backup.userId = user?.id

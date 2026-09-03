@@ -12,11 +12,11 @@ struct MainTabView: View {
     enum TabKey: Hashable {
         case photos, albums, library, search
         /// the library's destinations as sidebar entries of their own.
-        case favorites, people, places, archive, trash
+        case favorites, people, places, archive, locked, trash
 
         var isLibrarySection: Bool {
             switch self {
-            case .favorites, .people, .places, .archive, .trash: true
+            case .favorites, .people, .places, .archive, .locked, .trash: true
             case .photos, .albums, .library, .search: false
             }
         }
@@ -82,6 +82,9 @@ struct MainTabView: View {
                         Tab("Archive", systemImage: "archivebox", value: TabKey.archive) {
                             LibrarySectionTab(destination: .archive)
                         }
+                        Tab("Locked Folder", systemImage: "lock", value: TabKey.locked) {
+                            LibrarySectionTab(destination: .locked)
+                        }
                         if session.features?.trash != false {
                             Tab("Trash", systemImage: "trash", value: TabKey.trash) {
                                 LibrarySectionTab(destination: .trash)
@@ -99,6 +102,11 @@ struct MainTabView: View {
             // a section tab selected at regular width has nowhere to go once
             // the sidebar folds away, so the library list takes over.
             if !shows, selection.isLibrarySection { selection = .library }
+        }
+        // leaving the locked folder for another tab locks it, whether or
+        // not the folder's own disappearance fires on this tab style.
+        .onChange(of: selection) { _, _ in
+            session.lockedFolder?.lock()
         }
         .sheet(isPresented: $router.showsInbox) {
             NotificationsScreen()
