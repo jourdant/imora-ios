@@ -1006,6 +1006,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                     ToolbarItem(placement: .topBarTrailing) {
                         SelectionMoreMenu(
                             filter: filter,
+                            count: selection.count,
                             isDisabled: isSelectionWorking || selection.isEmpty,
                             serverActionsDisabled: selectionHasLocalAssets,
                             onFavorite: { await applyFavorite() },
@@ -1015,6 +1016,9 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                                 ? { await applySetAlbumCover() }
                                 : nil,
                             onAddToAlbum: { pendingAlbumAssets = Array(selection) },
+                            onLock: filter.visibility == .locked ? nil : { await applyLock() },
+                            onUnlock: filter.visibility == .locked ? { await applyVisibility(.timeline) } : nil,
+                            lockDeletesDeviceCopies: selectionHasDeviceCopies,
                             onBackUp: selectionHasLocalAssets ? applyBackup : nil,
                             backUpTitle: isBackupOnlySelection ? "Back Up" : "Back Up Missing"
                         )
@@ -1452,6 +1456,24 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 Task { _ = await setVisibility(ids: [serverID], isArchived ? .timeline : .archive) }
             })
         }
+        if availability.canLock, serverID != nil {
+            primary.append(UIAction(
+                title: "Move to Locked Folder",
+                image: UIImage(systemName: "lock"),
+                attributes: mutationAttributes
+            ) { _ in
+                Task { _ = await lockAssets([asset]) }
+            })
+        }
+        if availability.canUnlock, let serverID {
+            primary.append(UIAction(
+                title: "Remove from Locked Folder",
+                image: UIImage(systemName: "lock.open"),
+                attributes: mutationAttributes
+            ) { _ in
+                Task { _ = await setVisibility(ids: [serverID], .timeline) }
+            })
+        }
 
         var transfer: [UIMenuElement] = []
         transfer.append(UIAction(title: "Share", image: UIImage(systemName: "square.and.arrow.up")) { _ in
@@ -1473,7 +1495,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 })
             }
         }
-        if let serverID, !asset.isTrashed {
+        if let serverID, !asset.isTrashed, !availability.isLocked {
             transfer.append(UIAction(title: "Open in Browser", image: UIImage(systemName: "safari")) { _ in
                 Task { await openInBrowser(serverID: serverID) }
             })
@@ -1995,15 +2017,82 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             ErrorToastCenter.shared.show("The server is not available.")
             return false
         }
+        let errorMessage: String
+        switch value {
+        case .locked:
+            errorMessage = "Couldn’t move to the locked folder"
+        case .archive:
+            errorMessage = "Couldn’t archive"
+        case .timeline where filter.visibility == .locked:
+            errorMessage = "Couldn’t remove from the locked folder"
+        default:
+            errorMessage = "Couldn’t unarchive"
+        }
         var removal: TimelineRemoval?
         let result: Void? = await OptimisticAction.perform(
-            errorMessage: value == .archive ? "Couldn’t archive" : "Couldn’t unarchive",
+            errorMessage: errorMessage,
             apply: { removal = model.removeAssetsForOptimisticAction(ids: requestedIDs) },
             rollback: { if let removal { model.restore(removal) } },
             request: { try await client.setVisibility(ids: ids, value) },
             commit: { _ in if let removal { model.commit(removal) } }
         )
         return result != nil
+    }
+
+    /// device first, like deleteAssets: the folder would otherwise keep
+    /// showing through the device copy in the merged grid, and a declined
+    /// system dialog leaves the server untouched.
+    @discardableResult
+    private func lockAssets(_ assets: [Asset]) async -> Bool {
+        guard let client = session.client else {
+            ErrorToastCenter.shared.show("The server is not available.")
+            return false
+        }
+        let ids = assets.filter { !$0.isLocal }.map(\.id)
+        let requestedIDs = Set(ids)
+        guard beginServerMutation(ids: requestedIDs) else { return false }
+        defer { finishServerMutation(ids: requestedIDs) }
+
+        var localIDs = Set<String>()
+        for asset in assets where !asset.isLocal {
+            if let localID = pairedLocalIdentifier(for: asset) {
+                localIDs.insert(localID)
+            } else if let backup = session.backup,
+                      let localID = await backup.localIdentifier(forRemote: asset.id) {
+                localIDs.insert(localID)
+            }
+        }
+        if !localIDs.isEmpty {
+            do {
+                try await PhotoLibraryService.delete(localIdentifiers: Array(localIDs))
+            } catch {
+                if !PhotoLibraryService.isUserCancelled(error) {
+                    ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
+                }
+                return false
+            }
+            session.backup?.noteLocalDeletion(Array(localIDs))
+            for id in ids { downloadedLocalIdentifiers[id] = nil }
+        }
+
+        var removal: TimelineRemoval?
+        let result: Void? = await OptimisticAction.perform(
+            errorMessage: localIDs.isEmpty
+                ? "Couldn’t move to the locked folder"
+                : "Deleted from this device, but couldn’t move to the locked folder",
+            apply: { removal = model.removeAssetsForOptimisticAction(ids: requestedIDs) },
+            rollback: { if let removal { model.restore(removal) } },
+            request: { try await client.setVisibility(ids: ids, .locked) },
+            commit: { _ in if let removal { model.commit(removal) } }
+        )
+        return result != nil
+    }
+
+    /// whether locking the selection would also delete device copies.
+    private func selectionHasDeviceCopies() -> Bool {
+        model.flatAssets.contains { asset in
+            !asset.isLocal && selection.contains(asset.id) && pairedLocalIdentifier(for: asset) != nil
+        }
     }
 
     private func backUp(localID: String) async {
@@ -2219,7 +2308,14 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
 
     private func applyTrash() async {
         let selected = model.flatAssets.filter { selection.contains($0.id) && isSelectable($0) }
-        guard await deleteAssets(selected, force: filter.isTrashed == true) else { return }
+        let force = filter.isTrashed == true || filter.visibility == .locked
+        guard await deleteAssets(selected, force: force) else { return }
+        exitSelection()
+    }
+
+    private func applyLock() async {
+        let selected = model.flatAssets.filter { selection.contains($0.id) && !$0.isLocal }
+        guard await lockAssets(selected) else { return }
         exitSelection()
     }
 

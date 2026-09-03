@@ -208,12 +208,16 @@ private enum ViewerConfirmation: Identifiable {
     case trash
     case deletePermanently
     case deleteFromDevice
+    case moveToLocked
+    case removeFromLocked
 
     var id: Int {
         switch self {
         case .trash: 0
         case .deletePermanently: 1
         case .deleteFromDevice: 2
+        case .moveToLocked: 3
+        case .removeFromLocked: 4
         }
     }
 }
@@ -277,7 +281,7 @@ private struct AssetInformationSheet: View {
             AssetInfoPanel(
                 asset: asset,
                 onDateAdjusted: onDateAdjusted,
-                onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+                onAddToAlbum: serverAssetID == nil || asset.visibility == .locked ? nil : { showAddToAlbum = true },
                 onOpenPerson: onOpenPerson,
                 onOpenAlbum: onOpenAlbum,
                 albumMembershipUpdate: albumMembershipUpdate
@@ -333,7 +337,7 @@ private struct AssetInformationPanel: View {
             showsHeader: false,
             isRevealed: isRevealed,
             onDateAdjusted: onDateAdjusted,
-            onAddToAlbum: serverAssetID == nil ? nil : { showAddToAlbum = true },
+            onAddToAlbum: serverAssetID == nil || asset.visibility == .locked ? nil : { showAddToAlbum = true },
             onOpenPerson: onOpenPerson,
             onOpenAlbum: onOpenAlbum,
             albumMembershipUpdate: albumMembershipUpdate
@@ -1508,6 +1512,8 @@ struct AssetViewerScreen: View {
                 localToolbarItems(current)
             } else if current.isTrashed {
                 trashedToolbarItems
+            } else if current.visibility == .locked {
+                lockedToolbarItems(current)
             } else {
                 remoteToolbarItems(current)
             }
@@ -1607,6 +1613,76 @@ struct AssetViewerScreen: View {
                 } label: {
                     Image(systemName: "trash")
                 }
+                .modifier(confirmationDialog(from: .toolbar))
+            }
+        }
+    }
+
+    /// the locked folder keeps share, favorite, info and edit; delete is
+    /// permanent there, the trash never showing a locked asset.
+    @ToolbarContentBuilder private func lockedToolbarItems(_ current: Asset) -> some ToolbarContent {
+        ToolbarItem(placement: .bottomBar) {
+            Button {
+                shareRequest = AssetShareRequest(assets: [current])
+            } label: {
+                Image(systemName: "square.and.arrow.up")
+            }
+            .accessibilityLabel("Share")
+            .accessibilityIdentifier("viewer-share")
+        }
+
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+
+        if actionAvailability?.canFavorite == true {
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    Task { await toggleFavorite() }
+                } label: {
+                    Image(systemName: current.isFavorite ? "heart.fill" : "heart")
+                        .contentTransition(.symbolEffect(.replace))
+                        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: current.isFavorite)
+                }
+                .accessibilityLabel(current.isFavorite ? "Remove from Favorites" : "Add to Favorites")
+                .accessibilityIdentifier("viewer-favorite")
+                .disabled(mutatingAssetIDs.contains(current.id))
+            }
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+        }
+
+        ToolbarItem(placement: .bottomBar) {
+            Button {
+                toggleInfo()
+            } label: {
+                Image(systemName: informationControlIsPresented ? "info.circle.fill" : "info.circle")
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .accessibilityLabel(informationControlIsPresented ? "Hide Info" : "Show Info")
+            .accessibilityIdentifier("viewer-info")
+        }
+
+        if actionAvailability?.canEdit == true {
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    showEditor = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                }
+                .accessibilityLabel("Edit")
+                .accessibilityIdentifier("viewer-edit")
+                .disabled(optimisticEdits[current.id] != nil)
+            }
+        }
+
+        if actionAvailability?.canDeletePermanently == true {
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    ask(.deletePermanently, from: .toolbar)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .accessibilityLabel("Delete Permanently")
                 .modifier(confirmationDialog(from: .toolbar))
             }
         }
@@ -1714,7 +1790,7 @@ struct AssetViewerScreen: View {
                         }
                         .accessibilityIdentifier("viewer-view-in-timeline")
                     }
-                    if serverAssetID != nil, (current.isLocal || ownsCurrent) {
+                    if actionAvailability?.canShareLink == true {
                         Button { showShareLinks = true } label: {
                             Label("Share Link", systemImage: "link")
                         }
@@ -1726,6 +1802,16 @@ struct AssetViewerScreen: View {
                     Section {
                         Button { Task { await openInBrowser() } } label: {
                             Label("Open in Browser", systemImage: "safari")
+                        }
+                    }
+                } else if current.visibility == .locked {
+                    // nothing that would surface a locked asset elsewhere.
+                    Section {
+                        Button { airPlayTrigger += 1 } label: {
+                            Label("Cast", systemImage: "airplay.video")
+                        }
+                        if actionAvailability?.canDownload == true {
+                            downloadMenuItem
                         }
                     }
                 } else if !current.isTrashed {
@@ -1753,17 +1839,7 @@ struct AssetViewerScreen: View {
                             .disabled(session.isProfileImageMutationInFlight)
                         }
                         if actionAvailability?.canDownload == true {
-                            if downloading {
-                                Button {} label: {
-                                    Label("Downloading…", systemImage: "arrow.down.circle.dotted")
-                                }
-                                .disabled(true)
-                            } else {
-                                Button { Task { await download() } } label: {
-                                    Label("Download to Device", systemImage: "arrow.down.circle")
-                                }
-                                .accessibilityIdentifier("viewer-download")
-                            }
+                            downloadMenuItem
                         }
                         Button { Task { await openInBrowser() } } label: {
                             Label("Open in Browser", systemImage: "safari")
@@ -1779,6 +1855,26 @@ struct AssetViewerScreen: View {
                                 systemImage: current.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
                             )
                         }
+                    }
+                }
+
+                if actionAvailability?.canLock == true {
+                    Section {
+                        Button { ask(.moveToLocked, from: .menu) } label: {
+                            Label("Move to Locked Folder", systemImage: "lock")
+                        }
+                        .accessibilityIdentifier("viewer-lock")
+                        .disabled(mutatingAssetIDs.contains(current.id))
+                    }
+                }
+
+                if actionAvailability?.canUnlock == true {
+                    Section {
+                        Button { ask(.removeFromLocked, from: .menu) } label: {
+                            Label("Remove from Locked Folder", systemImage: "lock.open")
+                        }
+                        .accessibilityIdentifier("viewer-unlock")
+                        .disabled(mutatingAssetIDs.contains(current.id))
                     }
                 }
 
@@ -1820,6 +1916,20 @@ struct AssetViewerScreen: View {
         }
         // the dialog anchors to the menu button, not to the vanished menu item.
         .modifier(confirmationDialog(from: .menu))
+    }
+
+    @ViewBuilder private var downloadMenuItem: some View {
+        if downloading {
+            Button {} label: {
+                Label("Downloading…", systemImage: "arrow.down.circle.dotted")
+            }
+            .disabled(true)
+        } else {
+            Button { Task { await download() } } label: {
+                Label("Download to Device", systemImage: "arrow.down.circle")
+            }
+            .accessibilityIdentifier("viewer-download")
+        }
     }
 
     @ViewBuilder private func backupStatusControl(_ current: Asset) -> some View {
@@ -1962,6 +2072,8 @@ struct AssetViewerScreen: View {
                 : "Move \(noun) to Trash Everywhere?"
         case .deletePermanently: return "Delete \(noun) Permanently?"
         case .deleteFromDevice: return "Delete from This Device?"
+        case .moveToLocked: return "Move \(noun) to Locked Folder?"
+        case .removeFromLocked: return "Remove \(noun) from Locked Folder?"
         case nil: return ""
         }
     }
@@ -1986,6 +2098,12 @@ struct AssetViewerScreen: View {
                 return "This photo is not backed up. It will be removed from your device photo library permanently."
             }
             return "The copy in your device photo library will be deleted. The server copy is kept."
+        case .moveToLocked:
+            return localIdentifier != nil
+                ? "It will be removed from every album and only show in the locked folder. The copy in your device photo library will be deleted."
+                : "It will be removed from every album and only show in the locked folder."
+        case .removeFromLocked:
+            return "It will show in your library again."
         case nil:
             return ""
         }
@@ -2007,6 +2125,16 @@ struct AssetViewerScreen: View {
                 Task { await deleteFromDevice() }
             }
             .accessibilityIdentifier("viewer-delete-device-confirm")
+        case .moveToLocked:
+            Button("Move") {
+                Task { await moveToLockedFolder() }
+            }
+            .accessibilityIdentifier("viewer-lock-confirm")
+        case .removeFromLocked:
+            Button("Remove") {
+                Task { await removeFromLockedFolder() }
+            }
+            .accessibilityIdentifier("viewer-unlock-confirm")
         case nil:
             EmptyView()
         }
@@ -2181,6 +2309,56 @@ struct AssetViewerScreen: View {
         } catch {
             rollbackOptimisticRemoval(asset.id)
             ErrorToastCenter.shared.show("Couldn’t update the archive", error: error)
+        }
+    }
+
+    /// device first, like deleteEverywhere: the folder would otherwise keep
+    /// showing through the device copy in the merged grid, and a declined
+    /// system dialog leaves the server untouched.
+    private func moveToLockedFolder() async {
+        guard let client = session.client, let asset = current, let serverAssetID else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        let localID = await resolveLocalIdentifier()
+        if let localID {
+            do {
+                try await PhotoLibraryService.delete(localIdentifiers: [localID])
+            } catch {
+                if !PhotoLibraryService.isUserCancelled(error) {
+                    ErrorToastCenter.shared.show("Couldn’t delete from this device", error: error)
+                }
+                return
+            }
+            session.backup?.noteLocalDeletion([localID])
+            localIdentifier = nil
+        }
+        beginOptimisticRemoval(asset)
+        do {
+            try await client.setVisibility(ids: [serverAssetID], .locked)
+            commitOptimisticRemoval(asset.id)
+        } catch {
+            rollbackOptimisticRemoval(asset.id)
+            if localID != nil { onChange(.localDeleted(asset.id)) }
+            ErrorToastCenter.shared.show(
+                localID == nil
+                    ? "Couldn’t move to the locked folder"
+                    : "Deleted from this device, but couldn’t move to the locked folder",
+                error: error
+            )
+        }
+    }
+
+    private func removeFromLockedFolder() async {
+        guard let client = session.client, let asset = current, let serverAssetID else { return }
+        guard mutatingAssetIDs.insert(asset.id).inserted else { return }
+        defer { mutatingAssetIDs.remove(asset.id) }
+        beginOptimisticRemoval(asset)
+        do {
+            try await client.setVisibility(ids: [serverAssetID], .timeline)
+            commitOptimisticRemoval(asset.id)
+        } catch {
+            rollbackOptimisticRemoval(asset.id)
+            ErrorToastCenter.shared.show("Couldn’t remove from the locked folder", error: error)
         }
     }
 

@@ -8,6 +8,7 @@ struct AssetViewerOpeningChromePresentation: Hashable {
         case local
         case remote
         case trashed
+        case locked
     }
 
     let assetID: String
@@ -58,7 +59,10 @@ struct AssetViewerOpeningChromePresentation: Hashable {
         title = labels.title
         subtitle = labels.subtitle
         backupSymbol = Self.backupSymbol(for: asset, session: session, remoteID: remoteID)
-        kind = asset.isLocal ? .local : asset.isTrashed ? .trashed : .remote
+        kind = asset.isLocal ? .local
+            : asset.isTrashed ? .trashed
+            : asset.visibility == .locked ? .locked
+            : .remote
         showsShare = asset.isLocal ? localID != nil : session.client != nil
         showsFavorite = availability.canFavorite
         favoriteSymbol = asset.isFavorite ? "heart.fill" : "heart"
@@ -215,6 +219,8 @@ private struct AssetViewerOpeningChromeSource: View {
             remoteToolbarItems(presentation)
         case .trashed:
             trashedToolbarItems(presentation)
+        case .locked:
+            lockedToolbarItems(presentation)
         }
     }
 
@@ -290,6 +296,46 @@ private struct AssetViewerOpeningChromeSource: View {
             ToolbarSpacer(.flexible, placement: .bottomBar)
         }
         if presentation.showsPermanentDelete {
+            ToolbarItem(placement: .bottomBar) {
+                Image(systemName: "trash")
+            }
+        }
+    }
+
+    /// share, favorite, info, edit and permanent delete: the locked folder's
+    /// bottom bar.
+    @ToolbarContentBuilder
+    private func lockedToolbarItems(
+        _ presentation: AssetViewerOpeningChromePresentation
+    ) -> some ToolbarContent {
+        if presentation.showsShare {
+            ToolbarItem(placement: .bottomBar) {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+
+        if presentation.showsFavorite {
+            ToolbarItem(placement: .bottomBar) {
+                Image(systemName: presentation.favoriteSymbol)
+            }
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+        }
+
+        ToolbarItem(placement: .bottomBar) {
+            Image(systemName: "info.circle")
+        }
+
+        if presentation.showsEdit {
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                Image(systemName: "slider.horizontal.3")
+            }
+        }
+
+        if presentation.showsPermanentDelete {
+            ToolbarSpacer(.flexible, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
                 Image(systemName: "trash")
             }

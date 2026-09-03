@@ -10,6 +10,7 @@ import SwiftUI
 /// not-yet-backed-up device photos.
 struct SelectionMoreMenu: View {
     let filter: TimelineFilter
+    let count: Int
     let isDisabled: Bool
     /// server actions need a remote id for every item, so a selection
     /// holding device photos turns them off while back up stays live.
@@ -20,11 +21,26 @@ struct SelectionMoreMenu: View {
     /// set on owned albums while exactly one photo is picked.
     var onSetAlbumCover: (() async -> Void)?
     let onAddToAlbum: () -> Void
+    /// moves the selection into the locked folder, or out of it on the
+    /// locked grid. both confirm first, like the web client.
+    var onLock: (() async -> Void)?
+    var onUnlock: (() async -> Void)?
+    /// whether locking would also delete device copies, for the wording.
+    var lockDeletesDeviceCopies: () -> Bool = { false }
     /// set while the selection holds not-yet-backed-up device photos. only
     /// those upload; the title reads back up missing when server items are
     /// mixed in.
     var onBackUp: (() -> Void)?
     var backUpTitle = "Back Up"
+
+    private enum LockConfirmation {
+        case lock
+        case unlock
+    }
+
+    @State private var lockConfirmation: LockConfirmation?
+
+    private var noun: String { count == 1 ? "1 Item" : "\(count) Items" }
 
     var body: some View {
         Menu {
@@ -36,48 +52,106 @@ struct SelectionMoreMenu: View {
                     .accessibilityIdentifier("selection-backup")
                 }
             }
-            Section {
-                Button {
-                    Task { await onFavorite() }
-                } label: {
-                    Label("Favorite", systemImage: "heart")
+            if filter.visibility == .locked {
+                Section {
+                    Button {
+                        Task { await onFavorite() }
+                    } label: {
+                        Label("Favorite", systemImage: "heart")
+                    }
+                    Button {
+                        lockConfirmation = .unlock
+                    } label: {
+                        Label("Remove from Locked Folder", systemImage: "lock.open")
+                    }
+                    .accessibilityIdentifier("selection-unlock")
                 }
-                if let onRemoveFromAlbum {
-                    Button(action: onAddToAlbum) {
-                        Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
-                    }
+                .disabled(serverActionsDisabled)
+            } else {
+                Section {
                     Button {
-                        Task { await onRemoveFromAlbum() }
+                        Task { await onFavorite() }
                     } label: {
-                        Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                        Label("Favorite", systemImage: "heart")
                     }
-                    if let onSetAlbumCover {
-                        Button {
-                            Task { await onSetAlbumCover() }
-                        } label: {
-                            Label("Set as Album Cover", systemImage: "photo.badge.checkmark")
+                    if let onRemoveFromAlbum {
+                        Button(action: onAddToAlbum) {
+                            Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
                         }
-                        .accessibilityIdentifier("selection-album-cover")
+                        Button {
+                            Task { await onRemoveFromAlbum() }
+                        } label: {
+                            Label("Remove from Album", systemImage: "rectangle.stack.badge.minus")
+                        }
+                        if let onSetAlbumCover {
+                            Button {
+                                Task { await onSetAlbumCover() }
+                            } label: {
+                                Label("Set as Album Cover", systemImage: "photo.badge.checkmark")
+                            }
+                            .accessibilityIdentifier("selection-album-cover")
+                        }
+                    } else {
+                        Button {
+                            Task { await onArchive() }
+                        } label: {
+                            Label(
+                                filter.visibility == .archive ? "Unarchive" : "Archive",
+                                systemImage: filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
+                            )
+                        }
+                        Button(action: onAddToAlbum) {
+                            Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
+                        }
                     }
-                } else {
-                    Button {
-                        Task { await onArchive() }
-                    } label: {
-                        Label(
-                            filter.visibility == .archive ? "Unarchive" : "Archive",
-                            systemImage: filter.visibility == .archive ? "tray.and.arrow.up" : "archivebox"
-                        )
+                }
+                .disabled(serverActionsDisabled)
+                if onLock != nil {
+                    Section {
+                        Button {
+                            lockConfirmation = .lock
+                        } label: {
+                            Label("Move to Locked Folder", systemImage: "lock")
+                        }
+                        .accessibilityIdentifier("selection-lock")
                     }
-                    Button(action: onAddToAlbum) {
-                        Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
-                    }
+                    .disabled(serverActionsDisabled)
                 }
             }
-            .disabled(serverActionsDisabled)
         } label: {
             Image(systemName: "ellipsis")
         }
         .disabled(isDisabled)
+        // ios 26 morphs the dialog out of its source control, so it sits on
+        // the menu button, since a vanished menu item cannot host one.
+        .confirmationDialog(
+            lockConfirmation == .unlock
+                ? "Remove \(noun) from Locked Folder?"
+                : "Move \(noun) to Locked Folder?",
+            isPresented: Binding(
+                get: { lockConfirmation != nil },
+                set: { if !$0 { lockConfirmation = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if lockConfirmation == .unlock {
+                Button("Remove") {
+                    Task { await onUnlock?() }
+                }
+            } else {
+                Button("Move") {
+                    Task { await onLock?() }
+                }
+            }
+        } message: {
+            if lockConfirmation == .unlock {
+                Text("They will show in your library again.")
+            } else if lockDeletesDeviceCopies() {
+                Text("They will be removed from every album and only show in the locked folder. Their copies in your device photo library will be deleted.")
+            } else {
+                Text("They will be removed from every album and only show in the locked folder.")
+            }
+        }
         .accessibilityLabel("More Actions")
         .accessibilityIdentifier("selection-more")
     }
@@ -98,6 +172,12 @@ struct SelectionControlBar: View {
     @State private var confirmsTrash = false
 
     private var actionsDisabled: Bool { isWorking || count == 0 }
+
+    /// trash grids and the locked folder delete for good: neither has a
+    /// trash to move to.
+    private var deletesPermanently: Bool {
+        filter.isTrashed == true || filter.visibility == .locked
+    }
 
     var body: some View {
         GlassEffectContainer(spacing: 12) {
@@ -123,7 +203,7 @@ struct SelectionControlBar: View {
 
     private var trashConfirmationTitle: String {
         let noun = count == 1 ? "1 Item" : "\(count) Items"
-        return filter.isTrashed == true
+        return deletesPermanently
             ? "Permanently Delete \(noun)?"
             : "Move \(noun) to Trash?"
     }
@@ -132,7 +212,7 @@ struct SelectionControlBar: View {
         Button(role: .destructive) {
             confirmsTrash = true
         } label: {
-            Image(systemName: filter.isTrashed == true ? "trash.slash" : "trash")
+            Image(systemName: deletesPermanently ? "trash.slash" : "trash")
                 .font(.system(size: 17, weight: .medium))
                 .frame(width: 46, height: 46)
                 .contentShape(.circle)
@@ -143,13 +223,13 @@ struct SelectionControlBar: View {
             titleVisibility: .visible
         ) {
             Button(
-                filter.isTrashed == true ? "Delete Permanently" : "Move to Trash",
+                deletesPermanently ? "Delete Permanently" : "Move to Trash",
                 role: .destructive
             ) {
                 Task { await onTrash() }
             }
         } message: {
-            Text(filter.isTrashed == true
+            Text(deletesPermanently
                 ? "This cannot be undone."
                 : "Deleted items can be restored from the trash later.")
         }
@@ -158,7 +238,7 @@ struct SelectionControlBar: View {
         .glassEffect(.regular, in: .circle)
         .opacity(actionsDisabled ? 0.5 : 1)
         .disabled(actionsDisabled)
-        .accessibilityLabel(filter.isTrashed == true ? "Delete Permanently" : "Move to Trash")
+        .accessibilityLabel(deletesPermanently ? "Delete Permanently" : "Move to Trash")
         .accessibilityIdentifier("selection-trash")
     }
 
