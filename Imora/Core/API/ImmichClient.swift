@@ -866,11 +866,13 @@ nonisolated final class ImmichClient: Sendable {
     /// the transfer survives the app being suspended. takes ownership of the
     /// source file: it is deleted as soon as the request body is built, so peak
     /// disk usage stays near one file size. onProgress receives the sent
-    /// fraction, and `account` routes a completion that outlives this process.
+    /// fraction, `account` routes a completion that outlives this process,
+    /// and `lease` is released once the system owns the transfer.
     @concurrent
     func uploadAsset(
         _ upload: AssetUploadRequest,
         account: String,
+        lease: ProcessLease? = nil,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> AssetUploadResult {
         var fields: [(name: String, value: String)] = [
@@ -919,6 +921,7 @@ nonisolated final class ImmichClient: Sendable {
             request,
             fromFile: bodyURL,
             ticket: ticket,
+            lease: lease,
             onProgress: onProgress
         )
         do {

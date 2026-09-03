@@ -94,10 +94,13 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
 
     // MARK: - uploading
 
+    /// `lease` is whatever kept the process alive while the body was built.
+    /// it is released the moment the system owns the transfer.
     func upload(
         _ request: URLRequest,
         fromFile bodyURL: URL,
         ticket: Ticket,
+        lease: ProcessLease? = nil,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> Data {
         let task = session.uploadTask(with: request, fromFile: bodyURL)
@@ -112,6 +115,7 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
                     progressHandlers[id] = onProgress
                 }
                 task.resume()
+                lease?.release()
             }
         } onCancel: { [weak self] in
             self?.cancel(taskIdentifier: id)
@@ -209,7 +213,17 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
             return backgroundCompletion
         }
         // the system expects this on the main thread before it suspends us.
-        if let completion { DispatchQueue.main.async { completion.run() } }
+        // what just finished is only half the job: recording it, exporting the
+        // next assets and handing those over all happen after this, and the
+        // app may be suspended the moment the system hears it is done. a short
+        // lease covers the gap until that work holds one of its own.
+        guard let completion else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                ProcessLease.take("upload follow-up", for: .seconds(10))
+                completion.run()
+            }
+        }
     }
 
     // MARK: - helpers

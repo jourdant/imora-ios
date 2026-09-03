@@ -13,6 +13,9 @@ nonisolated enum BackupPhase: Equatable {
     case uploading(done: Int, total: Int)
     case done(BackupSummary)
     case error(String)
+    /// the user stopped the run, or the system reclaimed it. nothing to
+    /// announce, and the next launch or foreground picks up where it left off.
+    case cancelled
 }
 
 nonisolated struct BackupSummary: Equatable, Sendable {
@@ -149,6 +152,9 @@ final class BackupManager {
     /// the index quietly and ends back at idle.
     private var runAllowsUploads = true
     private var rerunRequested = false
+    /// the run takes no new work and ends once the transfers already handed
+    /// to the system are back.
+    private var windingDown = false
     private var changeObserver: LibraryChangeObserver?
 
     /// host|userId, stamped onto every background upload so a completion can
@@ -218,6 +224,21 @@ final class BackupManager {
         runTask?.cancel()
         let index = index
         Task { await index.flush() }
+    }
+
+    /// the gentle stop: nothing new starts, and the transfers the system is
+    /// already carrying are left to finish rather than thrown away. the run
+    /// ends as cancelled once they are back.
+    func windDown() {
+        guard runTask != nil else { return }
+        runAllowsUploads = false
+        windingDown = true
+    }
+
+    /// a wound-down run leaves the way a cancelled one does, so the phase
+    /// and the rerun rules are shared.
+    private func checkWindDown() throws {
+        if windingDown { throw CancellationError() }
     }
 
     func flushPendingIndexChanges() async {
@@ -379,7 +400,7 @@ final class BackupManager {
     /// runs before a single byte leaves the device.
     var progressFraction: Double {
         switch phase {
-        case .idle, .scanning:
+        case .idle, .scanning, .cancelled:
             0
         case .hashing(let done, let total):
             total > 0 ? 0.2 * Double(done) / Double(total) : 0
@@ -451,12 +472,16 @@ final class BackupManager {
                 phase = .idle
                 chainFullRun = runAllowsUploads
             }
-        } catch is CancellationError {
-            await index.flush()
-            phase = .idle
         } catch {
             await index.flush()
-            if runAllowsUploads {
+            if error is CancellationError || Task.isCancelled {
+                // a cancel surfaces as whatever the interrupted call threw,
+                // not always as a cancellationerror.
+                phase = .cancelled
+                // a library change during the run must not restart what the
+                // user just stopped. the next foreground reconciles anyway.
+                rerunRequested = false
+            } else if runAllowsUploads {
                 phase = .error(error.localizedDescription)
                 // the backup screen still shows the error; the banner is
                 // reserved for outcomes the server took part in.
@@ -468,8 +493,8 @@ final class BackupManager {
             }
         }
         if case .error(let message) = phase, reportsOutcome { onRunFailed?(message) }
-        uploadStates.removeAll()
         localChanged()
+        windingDown = false
         runTask = nil
         if chainFullRun {
             // the upload ask arrived after the gate: run again, in full.
@@ -511,6 +536,7 @@ final class BackupManager {
         phase = .hashing(done: 0, total: toHash.count)
         for (i, asset) in toHash.enumerated() {
             try Task.checkCancellation()
+            try checkWindDown()
             do {
                 let hashes = try await PhotoLibraryService.hash(
                     localIdentifier: asset.localIdentifier,
@@ -557,6 +583,7 @@ final class BackupManager {
             }
         }
 
+        try checkWindDown()
         let results = try await Self.bulkUploadCheck(items, client: client)
         for result in results {
             try Task.checkCancellation()
@@ -638,7 +665,9 @@ final class BackupManager {
             var next = 0
             var done = 0
             @MainActor func addNext() {
-                guard next < queue.count, quotaMessage == nil else { return }
+                // once cancelled, queueing the rest would only race the counter
+                // to the end as each new transfer dies on arrival.
+                guard next < queue.count, quotaMessage == nil, !Task.isCancelled, !windingDown else { return }
                 let asset = queue[next]
                 next += 1
                 uploadStates[asset.localIdentifier] = .uploading(0)
@@ -675,11 +704,15 @@ final class BackupManager {
                     group.cancelAll()
                 }
                 localChanged()
-                phase = .uploading(done: done, total: queue.count)
+                // the in-flight leftovers of a cancelled run are not progress.
+                if !Task.isCancelled {
+                    phase = .uploading(done: done, total: queue.count)
+                }
                 addNext()
             }
         }
         try Task.checkCancellation()
+        try checkWindDown()
         if let quotaMessage {
             throw ImmichError.http(400, quotaMessage)
         }
@@ -718,6 +751,12 @@ final class BackupManager {
         account: String,
         onProgress: @escaping @Sendable (String, Double) -> Void
     ) async -> UploadOutcome {
+        // everything up to the hand-off, the export and the request body, has
+        // to reach the system before the app is suspended. the lease keeps a
+        // backgrounded app running that long, and the uploader lets go of it
+        // once the transfer is the system's.
+        var lease = await ProcessLease.take("backup export")
+        defer { lease.release() }
         // the asset may have changed or vanished since the scan.
         guard let current = await PhotoLibraryService.assetInfo(localIdentifier: asset.localIdentifier) else {
             return .skipped
@@ -770,13 +809,15 @@ final class BackupManager {
                     durationMs: 0,
                     hidden: true,
                     isMotion: true
-                ), account: account) { fraction in
+                ), account: account, lease: lease) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 // recorded immediately so a failed still upload resumes here.
                 await index.setMotionRemoteId(localId: current.localIdentifier, result.id)
                 motionRemoteId = result.id
                 if !result.isDuplicate { uploadedSomething = true }
+                // the still is exported on whatever wake delivered the motion.
+                lease = await ProcessLease.take("backup export")
             }
 
             if entry.primaryRemoteId == nil {
@@ -794,7 +835,7 @@ final class BackupManager {
                     isFavorite: current.isFavorite,
                     durationMs: current.isVideo ? current.durationMs : 0,
                     livePhotoVideoId: motionRemoteId
-                ), account: account) { fraction in
+                ), account: account, lease: lease) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 await index.setPrimaryRemoteId(localId: current.localIdentifier, result.id)
@@ -806,6 +847,8 @@ final class BackupManager {
         } catch let ImmichError.http(_, message) where message.lowercased().contains("quota") {
             return .quota(message)
         } catch {
+            // a cancelled transfer comes back as a url error, not a cancellationerror.
+            if Task.isCancelled { return .skipped }
             backupLog.error("upload failed for \(asset.localIdentifier): \(error)")
             return .failed("\(error)")
         }
@@ -924,7 +967,7 @@ final class BackupManager {
         await withTaskGroup(of: (String, UploadOutcome).self) { group in
             var next = 0
             @MainActor func addNext() {
-                guard next < queue.count, quotaMessage == nil else { return }
+                guard next < queue.count, quotaMessage == nil, !Task.isCancelled else { return }
                 let asset = queue[next]
                 next += 1
                 uploadStates[asset.localIdentifier] = .uploading(0)
@@ -1150,6 +1193,7 @@ final class BackupManager {
         localChanged()
         return ids.count
     }
+
     @concurrent
     private static func linkedLivePhotos(
         _ photos: [(localId: String, remoteId: String)],
@@ -1192,6 +1236,7 @@ extension BackupManager: ContinuedWorkload {
             "Already backed up"
         case .done: "Backup complete"
         case .error: "Backup stopped"
+        case .cancelled: "Backup cancelled"
         default: "Backing up"
         }
     }
@@ -1208,15 +1253,20 @@ extension BackupManager: ContinuedWorkload {
             "\(summary.uploaded) uploaded, \(summary.failed) failed"
         case .done(let summary): "\(summary.uploaded) uploaded"
         case .error(let message): message
+        case .cancelled where summary.uploaded > 0: "\(summary.uploaded) uploaded before stopping"
+        case .cancelled: "Nothing was sent"
         }
     }
 
-    var continuedProgress: ContinuedProgress {
-        ContinuedProgress(fraction: progressFraction)
+    var continuedProgress: ContinuedProgress? {
+        // a cancelled run leaves the system bar where it stopped instead of
+        // snapping it empty or full on the way out.
+        if case .cancelled = phase { return nil }
+        return ContinuedProgress(fraction: progressFraction)
     }
 
-    var continuedSucceeded: Bool {
-        if case .done = phase { return true }
+    var continuedFailed: Bool {
+        if case .error = phase { return true }
         return false
     }
 }

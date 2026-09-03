@@ -38,6 +38,10 @@ struct BackupScreen: View {
                     let detail = session.backup?.lastFailure ?? "Some items were not uploaded."
                     ErrorToastCenter.shared.show("Some photos couldn’t be backed up. \(detail)")
                 }
+            case .cancelled:
+                // the ask died with the run, or the next automatic one
+                // would toast for a failure nobody started.
+                reportsNextBackupFailure = false
             default:
                 break
             }
@@ -149,6 +153,7 @@ struct BackupScreen: View {
         case .uploading(let done, let total): "Uploading \(done) of \(total)"
         case .done(let summary): doneText(summary)
         case .error(let message): "Error: \(message)"
+        case .cancelled: "Backup cancelled."
         }
     }
 

@@ -82,6 +82,8 @@ struct RootView: View {
                 // returning to the foreground picks up photos taken meanwhile
                 // and reconnects the realtime channel, which resyncs grids.
                 session.backup?.startIfIdle()
+                // a backup that lost its progress ui to a device lock gets it back.
+                ContinuedProcessing.backup.restore()
                 session.realtime?.setActive(true)
                 // the socket is down while backgrounded, so the inbox fetch is
                 // what surfaces anything raised in the meantime.
