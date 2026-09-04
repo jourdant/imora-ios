@@ -4,39 +4,33 @@ import SwiftUI
 
 /// the app's default ambient audio session is silenced by the ring switch.
 /// claiming playback before audible video makes sound play regardless, like
-/// the system photos app.
-private final class ViewerAudioSession: @unchecked Sendable {
+/// the system photos app. the actor keeps the category flag race-free and the
+/// blocking session calls off the main thread.
+private actor ViewerAudioSession {
     static let shared = ViewerAudioSession()
 
-    private let queue = DispatchQueue(
-        label: "com.vexcited.imora.viewer-audio-session",
-        qos: .userInitiated
-    )
     private var isPlaybackCategoryConfigured = false
 
     func activateForPlayback() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            let audioSession = AVAudioSession.sharedInstance()
-            if !self.isPlaybackCategoryConfigured {
-                do {
-                    try audioSession.setCategory(.playback, mode: .moviePlayback)
-                    self.isPlaybackCategoryConfigured = true
-                } catch {
-                    return
-                }
+        let audioSession = AVAudioSession.sharedInstance()
+        if !isPlaybackCategoryConfigured {
+            do {
+                try audioSession.setCategory(.playback, mode: .moviePlayback)
+                isPlaybackCategoryConfigured = true
+            } catch {
+                return
             }
-            if #available(iOS 27.0, *) {
-                audioSession.activate(options: []) { _, _ in }
-            } else {
-                try? audioSession.setActive(true, options: [])
-            }
+        }
+        if #available(iOS 27.0, *) {
+            audioSession.activate(options: []) { _, _ in }
+        } else {
+            try? audioSession.setActive(true, options: [])
         }
     }
 }
 
 private func activatePlaybackAudioSession() {
-    ViewerAudioSession.shared.activateForPlayback()
+    Task { await ViewerAudioSession.shared.activateForPlayback() }
 }
 
 /// single playback engine for the viewer. the active video page claims it and
@@ -153,11 +147,14 @@ final class VideoPlayback {
         applyMute()
         attachObservers(to: player, item: item)
         // frame stepping is the only consumer, so the track load trails the
-        // first frame instead of delaying it.
-        Task { [weak self] in
-            guard let interval = await Self.frameInterval(of: item) else { return }
-            guard let self, self.generation == gen else { return }
-            self.frameInterval = interval
+        // first frame instead of delaying it. only an avurlasset can leave the
+        // main actor, so anything else keeps the 30fps default.
+        if let asset = item.asset as? AVURLAsset {
+            Task { [weak self] in
+                guard let interval = await Self.frameInterval(of: asset) else { return }
+                guard let self, self.generation == gen else { return }
+                self.frameInterval = interval
+            }
         }
     }
 
@@ -294,8 +291,9 @@ final class VideoPlayback {
         player?.isMuted = forcesMute || isMuted
     }
 
-    private nonisolated static func frameInterval(of item: AVPlayerItem) async -> Double? {
-        guard let track = try? await item.asset.loadTracks(withMediaType: .video).first,
+    @concurrent
+    private nonisolated static func frameInterval(of asset: AVURLAsset) async -> Double? {
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let rate = try? await track.load(.nominalFrameRate),
               rate > 0
         else { return nil }

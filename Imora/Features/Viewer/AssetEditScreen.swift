@@ -966,7 +966,7 @@ struct CropCanvas: View {
 }
 
 /// one l-shaped crop corner.
-private struct CornerBracket: Shape {
+private nonisolated struct CornerBracket: Shape {
     let isRight: Bool
     let isBottom: Bool
 

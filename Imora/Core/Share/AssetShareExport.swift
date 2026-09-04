@@ -977,8 +977,11 @@ nonisolated enum AssetShareMetadataFilter {
             ? .mp4
             : .mov
         try Task.checkCancellation()
+        // the state sequence is sendable, the session is not: taking it here
+        // keeps the reporting task from capturing the session it exports with.
+        let states = session.states(updateInterval: 0.1)
         let progressTask = Task {
-            for await state in session.states(updateInterval: 0.1) {
+            for await state in states {
                 guard !Task.isCancelled else { return }
                 if case .exporting(let exportProgress) = state {
                     progress(exportProgress.fractionCompleted)

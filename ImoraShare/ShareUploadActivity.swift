@@ -131,7 +131,7 @@ nonisolated final class ShareUploadActivity: NSObject, URLSessionTaskDelegate, @
         activity = task
         activityIdentifier = identifier
         task.expirationHandler = { [weak self] in
-            self?.queue.async {
+            self?.queue.async { [weak self] in
                 guard let self, self.activityIdentifier == identifier,
                       let task = self.activity
                 else { return }

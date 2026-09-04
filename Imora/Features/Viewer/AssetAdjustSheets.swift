@@ -342,16 +342,13 @@ final class LocationSearchModel: NSObject, MKLocalSearchCompleterDelegate {
         return response?.mapItems.first?.location.coordinate
     }
 
-    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
-        let found = completer.results
-        Task { @MainActor in
-            results = Array(found.prefix(8))
-        }
+    // mapkit calls the delegate on the main thread, so the conformance stays
+    // main-actor isolated and the non-sendable completions never cross an actor.
+    func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        results = Array(completer.results.prefix(8))
     }
 
-    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
-        Task { @MainActor in
-            results = []
-        }
+    func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+        results = []
     }
 }

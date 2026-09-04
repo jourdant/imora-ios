@@ -584,6 +584,36 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         return min(1_280, (pixels / 32).rounded(.up) * 32)
     }
 
+    /// keeps the row window and the column count in step with the width.
+    private func applyViewportWidth(_ width: CGFloat, viewportHeight: CGFloat) {
+        scrollContext.viewportWidth = width
+        // whichever of the initial callbacks lands last completes the
+        // viewport, so each one windows the rows.
+        updateRowWindow()
+        if navigationTarget != nil {
+            Task { await revealPendingTimelineTarget() }
+        }
+        let target = columnTarget(viewportWidth: width)
+        guard target != columnCount else { return }
+        applyColumnCount(
+            target,
+            viewportWidth: width,
+            viewportHeight: viewportHeight,
+            preservedFraction: scrub.fraction,
+            recordsUserPreference: false
+        )
+    }
+
+    /// the stored preference clamped to what the current width can show, or
+    /// the default when nothing was pinched yet.
+    private func columnTarget(viewportWidth: CGFloat) -> Int {
+        guard let preferred = preferredColumnCount else {
+            return AssetGridLayout.defaultColumnCount(viewportWidth: viewportWidth)
+        }
+        let range = AssetGridLayout.columnRange(viewportWidth: viewportWidth)
+        return min(range.upperBound, max(range.lowerBound, preferred))
+    }
+
     private func applyColumnCount(
         _ target: Int,
         viewportWidth: CGFloat,
@@ -766,6 +796,169 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         isSelecting ? 90 : 0
     }
 
+    private var selectionMoreMenu: some View {
+        // the optional handlers are typed here: inferring them through the
+        // ternaries costs more than the whole screen's type checking budget.
+        let isLocked = filter.visibility == .locked
+        let removeFromAlbum: (() async -> Void)? = filter.albumId == nil
+            ? nil
+            : { await applyRemoveFromAlbum() }
+        let setAlbumCover: (() async -> Void)? = onSetAlbumCover != nil && selection.count == 1
+            ? { await applySetAlbumCover() }
+            : nil
+        let lock: (() async -> Void)? = isLocked ? nil : { await applyLock() }
+        let unlock: (() async -> Void)? = isLocked ? { await applyVisibility(.timeline) } : nil
+        let backUp: (() -> Void)? = selectionHasLocalAssets ? { applyBackup() } : nil
+        return SelectionMoreMenu(
+            filter: filter,
+            count: selection.count,
+            isDisabled: isSelectionWorking || selection.isEmpty,
+            serverActionsDisabled: selectionHasLocalAssets,
+            onFavorite: { await applyFavorite() },
+            onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
+            onRemoveFromAlbum: removeFromAlbum,
+            onSetAlbumCover: setAlbumCover,
+            onAddToAlbum: { pendingAlbumAssets = Array(selection) },
+            onLock: lock,
+            onUnlock: unlock,
+            lockDeletesDeviceCopies: selectionHasDeviceCopies,
+            onBackUp: backUp,
+            backUpTitle: isBackupOnlySelection ? "Back Up" : "Back Up Missing"
+        )
+    }
+
+    @ToolbarContentBuilder
+    private var timelineToolbar: some ToolbarContent {
+        if isSelecting, !isPicking {
+            if filter.isTrashed != true {
+                ToolbarItem(placement: .topBarTrailing) { selectionMoreMenu }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    exitSelection()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .disabled(isSelectionWorking)
+                .accessibilityLabel("Cancel Selection")
+                .accessibilityIdentifier("selection-cancel")
+            }
+        } else {
+            if !isPicking, !model.isEmpty {
+                // leads the host's items as a pill of its own: the fixed
+                // spacer splits the glass so it never merges into their
+                // group.
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Select") { enterSelection() }
+                        .accessibilityIdentifier("timeline-select")
+                }
+                if hasTrailingItems {
+                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                }
+            }
+            trailingItems
+        }
+    }
+
+    /// the scroll view's whole content: the header above the virtual stack.
+    /// every marker position is measured from where row space starts, so the
+    /// header's height is measured rather than assumed.
+    private func timelineRows(layout: RowLayout, side: CGFloat, tailPadding: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 0) { header }
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height.rounded()
+                } action: { height in
+                    if scrub.headerHeight != height {
+                        scrub.headerHeight = height
+                        updateRowWindow()
+                    }
+                }
+
+            VirtualRowStack(
+                rows: model.rows,
+                starts: layout.starts,
+                totalHeight: layout.total,
+                window: rowWindow
+            ) { rowIndex, row in
+                rowView(row, rowIndex: rowIndex, side: side)
+            }
+        }
+        .environment(motion)
+        .background {
+            TimelineSelectionSlideInstaller(
+                controller: selectionSlideController,
+                isEnabled: isSelecting && !isPicking,
+                selectedIDs: selection,
+                assetIDsInRectangle: selectableAssetIDs,
+                applyChanges: applySelectionRectangle,
+                onActiveChanged: handleSelectionSlideActivity
+            )
+        }
+        .padding(.bottom, tailPadding)
+    }
+
+    /// the app's own scroll indicator, kept out of `body` so the screen stays
+    /// one expression the type checker can still solve.
+    @ViewBuilder
+    private func scrubberOverlay(scrollable: Bool, side: CGFloat) -> some View {
+        if scrollable && !viewer.isTransitioning {
+            TimelineScrubber(
+                scrub: scrub,
+                // an absolute jump to the exact pixel, immich-web's
+                // scrollToSegmentPercentage. the virtual stack owns
+                // every row position, so the grid's layout IS the
+                // scroll view's coordinate space and nothing can land
+                // short or clamp - the drag is continuous within a
+                // month, not snapped to it.
+                onScrub: { fraction in
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        scrollPosition.scrollTo(y: scrub.contentOffset(forFraction: fraction))
+                    }
+                },
+                onScrubbingChanged: { scrubbing in
+                    if scrubbing {
+                        AssetViewerOpeningChromeCache.shared.cancelPrewarming(
+                            owner: openingChromePrewarmOwner
+                        )
+                        showIndicator()
+                        model.deferRebuilds()
+                    } else {
+                        scheduleIndicatorHide()
+                        // a drag can end mid-deceleration; the phase
+                        // handler lifts the hold once the scroll is
+                        // actually at rest.
+                        if scrollContext.isIdle { model.resumeRebuilds() }
+                        // the window went unwarmed for the length of
+                        // the drag; catch it up where it landed.
+                        prefetcher.update(
+                            visibleRowIDs: scrollContext.visibleRowIDs,
+                            model: model,
+                            client: session.client,
+                            backup: session.backup,
+                            targetPixelSize: thumbnailPixelSize(for: side)
+                        )
+                    }
+                    // outside the animation below: this swaps what every
+                    // tile is made of, and a cross-fade of the whole
+                    // grid is not what the thumb thickening asked for.
+                    var plain = Transaction()
+                    plain.disablesAnimations = true
+                    withTransaction(plain) { isScrubbingTiles = scrubbing }
+                    let apply = { scrubbing ? scrub.beginScrub() : scrub.endScrub() }
+                    if reduceMotion {
+                        apply()
+                    } else {
+                        withAnimation(.easeOut(duration: 0.15)) { apply() }
+                    }
+                    if !scrubbing { updateRowWindow() }
+                }
+            )
+        }
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let side = tileSide(for: geometry.size.width)
@@ -774,41 +967,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             let tailPadding = bottomPadding()
 
             ScrollView {
-                // the header sits above the virtual stack; every marker
-                // position is measured from where row space starts, so its
-                // height is measured rather than assumed.
-                VStack(spacing: 0) {
-                    VStack(spacing: 0) { header }
-                        .onGeometryChange(for: CGFloat.self) { proxy in
-                            proxy.size.height.rounded()
-                        } action: { height in
-                            if scrub.headerHeight != height {
-                                scrub.headerHeight = height
-                                updateRowWindow()
-                            }
-                        }
-
-                    VirtualRowStack(
-                        rows: model.rows,
-                        starts: layout.starts,
-                        totalHeight: layout.total,
-                        window: rowWindow
-                    ) { rowIndex, row in
-                        rowView(row, rowIndex: rowIndex, side: side)
-                    }
-                }
-                .environment(motion)
-                .background {
-                    TimelineSelectionSlideInstaller(
-                        controller: selectionSlideController,
-                        isEnabled: isSelecting && !isPicking,
-                        selectedIDs: selection,
-                        assetIDsInRectangle: selectableAssetIDs,
-                        applyChanges: applySelectionRectangle,
-                        onActiveChanged: handleSelectionSlideActivity
-                    )
-                }
-                .padding(.bottom, tailPadding)
+                timelineRows(layout: layout, side: side, tailPadding: tailPadding)
             }
             .scrollPosition($scrollPosition)
             // the drawn indicator is the app's own, so the system one would
@@ -842,25 +1001,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 updateRowWindow()
             }
             .onChange(of: geometry.size.width, initial: true) { _, width in
-                scrollContext.viewportWidth = width
-                // whichever of the initial callbacks lands last completes
-                // the viewport, so each one windows the rows.
-                updateRowWindow()
-                if navigationTarget != nil {
-                    Task { await revealPendingTimelineTarget() }
-                }
-                let range = AssetGridLayout.columnRange(viewportWidth: width)
-                let target = preferredColumnCount.map {
-                    min(range.upperBound, max(range.lowerBound, $0))
-                } ?? AssetGridLayout.defaultColumnCount(viewportWidth: width)
-                guard target != columnCount else { return }
-                applyColumnCount(
-                    target,
-                    viewportWidth: width,
-                    viewportHeight: geometry.size.height,
-                    preservedFraction: scrub.fraction,
-                    recordsUserPreference: false
-                )
+                applyViewportWidth(width, viewportHeight: geometry.size.height)
             }
             // the window is otherwise only recomputed while scrolling, so a
             // grid that has just filled in sits with nothing warmed past the
@@ -937,61 +1078,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             // scrolls at all gets one. gating it on a row count left short
             // albums with no indicator of any kind, the system's being hidden.
             .overlay(alignment: .topTrailing) {
-                if scrollable && !viewer.isTransitioning {
-                    TimelineScrubber(
-                        scrub: scrub,
-                        // an absolute jump to the exact pixel, immich-web's
-                        // scrollToSegmentPercentage. the virtual stack owns
-                        // every row position, so the grid's layout IS the
-                        // scroll view's coordinate space and nothing can land
-                        // short or clamp - the drag is continuous within a
-                        // month, not snapped to it.
-                        onScrub: { fraction in
-                            var transaction = Transaction()
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollPosition.scrollTo(y: scrub.contentOffset(forFraction: fraction))
-                            }
-                        },
-                        onScrubbingChanged: { scrubbing in
-                            if scrubbing {
-                                AssetViewerOpeningChromeCache.shared.cancelPrewarming(
-                                    owner: openingChromePrewarmOwner
-                                )
-                                showIndicator()
-                                model.deferRebuilds()
-                            } else {
-                                scheduleIndicatorHide()
-                                // a drag can end mid-deceleration; the phase
-                                // handler lifts the hold once the scroll is
-                                // actually at rest.
-                                if scrollContext.isIdle { model.resumeRebuilds() }
-                                // the window went unwarmed for the length of
-                                // the drag; catch it up where it landed.
-                                prefetcher.update(
-                                    visibleRowIDs: scrollContext.visibleRowIDs,
-                                    model: model,
-                                    client: session.client,
-                                    backup: session.backup,
-                                    targetPixelSize: thumbnailPixelSize(for: side)
-                                )
-                            }
-                            // outside the animation below: this swaps what every
-                            // tile is made of, and a cross-fade of the whole
-                            // grid is not what the thumb thickening asked for.
-                            var plain = Transaction()
-                            plain.disablesAnimations = true
-                            withTransaction(plain) { isScrubbingTiles = scrubbing }
-                            let apply = { scrubbing ? scrub.beginScrub() : scrub.endScrub() }
-                            if reduceMotion {
-                                apply()
-                            } else {
-                                withAnimation(.easeOut(duration: 0.15)) { apply() }
-                            }
-                            if !scrubbing { updateRowWindow() }
-                        }
-                    )
-                }
+                scrubberOverlay(scrollable: scrollable, side: side)
             }
         }
         .navigationTitle(title)
@@ -1000,56 +1087,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         // items in place - the bar itself stays put and the controls fade
         // where they are instead of sliding away with it. only the tab bar
         // leaves, for the bottom controls, like the photos app.
-        .toolbar {
-            if isSelecting, !isPicking {
-                if filter.isTrashed != true {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        SelectionMoreMenu(
-                            filter: filter,
-                            count: selection.count,
-                            isDisabled: isSelectionWorking || selection.isEmpty,
-                            serverActionsDisabled: selectionHasLocalAssets,
-                            onFavorite: { await applyFavorite() },
-                            onArchive: { await applyVisibility(filter.visibility == .archive ? .timeline : .archive) },
-                            onRemoveFromAlbum: filter.albumId != nil ? { await applyRemoveFromAlbum() } : nil,
-                            onSetAlbumCover: onSetAlbumCover != nil && selection.count == 1
-                                ? { await applySetAlbumCover() }
-                                : nil,
-                            onAddToAlbum: { pendingAlbumAssets = Array(selection) },
-                            onLock: filter.visibility == .locked ? nil : { await applyLock() },
-                            onUnlock: filter.visibility == .locked ? { await applyVisibility(.timeline) } : nil,
-                            lockDeletesDeviceCopies: selectionHasDeviceCopies,
-                            onBackUp: selectionHasLocalAssets ? applyBackup : nil,
-                            backUpTitle: isBackupOnlySelection ? "Back Up" : "Back Up Missing"
-                        )
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        exitSelection()
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .disabled(isSelectionWorking)
-                    .accessibilityLabel("Cancel Selection")
-                    .accessibilityIdentifier("selection-cancel")
-                }
-            } else {
-                if !isPicking, !model.isEmpty {
-                    // leads the host's items as a pill of its own: the fixed
-                    // spacer splits the glass so it never merges into their
-                    // group.
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Select") { enterSelection() }
-                            .accessibilityIdentifier("timeline-select")
-                    }
-                    if hasTrailingItems {
-                        ToolbarSpacer(.fixed, placement: .topBarTrailing)
-                    }
-                }
-                trailingItems
-            }
-        }
+        .toolbar { timelineToolbar }
         .toolbarVisibility(isSelecting ? .hidden : .automatic, for: .tabBar)
         .navigationBarBackButtonHidden(isSelecting)
         .overlay { overlayState }
@@ -2499,7 +2537,7 @@ private final class SelectionAutoScroller {
         displayLinkTarget.owner = self
     }
 
-    deinit {
+    isolated deinit {
         displayLink?.invalidate()
     }
 

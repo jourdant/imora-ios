@@ -475,7 +475,7 @@ final class TimelineModel {
         }
     }
 
-    deinit {
+    isolated deinit {
         prefetchTask?.cancel()
         rebuildTask?.cancel()
         resyncTask?.cancel()

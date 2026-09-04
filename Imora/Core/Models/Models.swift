@@ -4,13 +4,15 @@ import Foundation
 
 /// the api mixes iso8601 with zone, without zone, and with variable fraction digits.
 nonisolated enum APIDate {
-    private static let isoFractional: ISO8601DateFormatter = {
+    // both formatters are configured once here and only ever asked to parse or
+    // format afterwards, which foundation supports from any thread.
+    private nonisolated(unsafe) static let isoFractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
 
-    private static let iso = ISO8601DateFormatter()
+    private nonisolated(unsafe) static let iso = ISO8601DateFormatter()
 
     private static let naive: DateFormatter = {
         let formatter = DateFormatter()

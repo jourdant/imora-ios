@@ -132,7 +132,8 @@ nonisolated struct SearchRequestBody: Encodable {
     let filter: SearchFilter
     let page: Int
 
-    private static let iso = ISO8601DateFormatter()
+    // never reconfigured after this line, so formatting it from any thread is safe.
+    private nonisolated(unsafe) static let iso = ISO8601DateFormatter()
 
     private enum CodingKeys: String, CodingKey {
         case query, queryAssetId, language, originalFileName, description, ocr
