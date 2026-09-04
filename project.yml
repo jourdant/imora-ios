@@ -1,0 +1,109 @@
+name: Imora
+options:
+  bundleIdPrefix: com.vexcited
+  xcodeVersion: "27.0"
+  projectFormat: xcode16_3
+  defaultSourceDirectoryType: syncedFolder
+  # presets stay on the project config only, so a target setting is never
+  # silently overridden by one of xcodegen's own defaults.
+  settingPresets: project
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  base:
+    CLANG_CXX_LANGUAGE_STANDARD: "gnu++20"
+    GCC_C_LANGUAGE_STANDARD: gnu17
+    SWIFT_VERSION: "5.0"
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    STRING_CATALOG_GENERATE_SYMBOLS: YES
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
+    DEVELOPMENT_TEAM: WLAPHT4WXV
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    REGISTER_APP_GROUPS: YES
+    ENABLE_APP_SANDBOX: YES
+    GENERATE_INFOPLIST_FILE: YES
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    SDKROOT: auto
+    # the app group and the share task id are defined once here; both
+    # Info.plists and both entitlements files reference them as variables.
+    IMORA_APP_GROUP: group.com.vexcited.imora
+    IMORA_SHARE_TASK_ID: "com.vexcited.imora.share.upload.*"
+packages:
+  Nuke:
+    url: https://github.com/kean/Nuke
+    from: 13.0.6
+targets:
+  Imora:
+    type: application
+    platform: iOS
+    sources:
+      - path: Imora
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: Nuke
+      - target: ImoraShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vexcited.imora
+        INFOPLIST_FILE: Imora/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Imora/Imora.entitlements
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator macosx xros xrsimulator"
+        TARGETED_DEVICE_FAMILY: "1,2,7"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
+        "LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]": "@executable_path/../Frameworks"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+        ENABLE_USER_SELECTED_FILES: readonly
+        INFOPLIST_KEY_CFBundleDisplayName: Imora
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleDefault
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_NSFaceIDUsageDescription: "Imora uses Face ID to open your locked folder without typing the PIN."
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Imora connects to your Immich server, which is often a machine on your own network."
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "Imora shows where you are on the photo map. Your location never leaves the device."
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Imora backs up your photo library to your Immich server and removes device copies only when you ask it to."
+  ImoraShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ImoraShare
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vexcited.imora.share
+        INFOPLIST_FILE: ImoraShare/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ImoraShare/ImoraShare.entitlements
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+        SKIP_INSTALL: YES
+schemes:
+  Imora:
+    build:
+      targets:
+        Imora: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
