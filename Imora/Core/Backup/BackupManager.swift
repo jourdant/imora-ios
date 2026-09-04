@@ -86,6 +86,7 @@ nonisolated enum DeviceID {
 @Observable
 final class BackupManager {
     static let autoBackupKey = "imora.backupEnabled"
+    static let cellularBackupKey = "imora.backupOnCellular"
     private static let uploadWorkers = 3
     private nonisolated static let verificationWorkers = 8
     private nonisolated static let checkBatchSize = 100
@@ -136,11 +137,42 @@ final class BackupManager {
         }
     }
 
+    /// spending the data plan on automatic backups is opt in. a backup the
+    /// user starts themselves ignores this and asks them instead.
+    var backUpOnCellular: Bool {
+        didSet {
+            UserDefaults.standard.set(backUpOnCellular, forKey: Self.cellularBackupKey)
+            if backUpOnCellular { startIfIdle() }
+        }
+    }
+
+    /// the only way out is metered. a personal hotspot counts, since it is
+    /// someone else's data plan.
+    private(set) var isOnCellular = false
+
     var isRunning: Bool {
         switch phase {
         case .scanning, .hashing, .checking, .uploading: true
         default: false
         }
+    }
+
+    /// auto backup is on and holding off only because of the connection.
+    /// the screen says so, since the run itself just goes quiet.
+    var isHeldForCellular: Bool {
+        autoBackup && !networkAllowsUploads
+    }
+
+    /// whether bytes may leave right now: the user asked for this run, or
+    /// they opted in to cellular, or the connection is not theirs to pay for.
+    private var networkAllowsUploads: Bool {
+        cellularOverride || backUpOnCellular || !isOnCellular
+    }
+
+    /// the gate the pipeline reads: somebody asked for uploads, and the
+    /// connection is one they are willing to spend.
+    private var uploadsPermitted: Bool {
+        runAllowsUploads && networkAllowsUploads
     }
 
     private let client: ImmichClient
@@ -151,11 +183,15 @@ final class BackupManager {
     /// passive reconcile - scan, hash and bulk-check only - which rebuilds
     /// the index quietly and ends back at idle.
     private var runAllowsUploads = true
+    /// the user started this run themselves, so it may spend the data plan
+    /// whatever the cellular preference says. cleared when the run ends.
+    private var cellularOverride = false
     private var rerunRequested = false
     /// the run takes no new work and ends once the transfers already handed
     /// to the system are back.
     private var windingDown = false
     private var changeObserver: LibraryChangeObserver?
+    private var networkWatcher: NetworkPathWatcher?
 
     /// host|userId, stamped onto every background upload so a completion can
     /// never be applied to a different account's index.
@@ -170,11 +206,15 @@ final class BackupManager {
     init(client: ImmichClient) {
         self.client = client
         self.autoBackup = UserDefaults.standard.bool(forKey: Self.autoBackupKey)
+        self.backUpOnCellular = UserDefaults.standard.bool(forKey: Self.cellularBackupKey)
         self.index = BackupIndex()
         // stale exports from a killed run are useless without their request.
         let scratch = Self.scratchDirectory
         Task.detached { try? FileManager.default.removeItem(at: scratch) }
         updateChangeObserver()
+        networkWatcher = NetworkPathWatcher { [weak self] metered in
+            self?.networkChanged(metered)
+        }
     }
 
     /// called by sessionstore on logout. the manager must not outlive its client.
@@ -193,18 +233,34 @@ final class BackupManager {
             PHPhotoLibrary.shared().unregisterChangeObserver(changeObserver)
             self.changeObserver = nil
         }
+        networkWatcher?.stop()
+        networkWatcher = nil
     }
 
     // MARK: - triggers
 
+    /// the user asked for this one, so it spends whatever connection is
+    /// there. the screen warns them first when that is the data plan.
     func start() {
+        cellularOverride = true
+        beginRun(uploads: true)
+    }
+
+    /// the app asked for this one, so uploads wait for a connection the user
+    /// is not paying by the megabyte for. without one the run degrades to a
+    /// passive reconcile, which keeps the merged timeline honest for free.
+    private func startAutomatically() {
+        beginRun(uploads: autoBackup && networkAllowsUploads)
+    }
+
+    private func beginRun(uploads: Bool) {
         // a run is already going: raise its upload gate instead of dropping
         // the ask. a passive reconcile reads the flag again before uploading.
         if runTask != nil {
-            runAllowsUploads = true
+            if uploads { runAllowsUploads = true }
             return
         }
-        runAllowsUploads = true
+        runAllowsUploads = uploads
         runTask = Task { await run() }
     }
 
@@ -250,8 +306,7 @@ final class BackupManager {
     /// reinstall or an upload from another device - without sending anything.
     func startIfIdle() {
         guard runTask == nil, PhotoLibraryService.hasFullAccess else { return }
-        runAllowsUploads = autoBackup
-        runTask = Task { await run() }
+        startAutomatically()
     }
 
     private func enableAndStart() async {
@@ -261,7 +316,22 @@ final class BackupManager {
             return
         }
         updateChangeObserver()
-        start()
+        // turning the switch on is a vote for automatic backup, not for
+        // spending the data plan, so the cellular rule still applies.
+        startAutomatically()
+    }
+
+    /// the connection changed under us. the upload loop reads the rule live,
+    /// so turning metered stops an automatic run from queueing anything more
+    /// on its own; only the way back needs a nudge.
+    private func networkChanged(_ metered: Bool) {
+        isOnCellular = metered
+        guard networkAllowsUploads, PhotoLibraryService.hasFullAccess else { return }
+        // the queueing loop has already walked past whatever it skipped, so
+        // a run that far along needs a fresh one to pick those up. anything
+        // earlier just has its gate raised.
+        if case .uploading = phase { rerunRequested = true }
+        startAutomatically()
     }
 
     /// the observer keeps the merged timeline fresh, so it registers with
@@ -423,7 +493,7 @@ final class BackupManager {
     // MARK: - pipeline
 
     private func run() async {
-        var uploadsAllowed = runAllowsUploads
+        var uploadsAllowed = uploadsPermitted
         var chainFullRun = false
         var reportsOutcome = true
         summary = BackupSummary()
@@ -457,8 +527,9 @@ final class BackupManager {
             let pending = try await checkPhase(scanned)
             localChanged()
             // read again so a backup asked for during scan, hash or check
-            // upgrades this run instead of waiting for the next one.
-            uploadsAllowed = runAllowsUploads
+            // upgrades this run instead of waiting for the next one, and so
+            // a connection that turned metered meanwhile holds it back.
+            uploadsAllowed = uploadsPermitted
             if uploadsAllowed {
                 try await uploadPhase(pending)
             }
@@ -470,7 +541,7 @@ final class BackupManager {
                 // a passive reconcile ends where it began: no summary, no
                 // notification, just fresh pairings for the merged timeline.
                 phase = .idle
-                chainFullRun = runAllowsUploads
+                chainFullRun = uploadsPermitted
             }
         } catch {
             await index.flush()
@@ -497,9 +568,15 @@ final class BackupManager {
         windingDown = false
         runTask = nil
         if chainFullRun {
-            // the upload ask arrived after the gate: run again, in full.
-            start()
-        } else if rerunRequested {
+            // the upload ask arrived after the gate: run again, in full,
+            // carrying whatever permission that ask brought with it.
+            beginRun(uploads: true)
+            return
+        }
+        // the next run is the app's idea rather than the user's, so it has
+        // to earn the connection on its own again.
+        cellularOverride = false
+        if rerunRequested {
             rerunRequested = false
             startIfIdle()
         }
@@ -666,8 +743,12 @@ final class BackupManager {
             var done = 0
             @MainActor func addNext() {
                 // once cancelled, queueing the rest would only race the counter
-                // to the end as each new transfer dies on arrival.
-                guard next < queue.count, quotaMessage == nil, !Task.isCancelled, !windingDown else { return }
+                // to the end as each new transfer dies on arrival. the network
+                // rule is read here too, so walking out of wifi mid-run stops
+                // the queue rather than emptying the data plan behind the user.
+                guard next < queue.count, quotaMessage == nil, !Task.isCancelled,
+                      !windingDown, networkAllowsUploads
+                else { return }
                 let asset = queue[next]
                 next += 1
                 uploadStates[asset.localIdentifier] = .uploading(0)

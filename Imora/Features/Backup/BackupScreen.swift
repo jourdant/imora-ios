@@ -5,6 +5,7 @@ struct BackupScreen: View {
 
     @State private var cleanup: CleanupState = .idle
     @State private var confirmCleanup = false
+    @State private var confirmCellularBackup = false
     @State private var reportsNextBackupFailure = false
 
     nonisolated private enum CleanupState: Equatable {
@@ -62,8 +63,16 @@ struct BackupScreen: View {
                 Label("Back Up Automatically", systemImage: "arrow.triangle.2.circlepath.icloud")
             }
             .accessibilityIdentifier("backup-auto-toggle")
+
+            Toggle(isOn: Binding(
+                get: { backup.backUpOnCellular },
+                set: { backup.backUpOnCellular = $0 }
+            )) {
+                Label("Use Cellular Data", systemImage: "antenna.radiowaves.left.and.right")
+            }
+            .accessibilityIdentifier("backup-cellular-toggle")
         } footer: {
-            Text("Photos and videos upload to your server while the app is open, and new uploads appear in the timeline automatically. A backup you start yourself keeps running for a while after you leave, with progress on the Lock Screen.")
+            Text("Photos and videos upload to your server while the app is open, and new uploads appear in the timeline automatically. A backup you start yourself keeps running for a while after you leave, with progress on the Lock Screen.\n\nWithout cellular data, automatic backups wait for Wi-Fi. A backup you start yourself always runs.")
         }
     }
 
@@ -114,12 +123,32 @@ struct BackupScreen: View {
                 .accessibilityIdentifier("backup-cancel")
             } else {
                 Button {
-                    startBackup(backup)
+                    if backup.isOnCellular {
+                        confirmCellularBackup = true
+                    } else {
+                        startBackup(backup)
+                    }
                 } label: {
                     Label("Back Up Now", systemImage: "icloud.and.arrow.up")
                 }
                 .disabled(cleanup == .verifying || cleanup == .deleting)
                 .accessibilityIdentifier("backup-start")
+                // ios 26 morphs the dialog out of its source control, so it
+                // sits on the row instead of the section, where it would
+                // float detached.
+                .confirmationDialog(
+                    "Back up over cellular data?",
+                    isPresented: $confirmCellularBackup,
+                    titleVisibility: .visible
+                ) {
+                    Button("Back Up Now") {
+                        startBackup(backup)
+                    }
+                    .accessibilityIdentifier("backup-cellular-confirm")
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("You’re not on Wi-Fi. Backing up now can use a large amount of your data plan.")
+                }
             }
         }
     }
@@ -145,7 +174,12 @@ struct BackupScreen: View {
     }
 
     private func statusText(_ backup: BackupManager) -> String {
-        switch backup.phase {
+        // the run itself just goes quiet on a metered connection, so the
+        // reason has to be said out loud or nothing explains the silence.
+        if backup.isHeldForCellular, !backup.isRunning {
+            return "Waiting for Wi-Fi. Automatic backup does not use cellular data."
+        }
+        return switch backup.phase {
         case .idle: "Waiting to back up."
         case .scanning: "Scanning library..."
         case .hashing(let done, let total): "Preparing \(done) of \(total)"
