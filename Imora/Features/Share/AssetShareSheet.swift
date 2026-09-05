@@ -636,9 +636,13 @@ struct AssetSharePresenter: UIViewControllerRepresentable {
 /// vends one already-exported file to the activity sheet. the item is the plain
 /// on-disk url, so the system introspects it for the header thumbnail and
 /// summary and third-party extensions receive a real file, while the concrete
-/// type identifier makes the sheet read a video as a video - not a generic
-/// document - and lets recipients bucket the media for grouping.
-private final class AssetShareItemSource: NSObject, UIActivityItemSource {
+/// type identifier makes the sheet read a video as a video, not a generic
+/// document, and lets recipients bucket the media for grouping.
+///
+/// the sheet resolves items on a background queue while the main thread blocks
+/// waiting for them, so this source has to live off the main actor: a
+/// main-actor witness would trap in its objc thunk under swift 6.
+private nonisolated final class AssetShareItemSource: NSObject, UIActivityItemSource, Sendable {
     private let fileURL: URL
     private let contentType: UTType
 
