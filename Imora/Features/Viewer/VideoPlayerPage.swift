@@ -53,8 +53,11 @@ final class VideoPlayback {
     private(set) var duration: Double = 0
     private(set) var currentTime: Double = 0
 
-    /// user toggle, kept across pages for the viewer's lifetime.
-    var isMuted = false {
+    /// user toggle, kept across pages for the viewer's lifetime. clips open
+    /// silent and the speaker button is what asks for sound, so tapping a
+    /// thumbnail never talks back and the audio session is claimed only once
+    /// someone actually wants to hear something.
+    var isMuted = true {
         didSet {
             guard oldValue != isMuted else { return }
             applyMute()
