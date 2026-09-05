@@ -3188,6 +3188,9 @@ private struct TimelineScrubber: View {
     /// where the finger sat inside the thumb when it was grabbed, so the thumb
     /// never jumps under it.
     @State private var grabOffset: CGFloat = 0
+    /// month the thumb last landed in, nil at rest. the haptics below hang off
+    /// it: nil to a month is the grab, month to month is a boundary crossed.
+    @State private var scrubbedMonthID: String?
 
     private static let space = "timeline-scrubber-track"
     /// system metrics: a hairline capsule 4.5pt in from the trailing edge,
@@ -3218,9 +3221,6 @@ private struct TimelineScrubber: View {
                             .offset(y: scrub.thumbCenterY - 17)
                             .transition(.opacity)
                             .accessibilityIdentifier("timeline-scrubber-label")
-                            .onChange(of: month) {
-                                UISelectionFeedbackGenerator().selectionChanged()
-                            }
                     }
                 }
 
@@ -3249,6 +3249,13 @@ private struct TimelineScrubber: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .coordinateSpace(.named(Self.space))
         .accessibilityHidden(true)
+        // a rigid tap rather than .selection: the thumb rides the very edge of
+        // the glass under a finger that is already moving, and the softest tick
+        // ios has goes unfelt there. the grab is lighter so the two read apart.
+        .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.8), trigger: scrubbedMonthID) {
+            old, new in old != nil && new != nil
+        }
+        .sensoryFeedback(.impact(weight: .light), trigger: scrub.isScrubbing) { _, new in new }
     }
 
     private var drag: some Gesture {
@@ -3256,8 +3263,8 @@ private struct TimelineScrubber: View {
             .onChanged { value in
                 if !scrub.isScrubbing {
                     grabOffset = value.startLocation.y - scrub.thumbCenterY
+                    scrubbedMonthID = scrub.month(atFraction: scrub.fraction)?.id
                     onScrubbingChanged(true)
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 }
                 let travel = max(1, scrub.trackHeight - scrub.thumbHeight)
                 let centre = value.location.y - grabOffset
@@ -3267,9 +3274,17 @@ private struct TimelineScrubber: View {
                 let fraction = (min(1, max(0, raw)) * 1_000).rounded() / 1_000
                 guard fraction != scrub.scrubFraction else { return }
                 scrub.scrubFraction = fraction
+                // read off the same mapping the rail and the pill use, so the
+                // tick lands on the frame the pill changes word.
+                if let month = scrub.month(atFraction: fraction)?.id, month != scrubbedMonthID {
+                    scrubbedMonthID = month
+                }
                 onScrub(fraction)
             }
-            .onEnded { _ in onScrubbingChanged(false) }
+            .onEnded { _ in
+                scrubbedMonthID = nil
+                onScrubbingChanged(false)
+            }
     }
 }
 
