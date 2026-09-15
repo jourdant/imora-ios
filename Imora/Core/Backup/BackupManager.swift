@@ -261,6 +261,7 @@ final class BackupManager {
     private var isStopping = false
     private var isShutDown = false
     private var recoverAfterExpiration = false
+    private var runLifetime = BackgroundUploader.RunLifetime()
 
     /// host|userId, stamped onto every background upload so a completion can
     /// never be applied to a different account's index.
@@ -347,6 +348,7 @@ final class BackupManager {
         if runTask == nil {
             isStopping = false
             recoverAfterExpiration = false
+            runLifetime = BackgroundUploader.RunLifetime()
         }
         if uploads, userId != nil, manualBackupRequested || hasUnfinishedBackup {
             guard saveUnfinishedBackup() else { return }
@@ -387,16 +389,19 @@ final class BackupManager {
         stopWork()
     }
 
-    private func stopWork() {
+    private func stopWork(cancelTransfers: Bool = true) {
         // stopping also withdraws any upload ask that raced this cancel.
         runAllowsUploads = false
         isStopping = true
         networkInterruptedRun = false
         rerunRequested = false
         recentRescanRequested = false
+        // Mark the run before cancelling its workers: their cancellation
+        // handlers must detach from system-owned uploads instead of stopping them.
+        if !cancelTransfers { runLifetime.expire() }
         recentTask?.cancel()
         runTask?.cancel()
-        BackgroundUploader.shared.cancelAll()
+        if cancelTransfers { BackgroundUploader.shared.cancelAll() }
         let index = index
         Task { await index.flush() }
     }
@@ -423,7 +428,7 @@ final class BackupManager {
     func pauseForBackgroundExpiration() {
         let pending = hasUnfinishedBackup
         recoverAfterExpiration = true
-        stopWork()
+        stopWork(cancelTransfers: false)
         // Retain a retry without letting a network callback restart this run.
         BackupProcessing.shared.schedule(needed: !isShutDown && (autoBackup || pending))
     }
@@ -630,7 +635,7 @@ final class BackupManager {
             let outcome = await Self.uploadOne(
                 asset: current, client: client, index: index,
                 deviceId: DeviceID.current, scratch: Self.scratchDirectory,
-                account: accountKey
+                account: accountKey, lifetime: runLifetime
             ) { [weak self] id, fraction in
                 Task { @MainActor [weak self] in self?.noteUploadProgress(id, fraction) }
             }
@@ -1199,10 +1204,12 @@ final class BackupManager {
                 let asset = queue[next]
                 next += 1
                 uploadStates[asset.localIdentifier] = .uploading(0)
+                let lifetime = runLifetime
                 group.addTask {
                     let outcome = await Self.uploadOne(
                         asset: asset, client: client, index: index,
                         deviceId: deviceId, scratch: scratch, account: account,
+                        lifetime: lifetime,
                         onProgress: progress
                     )
                     return (asset, outcome)
@@ -1278,6 +1285,7 @@ final class BackupManager {
         deviceId: String,
         scratch: URL,
         account: String,
+        lifetime: BackgroundUploader.RunLifetime? = nil,
         onProgress: @escaping @Sendable (String, Double) -> Void
     ) async -> UploadOutcome {
         // everything up to the hand-off, the export and the request body, has
@@ -1341,7 +1349,7 @@ final class BackupManager {
                     durationMs: 0,
                     hidden: true,
                     isMotion: true
-                ), account: account, source: entry, lease: lease) { fraction in
+                ), account: account, source: entry, lease: lease, lifetime: lifetime) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 // recorded immediately so a failed still upload resumes here.
@@ -1367,7 +1375,7 @@ final class BackupManager {
                     isFavorite: current.isFavorite,
                     durationMs: current.isVideo ? current.durationMs : 0,
                     livePhotoVideoId: motionRemoteId
-                ), account: account, source: entry, lease: lease) { fraction in
+                ), account: account, source: entry, lease: lease, lifetime: lifetime) { fraction in
                     onProgress(current.localIdentifier, fraction)
                 }
                 _ = await index.applyReceipt(.init(ticket: .init(account: account, localId: current.localIdentifier, isMotion: false, bodyPath: "", source: entry), remoteId: result.id))

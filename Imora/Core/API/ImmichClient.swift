@@ -982,6 +982,7 @@ nonisolated final class ImmichClient: Sendable {
         account: String,
         source: BackupEntry,
         lease: ProcessLease? = nil,
+        lifetime: BackgroundUploader.RunLifetime? = nil,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> AssetUploadResult {
         var fields: [(name: String, value: String)] = [
@@ -1032,6 +1033,7 @@ nonisolated final class ImmichClient: Sendable {
             fromFile: bodyURL,
             ticket: ticket,
             lease: lease,
+            lifetime: lifetime,
             onProgress: onProgress
         )
         do {

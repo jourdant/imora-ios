@@ -29,6 +29,18 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         let remoteId: String
     }
 
+    /// One library run owns this policy. Expiring its processing budget stops
+    /// new transfers, but cancellation only detaches callers from existing ones.
+    /// Viewer uploads and later runs use independent cancellation policies.
+    final class RunLifetime: @unchecked Sendable {
+        private let lock = NSLock()
+        private var expired = false
+
+        var hasExpired: Bool { lock.withLock { expired } }
+
+        func expire() { lock.withLock { expired = true } }
+    }
+
     /// uikit hands the relaunch completion over as a plain closure. it only
     /// ever runs on the main thread, which is the guarantee this box stands on.
     struct LaunchCompletion: @unchecked Sendable {
@@ -135,6 +147,7 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         fromFile bodyURL: URL,
         ticket: Ticket,
         lease: ProcessLease? = nil,
+        lifetime: RunLifetime? = nil,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> Data {
         try Task.checkCancellation()
@@ -147,21 +160,28 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
             try await withCheckedThrowingContinuation { continuation in
                 // registered before the task runs, or a fast failure would find
                 // nothing to resume and be replayed as an orphan instead.
-                lock.withLock {
+                let started = lock.withLock {
+                    guard !Task.isCancelled, lifetime?.hasExpired != true else { return false }
                     continuations[id] = continuation
                     progressHandlers[id] = onProgress
+                    task.resume()
+                    return true
                 }
-                if Task.isCancelled { task.cancel() } else { task.resume() }
+                if !started {
+                    task.cancel()
+                    continuation.resume(throwing: CancellationError())
+                }
                 lease?.release()
             }
         } onCancel: { [weak self] in
-            self?.cancel(taskIdentifier: id)
-        }
-    }
-
-    private func cancel(taskIdentifier: Int) {
-        session.getAllTasks { tasks in
-            tasks.first { $0.taskIdentifier == taskIdentifier }?.cancel()
+            // Release the Swift worker promptly even if iOS continues sending
+            // the file. Completion still reaches the durable receipt journal.
+            let continuation = self?.lock.withLock {
+                self?.progressHandlers[id] = nil
+                return self?.continuations.removeValue(forKey: id)
+            }
+            if lifetime?.hasExpired != true { task.cancel() }
+            continuation?.resume(throwing: CancellationError())
         }
     }
 
