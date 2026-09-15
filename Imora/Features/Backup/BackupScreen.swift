@@ -7,13 +7,14 @@ struct BackupScreen: View {
     @State private var confirmCleanup = false
     @State private var confirmCellularBackup = false
     @State private var reportsNextBackupFailure = false
+    @State private var activeBackupPresented = false
 
     nonisolated private enum CleanupState: Equatable {
         case idle
         case verifying
         case ready(CleanupReport)
         case deleting
-        case finished(deleted: Int, kept: Int)
+        case finished(deleted: MediaCounts, kept: MediaCounts)
         case failed(String)
     }
 
@@ -22,11 +23,19 @@ struct BackupScreen: View {
             if let backup = session.backup {
                 autoSection(backup)
                 statusSection(backup)
+                advancedSection(backup)
                 cleanupSection(backup)
             }
         }
+        .keepsBackupScreenAwake(while: session.backup?.isRunning == true)
+        .task { await session.backup?.refreshLibraryStatus() }
         .navigationTitle("Backup")
         .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(isPresented: $activeBackupPresented) {
+            if let backup = session.backup {
+                ActiveBackupScreen(backup: backup)
+            }
+        }
         .onChange(of: session.backup?.phase) { _, phase in
             guard reportsNextBackupFailure, let phase else { return }
             switch phase {
@@ -36,8 +45,8 @@ struct BackupScreen: View {
             case .done(let summary):
                 reportsNextBackupFailure = false
                 if summary.failed > 0 {
-                    let detail = session.backup?.lastFailure ?? "Some items were not uploaded."
-                    ErrorToastCenter.shared.show("Some photos couldn’t be backed up. \(detail)")
+                    let detail = session.backup?.lastFailure ?? "Some photos or videos were not uploaded."
+                    ErrorToastCenter.shared.show("Some photos or videos couldn’t be backed up. \(detail)")
                 }
             case .cancelled:
                 // the ask died with the run, or the next automatic one
@@ -72,7 +81,43 @@ struct BackupScreen: View {
             }
             .accessibilityIdentifier("backup-cellular-toggle")
         } footer: {
-            Text("Photos and videos upload to your server while the app is open, and new uploads appear in the timeline automatically. A backup you start yourself keeps running for a while after you leave, with progress on the Lock Screen.\n\nWithout cellular data, automatic backups wait for Wi-Fi. A backup you start yourself always runs.")
+            Text("Imora first indexes your library to identify photos and videos already on your server, then uploads what’s missing. New captures get priority during the initial backup.\n\nWhen cellular data is off, automatic indexing and uploads wait for Wi-Fi. Back Up Now lets you approve a backup over cellular. Background work continues when iOS allows; force-quitting pauses it until you reopen Imora.")
+        }
+    }
+
+    private func advancedSection(_ backup: BackupManager) -> some View {
+        Section {
+            Picker("Files Indexed at Once", selection: Binding(
+                get: { backup.hashWorkers },
+                set: { backup.hashWorkers = $0 }
+            )) {
+                ForEach(BackupManager.hashWorkerOptions, id: \.self) { workers in
+                    Text("\(workers)").tag(workers)
+                }
+            }
+            .accessibilityIdentifier("backup-hash-workers")
+
+            Picker("Backup Order", selection: Binding(
+                get: { backup.dateOrder }, set: { backup.dateOrder = $0 }
+            )) {
+                ForEach(BackupDateOrder.allCases) { order in
+                    Text(order.title).tag(order)
+                }
+            }
+            .accessibilityIdentifier("backup-date-order")
+
+            Picker("Media Priority", selection: Binding(
+                get: { backup.mediaPriority }, set: { backup.mediaPriority = $0 }
+            )) {
+                ForEach(BackupMediaPriority.allCases) { priority in
+                    Text(priority.title).tag(priority)
+                }
+            }
+            .accessibilityIdentifier("backup-media-priority")
+        } header: {
+            Text("Advanced")
+        } footer: {
+            Text("More indexing workers may be faster but use more memory, battery, and iCloud bandwidth. Ordering controls which photos and videos are indexed and queued first. All photos and videos stay included, and new captures keep priority. Changes apply to the next pass.")
         }
     }
 
@@ -108,6 +153,17 @@ struct BackupScreen: View {
                 Text(statusText(backup))
                     .font(.callout)
                     .accessibilityIdentifier("backup-status")
+                if let status = backup.libraryStatus {
+                    Text(status.countText)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("backup-library-count")
+                }
+                if case .hashing = backup.phase {
+                    Text("Indexing your files to identify what’s already on your server. Missing photos and videos upload after indexing and matching; new captures can back up while the older library is indexed.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 if let fraction = progressFraction(backup.phase) {
                     ProgressView(value: fraction)
                         .tint(.indigo)
@@ -116,12 +172,41 @@ struct BackupScreen: View {
             }
             .padding(.vertical, 2)
 
+            if case .hashing = backup.phase, backup.downloadedOriginalsFromICloud {
+                Label(
+                    "Some originals are downloading from iCloud, so indexing may take longer.",
+                    systemImage: "icloud.and.arrow.down"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("backup-icloud-download")
+            }
+
+            if let status = backup.recentBackupStatus {
+                Label(status, systemImage: "sparkles")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("backup-recent-status")
+            }
+
             if backup.isRunning {
+                Button {
+                    activeBackupPresented = true
+                } label: {
+                    Label("Active Mode", systemImage: "moon.stars")
+                }
+                .accessibilityIdentifier("backup-keep-awake")
+
+                Text("This page keeps your screen awake while Imora indexes and backs up your library. Auto-Lock resumes when backup finishes or you leave this page. Active Mode offers a darker screen for longer backups.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
                 Button("Cancel", role: .destructive) {
                     backup.cancel()
                 }
                 .accessibilityIdentifier("backup-cancel")
             } else {
+                let canStart = backup.canStartBackup && cleanup != .verifying && cleanup != .deleting
                 Button {
                     if backup.isOnCellular {
                         confirmCellularBackup = true
@@ -130,8 +215,9 @@ struct BackupScreen: View {
                     }
                 } label: {
                     Label("Back Up Now", systemImage: "icloud.and.arrow.up")
+                        .foregroundStyle(canStart ? Color.accentColor : Color.secondary)
                 }
-                .disabled(cleanup == .verifying || cleanup == .deleting)
+                .disabled(!canStart)
                 .accessibilityIdentifier("backup-start")
                 // ios 26 morphs the dialog out of its source control, so it
                 // sits on the row instead of the section, where it would
@@ -167,7 +253,7 @@ struct BackupScreen: View {
         Task {
             let accepted = await ContinuedProcessing.backup.submit(
                 title: "Backing up",
-                subtitle: "Preparing..."
+                subtitle: "Indexing your library…"
             )
             if !accepted { backup.start() }
         }
@@ -180,11 +266,17 @@ struct BackupScreen: View {
             return "Waiting for Wi-Fi. Automatic backup does not use cellular data."
         }
         return switch backup.phase {
-        case .idle: "Waiting to back up."
+        case .idle:
+            if let status = backup.libraryStatus {
+                status.isUpToDate ? BackupLibraryStatus.upToDateText
+                    : status.pending == 0 ? "Some photos or videos use an unsupported format." : "Ready to index and back up."
+            } else {
+                "Checking backup status…"
+            }
         case .scanning: "Scanning library..."
-        case .hashing(let done, let total): "Preparing \(done) of \(total)"
-        case .checking: "Checking with server..."
-        case .uploading(let done, let total): "Uploading \(done) of \(total)"
+        case .hashing: backup.continuedSubtitle
+        case .checking: "Matching indexed files with your server…"
+        case .uploading: backup.continuedSubtitle
         case .done(let summary): doneText(summary)
         case .error(let message): "Error: \(message)"
         case .cancelled: "Backup cancelled."
@@ -192,11 +284,7 @@ struct BackupScreen: View {
     }
 
     private func doneText(_ summary: BackupSummary) -> String {
-        var parts = ["\(summary.uploaded) uploaded", "\(summary.duplicates) already backed up"]
-        if summary.failed > 0 { parts.append("\(summary.failed) failed") }
-        if summary.skipped > 0 { parts.append("\(summary.skipped) skipped") }
-        if summary.unsupported > 0 { parts.append("\(summary.unsupported) unsupported") }
-        var text = "Done - " + parts.joined(separator: ", ")
+        var text = session.backup?.libraryStatus?.completionText(summary) ?? "Backup check complete."
         if summary.failed > 0, let failure = session.backup?.lastFailure {
             text += " (\(failure))"
         }
@@ -246,7 +334,7 @@ struct BackupScreen: View {
                     titleVisibility: .visible
                 ) {
                     if case .ready(let report) = cleanup {
-                        Button("Delete \(report.eligible.count) Items", role: .destructive) {
+                        Button("Delete \(report.eligibleMedia.text)", role: .destructive) {
                             performCleanup(backup, report: report)
                         }
                         .accessibilityIdentifier("backup-cleanup-confirm")
@@ -266,13 +354,13 @@ struct BackupScreen: View {
         } header: {
             Text("Device Storage")
         } footer: {
-            Text("Removes device copies of photos already backed up to your server. Photos not yet backed up stay on this device.")
+            Text("Removes device copies of photos and videos already backed up to your server. Anything not verified as backed up stays on this device.")
         }
     }
 
     private var confirmTitle: String {
         if case .ready(let report) = cleanup {
-            return "Delete \(report.eligible.count) backed-up items from this device?"
+            return "Delete \(report.eligibleMedia.text) from this device? These are already backed up."
         }
         return ""
     }
@@ -280,7 +368,7 @@ struct BackupScreen: View {
     private var cleanupSummary: String? {
         switch cleanup {
         case .finished(let deleted, let kept):
-            "Deleted \(deleted) items - \(kept) local-only items kept."
+            "Deleted \(deleted.text). Kept \(kept.text) on this device because their backups could not be verified."
         case .failed(let message):
             "Cleanup failed: \(message)"
         default:
@@ -294,7 +382,7 @@ struct BackupScreen: View {
             do {
                 let report = try await backup.cleanUpCandidates()
                 if report.eligible.isEmpty {
-                    cleanup = .finished(deleted: 0, kept: report.keptLocalOnly)
+                    cleanup = .finished(deleted: MediaCounts(), kept: report.keptMedia)
                 } else {
                     cleanup = .ready(report)
                     confirmCleanup = true
@@ -310,8 +398,8 @@ struct BackupScreen: View {
         cleanup = .deleting
         Task {
             do {
-                let deleted = try await backup.performCleanup(ids: report.eligible)
-                cleanup = .finished(deleted: deleted, kept: report.keptLocalOnly)
+                _ = try await backup.performCleanup(ids: report.eligible)
+                cleanup = .finished(deleted: report.eligibleMedia, kept: report.keptMedia)
             } catch {
                 // declining the system dialog is a normal way out, not a failure.
                 if PhotoLibraryService.isUserCancelled(error) {
