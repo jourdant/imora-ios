@@ -82,10 +82,18 @@ The timeline mirrors the server's bucket API: `GET /timeline/buckets` returns mo
 
 ## Style
 
-- Swift 5 language mode with approachable concurrency and `MainActor` default isolation. Keep new code data-race safe rather than silencing warnings.
+- Swift 6 language mode with approachable concurrency and `MainActor` default isolation. Keep new code data-race safe rather than silencing warnings.
 - SwiftUI first. Keep views small and hold state in observable stores under `Core`.
 - Match the existing file and type layout.
 - There is no test target and pull requests should not add one.
+
+### Settings wording and defaults
+
+- Prefer positive toggle labels: turning a switch on enables the named behaviour. Use “Include Screenshots” rather than “Exclude Screenshots,” and “Use Cellular Data” rather than “Disable Cellular Data.” Avoid double negatives.
+- Name protective behaviours directly. “Pause on Low Battery” is clear because on enables that protection; do not invert it just to make every switch enable more activity.
+- Choose the default separately from the wording, based on user intent, privacy, and resource use. Automatic backup requires opt-in, screenshots are included by default, cellular backup defaults to off, and low-battery pausing defaults to on at 15% or less.
+- Use brief supporting text to explain scope, exceptions, and thresholds when needed. The label itself should make the on state understandable.
+- Preserve existing saved choices when renaming or reversing a toggle. Invert the binding to the existing preference or migrate its value explicitly; a wording change must not change the user's behaviour.
 
 ## Pull requests
 
