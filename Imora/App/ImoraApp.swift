@@ -4,9 +4,14 @@ import UserNotifications
 @main
 struct ImoraApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var session = SessionStore()
+    @State private var session: SessionStore
 
     init() {
+        // State is not installed during App.init. Bind background processing
+        // to the same retained instance that the scene receives, not a fresh
+        // temporary instance produced by reading the wrapper too early.
+        let session = SessionStore()
+        _session = State(initialValue: session)
         // set before any scene exists so a backup report landing mid-launch
         // is still presented.
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
