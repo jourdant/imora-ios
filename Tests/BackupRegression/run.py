@@ -7,6 +7,7 @@ No Photos library, real server, or application data is used.
 """
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
@@ -32,3 +33,6 @@ with tempfile.TemporaryDirectory(prefix="imora-regression-build-") as scratch:
     subprocess.run(["xcrun", "swiftc", "-swift-version", "6", "-parse-as-library",
                     *map(str, sources), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True, timeout=90)
+
+for runner in ("conditions.py", "screenshots.py"):
+    subprocess.run([sys.executable, str(Path(__file__).with_name(runner))], check=True)
