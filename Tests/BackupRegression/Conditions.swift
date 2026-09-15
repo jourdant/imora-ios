@@ -1,0 +1,45 @@
+import Foundation
+
+@main struct ConditionsChecks {
+    static func main() {
+        func allowed(_ policy: BackupConditions, cellular: Bool = false, battery: Bool = true, threshold: Int = 15) -> Bool {
+            policy.allowsWork(allowCellular: cellular, pauseOnLowBattery: battery, threshold: threshold)
+        }
+        var policy = BackupConditions()
+        precondition(!allowed(policy), "Cold launch must wait for a network result")
+        policy.updateNetwork(connected: true, metered: false, wifi: true)
+        precondition(allowed(policy), "Unknown battery level must not block backup")
+        policy.updateBattery(15, threshold: 15)
+        precondition(!allowed(policy), "Threshold is inclusive")
+        precondition(allowed(policy, battery: false), "Battery setting can be disabled")
+        policy.updateNetwork(connected: true, metered: true, wifi: false)
+        precondition(!allowed(policy, cellular: true), "Allowing cellular must not bypass battery protection")
+        policy.overrideCurrentHolds(allowCellular: false, pauseOnLowBattery: true, threshold: 15)
+        precondition(allowed(policy), "Both holds can be overridden together")
+        policy.updateBattery(14, threshold: 15)
+        precondition(allowed(policy), "Battery override survives further discharge")
+        policy.updateNetwork(connected: false, metered: false, wifi: false)
+        precondition(!allowed(policy) && policy.cellularOverride, "Going offline preserves the override but prevents work")
+        policy.updateNetwork(connected: true, metered: true, wifi: false)
+        precondition(allowed(policy), "Returning to cellular retains the override")
+        policy.updateNetwork(connected: true, metered: false, wifi: true)
+        precondition(!policy.cellularOverride && policy.batteryOverride, "Wi-Fi clears only the cellular override")
+        policy.updateNetwork(connected: true, metered: true, wifi: false)
+        precondition(!allowed(policy), "Next cellular episode must pause again")
+        policy.overrideCurrentHolds(allowCellular: false, pauseOnLowBattery: true, threshold: 15)
+        policy.updateBattery(nil, threshold: 15)
+        precondition(policy.batteryOverride, "An unknown reading must not clear a battery override")
+        policy.updateBattery(16, threshold: 15)
+        precondition(!policy.batteryOverride && policy.cellularOverride, "Charge recovery clears only battery override")
+        policy.updateBattery(15, threshold: 15)
+        precondition(!allowed(policy), "Next low-battery episode must pause again")
+        precondition(allowed(policy, threshold: 10), "An adjusted threshold changes the hold")
+        policy.updateBattery(40, threshold: 15)
+        policy.updateNetwork(connected: true, metered: false, wifi: true)
+        policy.overrideCurrentHolds(allowCellular: false, pauseOnLowBattery: true, threshold: 15)
+        precondition(!policy.cellularOverride && !policy.batteryOverride, "No permission for future conditions")
+        policy.updateNetwork(connected: true, metered: true, wifi: true)
+        precondition(!allowed(policy), "A metered hotspot retains the existing data-plan protection")
+        print("PASS: backup condition transitions, independent overrides, threshold boundaries, and unknown readings")
+    }
+}

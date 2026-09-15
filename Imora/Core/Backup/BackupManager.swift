@@ -94,6 +94,11 @@ nonisolated enum DeviceID {
 final class BackupManager {
     static let autoBackupKey = "imora.backupEnabled"
     static let cellularBackupKey = "imora.backupOnCellular"
+    static let reminderDismissedKey = "imora.backupReminderDismissed"
+    static let lowBatteryKey = "imora.backupPauseOnLowBattery"
+    static let batteryThresholdKey = "imora.backupBatteryThreshold"
+    private static let cellularOverrideKey = "imora.backupCellularOverride"
+    private static let batteryOverrideKey = "imora.backupBatteryOverride"
     static let dateOrderKey = "imora.backupDateOrder"
     static let mediaPriorityKey = "imora.backupMediaPriority"
     static let hashWorkersKey = "imora.backupHashWorkers"
@@ -154,6 +159,12 @@ final class BackupManager {
     var autoBackup: Bool {
         didSet {
             UserDefaults.standard.set(autoBackup, forKey: Self.autoBackupKey)
+            if oldValue != autoBackup {
+                reminderDismissed = false
+                reminderHiddenThisSession = false
+                conditions.cellularOverride = false
+                conditions.batteryOverride = false
+            }
             scheduleRecovery()
             if autoBackup {
                 Task { await self.enableAndStart() }
@@ -165,18 +176,39 @@ final class BackupManager {
         }
     }
 
-    /// spending the data plan on automatic backups is opt in. a backup the
-    /// user starts themselves ignores this and asks them instead.
+    /// Cellular backup is opt in; a temporary override leaves this preference intact.
     var backUpOnCellular: Bool {
         didSet {
             UserDefaults.standard.set(backUpOnCellular, forKey: Self.cellularBackupKey)
-            if !automaticRecentUploadsPermitted { recentTask?.cancel() }
-            if backUpOnCellular {
-                startIfIdle()
-            } else if !networkAllowsUploads, !isStopping, case .hashing = phase {
-                networkInterruptedRun = true
-                runTask?.cancel()
-            }
+            conditions.cellularOverride = false
+            conditionsChanged()
+        }
+    }
+
+    var reminderDismissed: Bool {
+        didSet { UserDefaults.standard.set(reminderDismissed, forKey: Self.reminderDismissedKey) }
+    }
+    var reminderHiddenThisSession = false
+    var showsBackupReminder: Bool { !autoBackup && !reminderDismissed && !reminderHiddenThisSession }
+
+    var pauseOnLowBattery: Bool {
+        didSet {
+            UserDefaults.standard.set(pauseOnLowBattery, forKey: Self.lowBatteryKey)
+            conditions.batteryOverride = false
+            conditionsChanged()
+        }
+    }
+    var batteryThreshold: Int {
+        didSet {
+            UserDefaults.standard.set(batteryThreshold, forKey: Self.batteryThresholdKey)
+            conditions.updateBattery(conditions.batteryPercent, threshold: batteryThreshold)
+            conditionsChanged()
+        }
+    }
+    private var conditions = BackupConditions() {
+        didSet {
+            UserDefaults.standard.set(conditions.cellularOverride, forKey: Self.cellularOverrideKey)
+            UserDefaults.standard.set(conditions.batteryOverride, forKey: Self.batteryOverrideKey)
         }
     }
 
@@ -198,8 +230,8 @@ final class BackupManager {
 
     /// the only way out is metered. a personal hotspot counts, since it is
     /// someone else's data plan.
-    private(set) var isOnCellular = false
-    private var networkStatusKnown = false
+    var isOnCellular: Bool { conditions.metered }
+    private var networkStatusKnown: Bool { conditions.networkKnown }
 
     var isRunning: Bool {
         switch phase {
@@ -208,11 +240,48 @@ final class BackupManager {
         }
     }
 
-    /// auto backup is on and holding off only because of the connection.
-    /// the screen says so, since the run itself just goes quiet.
     var isHeldForCellular: Bool {
-        autoBackup && networkStatusKnown && !networkAllowsUploads
-            && (libraryStatus.map { $0.pending > 0 } ?? true)
+        autoBackup && conditions.heldForCellular(allowCellular: backUpOnCellular)
+    }
+
+    var isHeldForLowBattery: Bool {
+        autoBackup && batteryBlocksWork
+    }
+
+    private var batteryBlocksWork: Bool {
+        conditions.heldForBattery(pauseOnLowBattery: pauseOnLowBattery, threshold: batteryThreshold)
+    }
+
+    var syncHoldMessage: String? {
+        // A hold is actionable only with Photos access and work remaining.
+        // Unknown counts may still represent an initial backup waiting to scan.
+        guard PhotoAccess.shared.status == .authorized,
+              libraryStatus.map({ $0.pending > 0 }) ?? true else { return nil }
+        return switch (isHeldForCellular, isHeldForLowBattery) {
+        case (true, true): "Cellular backup is off and battery is at \(batteryThreshold)% or less."
+        case (true, false): "Cellular backup is off. Waiting for Wi-Fi."
+        case (false, true): "Battery is at \(batteryThreshold)% or less. Waiting for more charge."
+        default: nil
+        }
+    }
+
+    var manualBackupNeedsApproval: Bool { isOnCellular || batteryBlocksWork }
+    var manualBackupApprovalMessage: String {
+        var messages: [String] = []
+        if isOnCellular { messages.append("Backing up now can use a large amount of cellular data.") }
+        if batteryBlocksWork { messages.append("Battery is at \(batteryThreshold)% or less. Allow backup this time; low-battery protection resets after the charge rises above this threshold.") }
+        return messages.joined(separator: " ")
+    }
+
+    /// Explicitly continue all currently displayed holds without changing settings.
+    func syncThisTime() {
+        conditions.overrideCurrentHolds(allowCellular: backUpOnCellular,
+            pauseOnLowBattery: pauseOnLowBattery, threshold: batteryThreshold)
+        // A recovering/cancelled worker may still be draining.
+        isStopping = false
+        rerunRequested = runTask != nil
+        if runTask != nil { policyInterruptedRun = true }
+        conditionsChanged()
     }
 
     var canStartBackup: Bool {
@@ -220,16 +289,14 @@ final class BackupManager {
             && (libraryStatus.map { $0.pending > 0 } ?? true)
     }
 
-    /// whether bytes may leave right now: the user asked for this run, or
-    /// they opted in to cellular, or the connection is not theirs to pay for.
-    private var networkAllowsUploads: Bool {
-        cellularOverride || backUpOnCellular || !isOnCellular
+    private var conditionsAllowWork: Bool {
+        conditions.allowsWork(allowCellular: backUpOnCellular,
+            pauseOnLowBattery: pauseOnLowBattery, threshold: batteryThreshold)
     }
 
-    /// the gate the pipeline reads: somebody asked for uploads, and the
-    /// connection is one they are willing to spend.
+    /// The pipeline needs an upload request and permitted connection/battery conditions.
     private var uploadsPermitted: Bool {
-        runAllowsUploads && networkAllowsUploads
+        runAllowsUploads && conditionsAllowWork
     }
 
     private let client: ImmichClient
@@ -237,7 +304,7 @@ final class BackupManager {
     private var runTask: Task<Void, Never>?
     private var localChangedTask: Task<Void, Never>?
     /// One dedicated recent-asset worker, separate from the bounded backlog
-    /// pool. Its automatic policy never borrows a manual cellular override.
+    /// pool. It shares the same condition overrides as the backlog.
     private var recentTask: Task<Void, Never>?
     private var recentRescanRequested = false
     private var recentQuotaReached = false
@@ -249,15 +316,13 @@ final class BackupManager {
     /// passive reconcile - scan, hash and bulk-check only - which rebuilds
     /// the index quietly and ends back at idle.
     private var runAllowsUploads = true
-    /// the user started this run themselves, so it may spend the data plan
-    /// whatever the cellular preference says. cleared when the run ends.
-    private var cellularOverride = false
     private var manualBackupRequested = false
     private var rerunRequested = false
-    /// Distinguishes a network-policy stop from an explicit user cancellation.
-    private var networkInterruptedRun = false
+    /// Distinguishes a conditions-policy stop from an explicit user cancellation.
+    private var policyInterruptedRun = false
     private var changeObserver: LibraryChangeObserver?
     private var networkWatcher: NetworkPathWatcher?
+    private var batteryWatcher: BatteryLevelWatcher?
     private var isStopping = false
     private var isShutDown = false
     private var recoverAfterExpiration = false
@@ -277,6 +342,10 @@ final class BackupManager {
         self.client = client
         self.autoBackup = UserDefaults.standard.bool(forKey: Self.autoBackupKey)
         self.backUpOnCellular = UserDefaults.standard.bool(forKey: Self.cellularBackupKey)
+        self.reminderDismissed = UserDefaults.standard.bool(forKey: Self.reminderDismissedKey)
+        self.pauseOnLowBattery = UserDefaults.standard.object(forKey: Self.lowBatteryKey) as? Bool ?? true
+        let threshold = UserDefaults.standard.object(forKey: Self.batteryThresholdKey) as? Int ?? 15
+        self.batteryThreshold = min(50, max(1, threshold))
         let storedHashWorkers = UserDefaults.standard.integer(forKey: Self.hashWorkersKey)
         self.hashWorkers = Self.hashWorkerOptions.contains(storedHashWorkers)
             ? storedHashWorkers
@@ -287,9 +356,19 @@ final class BackupManager {
         // stale exports from a killed run are useless without their request.
         let scratch = Self.scratchDirectory
         Task.detached { try? FileManager.default.removeItem(at: scratch) }
+        let savedCellularOverride = UserDefaults.standard.bool(forKey: Self.cellularOverrideKey)
+        let savedBatteryOverride = UserDefaults.standard.bool(forKey: Self.batteryOverrideKey)
+        conditions.cellularOverride = savedCellularOverride
+        conditions.batteryOverride = savedBatteryOverride
         updateChangeObserver()
-        networkWatcher = NetworkPathWatcher { [weak self] metered in
-            self?.networkChanged(metered)
+        batteryWatcher = BatteryLevelWatcher { [weak self] percent in
+            guard let self, !self.isShutDown else { return }
+            let wasAllowed = self.conditionsAllowWork
+            self.conditions.updateBattery(percent, threshold: self.batteryThreshold)
+            if wasAllowed != self.conditionsAllowWork { self.conditionsChanged() }
+        }
+        networkWatcher = NetworkPathWatcher { [weak self] connected, metered, wifi in
+            self?.networkChanged(connected: connected, metered: metered, wifi: wifi)
         }
     }
 
@@ -299,7 +378,7 @@ final class BackupManager {
         BackupIntentStore.shared.set(false, account: accountKey)
         BackupProcessing.shared.schedule(needed: false)
         isStopping = true
-        networkInterruptedRun = false
+        policyInterruptedRun = false
         rerunRequested = false
         activeBacklogCheckpoint = nil
         recentRescanRequested = false
@@ -320,15 +399,19 @@ final class BackupManager {
         }
         networkWatcher?.stop()
         networkWatcher = nil
+        batteryWatcher?.stop()
+        batteryWatcher = nil
+        conditions.cellularOverride = false
+        conditions.batteryOverride = false
     }
 
     // MARK: - triggers
 
-    /// the user asked for this one, so it spends whatever connection is
-    /// there. the screen warns them first when that is the data plan.
+    /// The settings screen confirms the current cellular/low-battery holds first.
     func start() {
         manualBackupRequested = true
-        cellularOverride = true
+        conditions.overrideCurrentHolds(allowCellular: backUpOnCellular,
+            pauseOnLowBattery: pauseOnLowBattery, threshold: batteryThreshold)
         beginRun(uploads: true)
     }
 
@@ -337,10 +420,10 @@ final class BackupManager {
     private func startAutomatically() {
         // Do not start an iCloud-backed hash pass before the path monitor has
         // identified the connection, or while the user's data plan is gated.
-        guard networkStatusKnown, networkAllowsUploads else { return }
-        if runTask == nil { networkInterruptedRun = false }
+        guard networkStatusKnown, conditionsAllowWork else { return }
+        if runTask == nil { policyInterruptedRun = false }
         else { recentAttempted = [:] }
-        beginRun(uploads: (autoBackup || hasUnfinishedBackup) && networkAllowsUploads)
+        beginRun(uploads: (autoBackup || hasUnfinishedBackup) && conditionsAllowWork)
     }
 
     private func beginRun(uploads: Bool) {
@@ -393,7 +476,7 @@ final class BackupManager {
         // stopping also withdraws any upload ask that raced this cancel.
         runAllowsUploads = false
         isStopping = true
-        networkInterruptedRun = false
+        policyInterruptedRun = false
         rerunRequested = false
         recentRescanRequested = false
         // Mark the run before cancelling its workers: their cancellation
@@ -445,7 +528,7 @@ final class BackupManager {
             try? await Task.sleep(for: .milliseconds(100))
         }
         guard !Task.isCancelled, networkStatusKnown,
-              backUpOnCellular || !isOnCellular,
+              conditionsAllowWork,
               autoBackup || hasUnfinishedBackup else { return false }
         await primeLocalState()
         startAutomatically()
@@ -487,17 +570,22 @@ final class BackupManager {
     /// the connection changed under us. the upload loop reads the rule live,
     /// so turning metered stops an automatic run from queueing anything more
     /// on its own; only the way back needs a nudge.
-    private func networkChanged(_ metered: Bool) {
-        networkStatusKnown = true
-        isOnCellular = metered
+    private func networkChanged(connected: Bool, metered: Bool, wifi: Bool) {
+        guard !isShutDown else { return }
+        conditions.updateNetwork(connected: connected, metered: metered, wifi: wifi)
+        conditionsChanged()
+    }
+
+    private func conditionsChanged() {
+        guard !isShutDown else { return }
         if !automaticRecentUploadsPermitted { recentTask?.cancel() }
-        if !networkAllowsUploads, !isStopping, case .hashing = phase {
+        if !conditionsAllowWork, !isStopping, case .hashing = phase {
             // PhotoKit may be downloading originals, not merely reading local
-            // bytes. Stop the active preparation pass when Wi-Fi is lost.
-            networkInterruptedRun = true
+            // bytes. Stop preparation when connection or battery rules block it.
+            policyInterruptedRun = true
             runTask?.cancel()
         }
-        guard !isStopping, networkAllowsUploads, PhotoLibraryService.hasFullAccess else { return }
+        guard !isStopping, conditionsAllowWork, PhotoLibraryService.hasFullAccess else { return }
         // the queueing loop has already walked past whatever it skipped, so
         // a run that far along needs a fresh one to pick those up. anything
         // earlier just has its gate raised.
@@ -538,7 +626,7 @@ final class BackupManager {
     // MARK: - recent captures
 
     private var automaticRecentUploadsPermitted: Bool {
-        autoBackup && networkStatusKnown && (backUpOnCellular || !isOnCellular)
+        autoBackup && conditionsAllowWork
             && !isStopping && !recentQuotaReached && PhotoLibraryService.hasFullAccess
     }
 
@@ -878,9 +966,7 @@ final class BackupManager {
             try Task.checkCancellation()
             await index.prune(keeping: Set(scanned.map(\.localIdentifier)))
             libraryStatus = await index.libraryStatus(for: scanned)
-            // Assign the snapshot before starting the other worker. A manual
-            // cellular run can own newer items already in its snapshot, but
-            // future automatic captures never inherit that cellular override.
+            // Assign the snapshot before starting the recent-capture worker.
             let backlogCandidates = automaticRecentUploadsPermitted ? scanned.filter {
                 ($0.creationDate ?? .distantPast) <= checkpoint
             } : scanned
@@ -937,9 +1023,9 @@ final class BackupManager {
                 // not always as a cancellationerror.
                 phase = .cancelled
                 // A user cancellation drops any queued library-change rerun.
-                // A network-policy stop restarts only if the connection became
-                // permitted again while its in-flight PhotoKit work drained.
-                rerunRequested = !isStopping && networkInterruptedRun && networkAllowsUploads
+                // A policy stop restarts only if conditions permit work again
+                // while its in-flight PhotoKit work drains.
+                rerunRequested = !isStopping && policyInterruptedRun && conditionsAllowWork
             } else if runAllowsUploads {
                 phase = .error(error.localizedDescription)
                 // the backup screen still shows the error; the banner is
@@ -962,10 +1048,8 @@ final class BackupManager {
             beginRun(uploads: true)
             return
         }
-        // the next run is the app's idea rather than the user's, so it has
-        // to earn the connection on its own again.
-        cellularOverride = false
-        networkInterruptedRun = false
+        // Condition overrides survive run completion until Wi-Fi/charge resets them.
+        policyInterruptedRun = false
         if rerunRequested {
             rerunRequested = false
             startIfIdle()
@@ -1007,8 +1091,8 @@ final class BackupManager {
             }
         }
         try Task.checkCancellation()
-        guard networkAllowsUploads else {
-            if !isStopping { networkInterruptedRun = true }
+        guard conditionsAllowWork else {
+            if !isStopping { policyInterruptedRun = true }
             throw CancellationError()
         }
         downloadedOriginalsFromICloud = false
@@ -1028,7 +1112,7 @@ final class BackupManager {
 
             @MainActor func addNext() {
                 guard next < toHash.count, !cancelled, !Task.isCancelled,
-                      networkAllowsUploads else { return }
+                      conditionsAllowWork else { return }
                 let asset = toHash[next]
                 next += 1
                 group.addTask {
@@ -1049,7 +1133,7 @@ final class BackupManager {
 
             for _ in 0..<workerLimit { addNext() }
             while let outcome = await group.next() {
-                if Task.isCancelled || !networkAllowsUploads {
+                if Task.isCancelled || !conditionsAllowWork {
                     cancelled = true
                     group.cancelAll()
                     continue
@@ -1079,11 +1163,11 @@ final class BackupManager {
                 addNext()
             }
         }
-        if !networkAllowsUploads, !isStopping { networkInterruptedRun = true }
+        if !conditionsAllowWork, !isStopping { policyInterruptedRun = true }
         if cancelled { throw CancellationError() }
         try Task.checkCancellation()
-        guard networkAllowsUploads else {
-            if !isStopping { networkInterruptedRun = true }
+        guard conditionsAllowWork else {
+            if !isStopping { policyInterruptedRun = true }
             throw CancellationError()
         }
     }
@@ -1202,7 +1286,7 @@ final class BackupManager {
                 // rule is read here too, so walking out of wifi mid-run stops
                 // the queue rather than emptying the data plan behind the user.
                 guard next < queue.count, quotaMessage == nil, !Task.isCancelled,
-                      networkAllowsUploads
+                      conditionsAllowWork
                 else { return }
                 let asset = queue[next]
                 next += 1

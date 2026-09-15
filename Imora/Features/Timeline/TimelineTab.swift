@@ -4,6 +4,7 @@ struct TimelineTab: View {
     @Environment(SessionStore.self) private var session
     @Bindable private var router = TimelineNavigationRouter.shared
     @State private var showSettings = false
+    @State private var showBackupSettings = false
 
     var body: some View {
         NavigationStack {
@@ -38,11 +39,17 @@ struct TimelineTab: View {
                 },
                 header: {
                     VStack(spacing: 0) {
-                        LocalPhotosBanner()
+                        BackupStatusBanner { showBackupSettings = true }
+                        if session.backup?.showsBackupReminder != true && session.backup?.syncHoldMessage == nil {
+                            LocalPhotosBanner()
+                        }
                         MemoryLane()
                     }
                 }
             )
+            .navigationDestination(isPresented: $showBackupSettings) {
+                BackupScreen()
+            }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }

@@ -5,7 +5,7 @@ struct BackupScreen: View {
 
     @State private var cleanup: CleanupState = .idle
     @State private var confirmCleanup = false
-    @State private var confirmCellularBackup = false
+    @State private var confirmBackupConditions = false
     @State private var reportsNextBackupFailure = false
     @State private var activeBackupPresented = false
 
@@ -22,6 +22,7 @@ struct BackupScreen: View {
         List {
             if let backup = session.backup {
                 autoSection(backup)
+                batterySection(backup)
                 statusSection(backup)
                 advancedSection(backup)
                 cleanupSection(backup)
@@ -82,6 +83,31 @@ struct BackupScreen: View {
             .accessibilityIdentifier("backup-cellular-toggle")
         } footer: {
             Text("Imora first indexes your library to identify photos and videos already on your server, then uploads what’s missing. New captures get priority during the initial backup.\n\nWhen cellular data is off, automatic indexing and uploads wait for Wi-Fi. Back Up Now lets you approve a backup over cellular. Background work continues when iOS allows; force-quitting pauses it until you reopen Imora.")
+        }
+    }
+
+    private func batterySection(_ backup: BackupManager) -> some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { backup.pauseOnLowBattery },
+                set: { backup.pauseOnLowBattery = $0 }
+            )) {
+                Label("Pause on Low Battery", systemImage: "battery.25percent")
+            }
+            .accessibilityIdentifier("backup-low-battery-toggle")
+            if backup.pauseOnLowBattery {
+                Stepper(value: Binding(
+                    get: { backup.batteryThreshold },
+                    set: { backup.batteryThreshold = $0 }
+                ), in: 1...50) {
+                    Text("Pause at \(backup.batteryThreshold)% or Less")
+                }
+                .accessibilityIdentifier("backup-battery-threshold")
+            }
+        } header: {
+            Text("Battery")
+        } footer: {
+            Text("Indexing and uploads pause at this battery level, including while charging. Sync This Time allows backup until the battery rises above the threshold. The cellular override ends when you connect to Wi-Fi. Transfers already handed to iOS may finish while backup is paused.")
         }
     }
 
@@ -208,8 +234,8 @@ struct BackupScreen: View {
             } else {
                 let canStart = backup.canStartBackup && cleanup != .verifying && cleanup != .deleting
                 Button {
-                    if backup.isOnCellular {
-                        confirmCellularBackup = true
+                    if backup.manualBackupNeedsApproval {
+                        confirmBackupConditions = true
                     } else {
                         startBackup(backup)
                     }
@@ -223,8 +249,8 @@ struct BackupScreen: View {
                 // sits on the row instead of the section, where it would
                 // float detached.
                 .confirmationDialog(
-                    "Back up over cellular data?",
-                    isPresented: $confirmCellularBackup,
+                    "Back up now?",
+                    isPresented: $confirmBackupConditions,
                     titleVisibility: .visible
                 ) {
                     Button("Back Up Now") {
@@ -233,7 +259,7 @@ struct BackupScreen: View {
                     .accessibilityIdentifier("backup-cellular-confirm")
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("You’re not on Wi-Fi. Backing up now can use a large amount of your data plan.")
+                    Text(backup.manualBackupApprovalMessage)
                 }
             }
         }
@@ -262,8 +288,8 @@ struct BackupScreen: View {
     private func statusText(_ backup: BackupManager) -> String {
         // the run itself just goes quiet on a metered connection, so the
         // reason has to be said out loud or nothing explains the silence.
-        if backup.isHeldForCellular, !backup.isRunning {
-            return "Waiting for Wi-Fi. Automatic backup does not use cellular data."
+        if let message = backup.syncHoldMessage {
+            return "Not currently syncing. " + message
         }
         return switch backup.phase {
         case .idle:
