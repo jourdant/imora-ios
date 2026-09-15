@@ -812,6 +812,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
         return SelectionMoreMenu(
             filter: filter,
             count: selection.count,
+            mediaCounts: selectedMediaCounts,
             isDisabled: isSelectionWorking || selection.isEmpty,
             serverActionsDisabled: selectionHasLocalAssets,
             onFavorite: { await applyFavorite() },
@@ -1096,6 +1097,7 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
                 if isSelecting, !isPicking {
                     SelectionControlBar(
                         count: selection.count,
+                        mediaCounts: selectedMediaCounts,
                         filter: filter,
                         isWorking: isSelectionWorking,
                         onShare: shareSelection,
@@ -1803,6 +1805,14 @@ struct TimelineScreen<Header: View, Trailing: ToolbarContent>: View {
             selection.removeAll()
         }
         selectedSheetAssets.removeAll()
+    }
+
+    private var selectedMediaCounts: MediaCounts {
+        var counts = MediaCounts()
+        for asset in model.flatAssets where selection.contains(asset.id) {
+            if asset.isImage { counts.photos += 1 } else { counts.videos += 1 }
+        }
+        return counts
     }
 
     private var isSelectionWorking: Bool {

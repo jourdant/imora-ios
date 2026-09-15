@@ -11,6 +11,7 @@ import SwiftUI
 struct SelectionMoreMenu: View {
     let filter: TimelineFilter
     let count: Int
+    let mediaCounts: MediaCounts
     let isDisabled: Bool
     /// server actions need a remote id for every item, so a selection
     /// holding device photos turns them off while back up stays live.
@@ -40,7 +41,7 @@ struct SelectionMoreMenu: View {
 
     @State private var lockConfirmation: LockConfirmation?
 
-    private var noun: String { count == 1 ? "1 Item" : "\(count) Items" }
+    private var noun: String { mediaCounts.text }
 
     var body: some View {
         Menu {
@@ -162,6 +163,7 @@ struct SelectionMoreMenu: View {
 /// the right. trash grids swap share for restore and delete permanently.
 struct SelectionControlBar: View {
     let count: Int
+    let mediaCounts: MediaCounts
     let filter: TimelineFilter
     let isWorking: Bool
     let onShare: () -> Void
@@ -195,6 +197,7 @@ struct SelectionControlBar: View {
                     trashButton
                 }
                 selectedPill
+                    .padding(.horizontal, count == 0 ? 0 : 58)
             }
         }
         .padding(.horizontal, 20)
@@ -202,7 +205,7 @@ struct SelectionControlBar: View {
     }
 
     private var trashConfirmationTitle: String {
-        let noun = count == 1 ? "1 Item" : "\(count) Items"
+        let noun = mediaCounts.text
         return deletesPermanently
             ? "Permanently Delete \(noun)?"
             : "Move \(noun) to Trash?"
@@ -242,12 +245,11 @@ struct SelectionControlBar: View {
         .accessibilityIdentifier("selection-trash")
     }
 
-    /// "Select Items" while nothing is picked, then a tappable
-    /// "Show Selected (n)" that opens the selected-items sheet.
+    /// Show separate photo and video counts in the selected-assets control.
     private var selectedPill: some View {
         Group {
             if count == 0 {
-                Text("Select Items")
+                Text("Select Photos and Videos")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 16)
@@ -255,7 +257,10 @@ struct SelectionControlBar: View {
                     .glassEffect(.regular, in: .capsule)
             } else {
                 Button(action: onShowSelected) {
-                    Text("Show Selected (\(count))")
+                    Text(mediaCounts.text)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .minimumScaleFactor(0.85)
                         .font(.subheadline.weight(.semibold))
                         .monospacedDigit()
                         .contentTransition(.numericText())
@@ -266,6 +271,7 @@ struct SelectionControlBar: View {
                 .buttonStyle(.plain)
                 .glassEffect(.regular, in: .capsule)
                 .disabled(isWorking)
+                .accessibilityLabel("Show selected \(mediaCounts.text)")
                 .accessibilityIdentifier("selection-show-selected")
             }
         }
@@ -301,6 +307,12 @@ struct SelectedAssetsSheet: View {
     @Binding var selection: Set<String>
     @Environment(\.dismiss) private var dismiss
 
+    private var selectedMediaCounts: MediaCounts {
+        let selected = assets.filter { selection.contains($0.id) }
+        return MediaCounts(photos: selected.filter(\.isImage).count,
+                           videos: selected.filter { !$0.isImage }.count)
+    }
+
     private static let columns = [GridItem(.adaptive(minimum: 100, maximum: 160), spacing: 2)]
 
     var body: some View {
@@ -312,7 +324,7 @@ struct SelectedAssetsSheet: View {
                     }
                 }
             }
-            .navigationTitle(selection.isEmpty ? "Selected Items" : "\(selection.count) Selected")
+            .navigationTitle(selection.isEmpty ? "Selected Photos and Videos" : selectedMediaCounts.text)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
