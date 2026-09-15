@@ -95,6 +95,7 @@ final class BackupManager {
     static let autoBackupKey = "imora.backupEnabled"
     static let cellularBackupKey = "imora.backupOnCellular"
     static let reminderDismissedKey = "imora.backupReminderDismissed"
+    static let excludeScreenshotsKey = "imora.backupExcludeScreenshots"
     static let lowBatteryKey = "imora.backupPauseOnLowBattery"
     static let batteryThresholdKey = "imora.backupBatteryThreshold"
     private static let cellularOverrideKey = "imora.backupCellularOverride"
@@ -183,6 +184,29 @@ final class BackupManager {
             conditions.cellularOverride = false
             conditionsChanged()
         }
+    }
+
+    var excludeScreenshots: Bool {
+        didSet {
+            guard oldValue != excludeScreenshots else { return }
+            UserDefaults.standard.set(excludeScreenshots, forKey: Self.excludeScreenshotsKey)
+            libraryStatusGeneration += 1
+            localChanged()
+            recentAttempted = [:]
+            // Rebuild the run's snapshot and counters with the new selection.
+            // Keep the saved manual request and all existing index pairings.
+            if runTask != nil {
+                policyInterruptedRun = true
+                recentTask?.cancel()
+                runTask?.cancel()
+            } else {
+                startIfIdle()
+            }
+        }
+    }
+
+    private func includesInBackup(_ asset: DeviceAsset) -> Bool {
+        !excludeScreenshots || !asset.isScreenshot
     }
 
     var reminderDismissed: Bool {
@@ -342,6 +366,7 @@ final class BackupManager {
         self.client = client
         self.autoBackup = UserDefaults.standard.bool(forKey: Self.autoBackupKey)
         self.backUpOnCellular = UserDefaults.standard.bool(forKey: Self.cellularBackupKey)
+        self.excludeScreenshots = UserDefaults.standard.bool(forKey: Self.excludeScreenshotsKey)
         self.reminderDismissed = UserDefaults.standard.bool(forKey: Self.reminderDismissedKey)
         self.pauseOnLowBattery = UserDefaults.standard.object(forKey: Self.lowBatteryKey) as? Bool ?? true
         let threshold = UserDefaults.standard.object(forKey: Self.batteryThresholdKey) as? Int ?? 15
@@ -661,7 +686,7 @@ final class BackupManager {
             let scanned = await PhotoLibraryService.scan()
             let entries = await index.allEntries()
             let candidates = scanned.filter { asset in
-                guard let created = asset.creationDate, created > checkpoint,
+                guard includesInBackup(asset), let created = asset.creationDate, created > checkpoint,
                       !activeBacklogIDs.contains(asset.localIdentifier),
                       recentAttempted[asset.localIdentifier] != asset else { return false }
                 if let entry = entries[asset.localIdentifier],
@@ -672,6 +697,7 @@ final class BackupManager {
             for asset in candidates {
                 guard !Task.isCancelled, automaticRecentUploadsPermitted,
                       activeBacklogCheckpoint != nil else { break }
+                guard includesInBackup(asset) else { continue }
                 // The viewer may already own this asset. Its result goes to
                 // the same index; a later scan can recover a failed upload.
                 if case .uploading = uploadStates[asset.localIdentifier] { continue }
@@ -697,7 +723,7 @@ final class BackupManager {
         do {
             try Task.checkCancellation()
             let current = await PhotoLibraryService.assetInfo(localIdentifier: localId)
-            guard let current else { return }
+            guard let current, includesInBackup(current) else { return }
             try Task.checkCancellation()
             let entry = await index.entry(for: localId)
             if entry == nil || entry?.matches(modificationDate: current.modificationDate) != true {
@@ -800,7 +826,7 @@ final class BackupManager {
         }
         let assets = await PhotoLibraryService.scan()
         guard !isShutDown, !Task.isCancelled, PhotoLibraryService.hasFullAccess else { return }
-        let status = await index.libraryStatus(for: assets)
+        let status = await index.libraryStatus(for: assets, excludeScreenshots: excludeScreenshots)
         guard generation == libraryStatusGeneration, !isShutDown, PhotoLibraryService.hasFullAccess else { return }
         libraryStatus = status
     }
@@ -962,10 +988,12 @@ final class BackupManager {
             await BackgroundUploader.shared.replayReceipts()
             try Task.checkCancellation()
             let checkpoint = await index.ensureBacklogCheckpoint(at: startedAt)
-            let scanned = await PhotoLibraryService.scan()
+            let allAssets = await PhotoLibraryService.scan()
             try Task.checkCancellation()
-            await index.prune(keeping: Set(scanned.map(\.localIdentifier)))
-            libraryStatus = await index.libraryStatus(for: scanned)
+            // Exclusion changes backup selection, never the library or index ownership.
+            await index.prune(keeping: Set(allAssets.map(\.localIdentifier)))
+            libraryStatus = await index.libraryStatus(for: allAssets, excludeScreenshots: excludeScreenshots)
+            let scanned = allAssets.filter(includesInBackup)
             // Assign the snapshot before starting the recent-capture worker.
             let backlogCandidates = automaticRecentUploadsPermitted ? scanned.filter {
                 ($0.creationDate ?? .distantPast) <= checkpoint

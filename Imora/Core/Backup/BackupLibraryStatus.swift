@@ -17,7 +17,9 @@ nonisolated struct BackupLibraryStatus: Equatable, Sendable {
     private(set) var unindexedMedia = MediaCounts()
     private(set) var unsupportedMedia = MediaCounts()
     private(set) var pendingMedia = MediaCounts()
+    private(set) var excludedMedia = MediaCounts()
 
+    var excluded: Int { excludedMedia.total }
     var total: Int { totalMedia.total }
     var backedUp: Int { backedUpMedia.total }
     var unindexed: Int { unindexedMedia.total }
@@ -25,8 +27,12 @@ nonisolated struct BackupLibraryStatus: Equatable, Sendable {
     var pending: Int { pendingMedia.total }
     var isUpToDate: Bool { pending == 0 && unsupported == 0 }
 
-    init(assets: [DeviceAsset], entries: [String: BackupEntry]) {
+    init(assets: [DeviceAsset], entries: [String: BackupEntry], excludeScreenshots: Bool = false) {
         for asset in assets {
+            if excludeScreenshots && asset.isScreenshot {
+                excludedMedia.add(asset)
+                continue
+            }
             totalMedia.add(asset)
             guard let entry = entries[asset.localIdentifier],
                   entry.matches(modificationDate: asset.modificationDate),
@@ -42,7 +48,7 @@ nonisolated struct BackupLibraryStatus: Equatable, Sendable {
     }
 
     var countText: String {
-        total == 0 ? "No photos or videos in your library."
+        total == 0 ? (excluded > 0 ? "No photos or videos selected for backup." : "No photos or videos in your library.")
             : "\(backedUpMedia.text) backed up"
     }
 

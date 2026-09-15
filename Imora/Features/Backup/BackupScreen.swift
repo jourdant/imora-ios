@@ -22,6 +22,7 @@ struct BackupScreen: View {
         List {
             if let backup = session.backup {
                 autoSection(backup)
+                selectionSection(backup)
                 batterySection(backup)
                 statusSection(backup)
                 advancedSection(backup)
@@ -86,6 +87,22 @@ struct BackupScreen: View {
         }
     }
 
+    private func selectionSection(_ backup: BackupManager) -> some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { !backup.excludeScreenshots },
+                set: { backup.excludeScreenshots = !$0 }
+            )) {
+                Label("Include Screenshots", systemImage: "camera.viewfinder")
+            }
+            .accessibilityIdentifier("backup-include-screenshots-toggle")
+        } header: {
+            Text("Include in Backup")
+        } footer: {
+            Text("Include screenshots in automatic backup and Back Up Now. When off, screenshots stay in your gallery and can still be selected for manual backup. Existing server copies are kept. Transfers already in progress may finish.")
+        }
+    }
+
     private func batterySection(_ backup: BackupManager) -> some View {
         Section {
             Toggle(isOn: Binding(
@@ -143,7 +160,7 @@ struct BackupScreen: View {
         } header: {
             Text("Advanced")
         } footer: {
-            Text("More indexing workers may be faster but use more memory, battery, and iCloud bandwidth. Ordering controls which photos and videos are indexed and queued first. All photos and videos stay included, and new captures keep priority. Changes apply to the next pass.")
+            Text("More indexing workers may be faster but use more memory, battery, and iCloud bandwidth. Ordering controls which photos and videos are indexed and queued first. Your backup exclusions still apply, and new captures keep priority. Changes apply to the next pass.")
         }
     }
 
@@ -184,6 +201,12 @@ struct BackupScreen: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("backup-library-count")
+                    if status.excluded > 0 {
+                        Text("\(status.excluded) screenshot\(status.excluded == 1 ? "" : "s") excluded")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("backup-excluded-count")
+                    }
                 }
                 if case .hashing = backup.phase {
                     Text("Indexing your files to identify what’s already on your server. Missing photos and videos upload after indexing and matching; new captures can back up while the older library is indexed.")

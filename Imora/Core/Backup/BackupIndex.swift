@@ -221,8 +221,8 @@ actor BackupIndex {
         entries[localId]
     }
 
-    func libraryStatus(for assets: [DeviceAsset]) -> BackupLibraryStatus {
-        BackupLibraryStatus(assets: assets, entries: entries)
+    func libraryStatus(for assets: [DeviceAsset], excludeScreenshots: Bool = false) -> BackupLibraryStatus {
+        BackupLibraryStatus(assets: assets, entries: entries, excludeScreenshots: excludeScreenshots)
     }
 
     func allEntries() -> [String: BackupEntry] {

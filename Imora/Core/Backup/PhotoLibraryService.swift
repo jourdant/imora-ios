@@ -26,6 +26,7 @@ nonisolated struct DeviceAsset: Equatable, Sendable {
     let localIdentifier: String
     let isVideo: Bool
     let isLivePhoto: Bool
+    let isScreenshot: Bool
     let creationDate: Date?
     let modificationDate: Date?
     let isFavorite: Bool
@@ -132,6 +133,7 @@ nonisolated enum PhotoLibraryService {
             localIdentifier: asset.localIdentifier,
             isVideo: asset.mediaType == .video,
             isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
+            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
             creationDate: asset.creationDate,
             modificationDate: asset.modificationDate,
             isFavorite: asset.isFavorite,

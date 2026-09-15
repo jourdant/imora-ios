@@ -6,7 +6,7 @@ let backupLog = Logger(subsystem: "imora.cancellation-check", category: "test")
 // UI/PhotoKit types are not used by these checks. The real BackupEntry,
 // BackupIndex, UploadJournal and BackupIntentStore are compiled by run.py.
 struct DeviceAsset: Sendable { let localIdentifier: String; let modificationDate: Date? }
-struct BackupLibraryStatus { init(assets: [DeviceAsset], entries: [String: BackupEntry]) {} }
+struct BackupLibraryStatus { init(assets: [DeviceAsset], entries: [String: BackupEntry], excludeScreenshots: Bool = false) {} }
 struct AssetUploadResult: Codable { let id: String }
 enum ImmichError: Error { case http(Int, String) }
 final class ProcessLease: Sendable { func release() {} }
