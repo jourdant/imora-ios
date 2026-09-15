@@ -768,6 +768,9 @@ final class BackupManager {
         guard current.modificationDate == source.modificationDate,
               current.isLivePhoto == source.isLivePhoto else { return true }
         let committed = await index.applyReceipt(completion)
+        #if DEBUG
+        BackupExpiryDebug.shared.record("orphan-index-applied success=\(committed)", localId: completion.ticket.localId)
+        #endif
         if committed { localChanged() }
         return committed
     }

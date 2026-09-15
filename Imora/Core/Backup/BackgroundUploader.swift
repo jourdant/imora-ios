@@ -164,7 +164,11 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
                     guard !Task.isCancelled, lifetime?.hasExpired != true else { return false }
                     continuations[id] = continuation
                     progressHandlers[id] = onProgress
+                    #if DEBUG
+                    if !BackupExpiryDebug.shared.holdAtHandoff(task, ticket: ticket) { task.resume() }
+                    #else
                     task.resume()
+                    #endif
                     return true
                 }
                 if !started {
@@ -181,6 +185,9 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
                 return self?.continuations.removeValue(forKey: id)
             }
             if lifetime?.hasExpired != true { task.cancel() }
+            #if DEBUG
+            BackupExpiryDebug.shared.record("waiter-detached task=\(id) expired=\(lifetime?.hasExpired == true) had-continuation=\(continuation != nil)", localId: ticket.localId)
+            #endif
             continuation?.resume(throwing: CancellationError())
         }
     }
@@ -190,6 +197,19 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
             for task in tasks { task.cancel() }
         }
     }
+
+    #if DEBUG
+    func debugResumeFixtureTasks(_ localIds: Set<String>) async {
+        var resumed = 0
+        for task in await session.allTasks {
+            guard let ticket = Self.decode(task.taskDescription), localIds.contains(ticket.localId) else { continue }
+            BackupExpiryDebug.shared.record("resume-after-relaunch task=\(task.taskIdentifier) state=\(task.state.rawValue)", localId: ticket.localId)
+            task.resume()
+            resumed += 1
+        }
+        if resumed == 0 { BackupExpiryDebug.shared.record("INCONCLUSIVE: no retained fixture upload found after relaunch") }
+    }
+    #endif
 
     /// removes body files no live task still refers to. a killed run leaves
     /// them behind and nothing else ever will. anything recent is spared: a
@@ -230,6 +250,11 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         totalBytesExpectedToSend: Int64
     ) {
         guard totalBytesExpectedToSend > 0 else { return }
+        #if DEBUG
+        if let ticket = Self.decode(task.taskDescription) {
+            BackupExpiryDebug.shared.progress(task, ticket: ticket, sent: totalBytesSent, total: totalBytesExpectedToSend)
+        }
+        #endif
         let handler = lock.withLock { progressHandlers[task.taskIdentifier] }
         handler?(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
     }
@@ -254,8 +279,14 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
                     // The delegate queue writes this before acknowledging events
                     // to UIKit, even if the account/index is not ready yet.
                     try journal.complete(Completion(ticket: ticket, remoteId: result.id))
+                    #if DEBUG
+                    BackupExpiryDebug.shared.record("receipt-persisted task=\(id) http=\(status) orphan=\(continuation == nil)", localId: ticket.localId)
+                    #endif
                 } else {
                     try journal.recordFailure(ticket, status: status, error: error)
+                    #if DEBUG
+                    BackupExpiryDebug.shared.record("upload-failed task=\(id) http=\(status) error=\((error as NSError?)?.code ?? 0)", localId: ticket.localId)
+                    #endif
                 }
                 try? FileManager.default.removeItem(at: URL(fileURLWithPath: ticket.bodyPath))
             } catch {

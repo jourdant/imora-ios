@@ -73,6 +73,9 @@ struct RootView: View {
             }
         }
         .animation(.smooth, value: session.state)
+        #if DEBUG
+        .task { await BackupExpiryDebug.shared.runIfRequested(session: session) }
+        #endif
         .task {
             session.restoreSessionIfAvailable()
             // never prompts at launch - access is asked from the timeline
