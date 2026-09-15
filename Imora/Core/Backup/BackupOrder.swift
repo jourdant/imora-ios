@@ -11,7 +11,7 @@ nonisolated enum BackupMediaPriority: String, CaseIterable, Identifiable, Sendab
     var id: Self { self }
     var title: String {
         switch self {
-        case .together: "Photos and Videos Together"
+        case .together: "Photos & Videos"
         case .photosFirst: "Photos First"
         case .videosFirst: "Videos First"
         }

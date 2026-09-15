@@ -67,18 +67,26 @@ struct SettingsView: View {
                     .accessibilityIdentifier("settings-locked-folder")
 
                     NavigationLink {
+                        BackupScreen()
+                    } label: {
+                        LabeledContent {
+                            if session.backup?.autoBackup == false {
+                                Text("Off")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } label: {
+                            Label("Backup", systemImage: "arrow.triangle.2.circlepath.icloud")
+                        }
+                    }
+                    .accessibilityValue(session.backup?.autoBackup == false ? "Automatic backup off" : "")
+                    .accessibilityIdentifier("settings-backup")
+
+                    NavigationLink {
                         StorageScreen()
                     } label: {
                         Label("Storage", systemImage: "internaldrive")
                     }
                     .accessibilityIdentifier("settings-storage")
-
-                    NavigationLink {
-                        BackupScreen()
-                    } label: {
-                        Label("Backup", systemImage: "arrow.triangle.2.circlepath.icloud")
-                    }
-                    .accessibilityIdentifier("settings-backup")
                 }
 
                 Section("Server") {
