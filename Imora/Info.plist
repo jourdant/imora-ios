@@ -5,6 +5,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).backup</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).backup.refresh</string>
 	</array>
 	<key>IMORAAppGroup</key>
 	<string>$(IMORA_APP_GROUP)</string>

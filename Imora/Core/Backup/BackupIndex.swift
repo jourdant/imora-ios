@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// persisted backup state for one device asset. a live photo is backed up only
 /// when both its still and its paired motion video are confirmed on the server.
@@ -65,9 +66,12 @@ actor BackupIndex {
         var entries: [String: BackupEntry]
         /// optional so snapshots written before edit tracking still decode.
         var editedRemoteIds: [String]?
+        /// Optional for migration from snapshots without a backlog boundary.
+        var backlogCheckpoint: Date?
     }
 
-    private let fileURL: URL
+    private var fileURL: URL
+    private let usesAccountFiles: Bool
     private var serverHost = ""
     private var userId = ""
     private var entries: [String: BackupEntry] = [:]
@@ -76,12 +80,21 @@ actor BackupIndex {
     /// delete still has to cascade to the device - but the device bytes are no
     /// longer what the server shows, so they must not be rendered.
     private var editedRemoteIds: Set<String> = []
+    private var backlogCheckpoint: Date?
     private var loaded = false
     private var dirty = false
     private var flushTask: Task<Void, Never>?
 
-    init(fileURL: URL = BackupIndex.defaultFileURL) {
-        self.fileURL = fileURL
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? BackupIndex.defaultFileURL
+        self.usesAccountFiles = fileURL == nil
+    }
+
+    private func accountFileURL(serverHost: String, userId: String) -> URL {
+        let key = SHA256.hash(data: Data("\(serverHost)|\(userId)".utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return Self.defaultFileURL.deletingLastPathComponent()
+            .appending(path: "backup-index/\(key).json")
     }
 
     nonisolated static var defaultFileURL: URL {
@@ -91,47 +104,102 @@ actor BackupIndex {
 
     /// reads the snapshot from disk. a snapshot written for a different server or
     /// user is discarded - accounts must never share local-to-remote mappings.
-    func load(serverHost: String, userId: String) {
-        if loaded, serverHost == self.serverHost, userId == self.userId { return }
-        flush()
+    @discardableResult
+    func load(serverHost: String, userId: String) -> Bool {
+        if loaded, serverHost == self.serverHost, userId == self.userId { return true }
+        guard flush() else { return false }
+        if usesAccountFiles { fileURL = accountFileURL(serverHost: serverHost, userId: userId) }
         self.serverHost = serverHost
         self.userId = userId
         entries = [:]
         remoteToLocal = [:]
         editedRemoteIds = []
+        backlogCheckpoint = nil
+        loaded = false
+        let snapshot: Snapshot
+        do {
+            snapshot = try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: fileURL))
+        } catch CocoaError.fileReadNoSuchFile {
+            // Migrate the old shared snapshot only for its own account. Keep
+            // each account in a separate file so a late logout flush cannot
+            // overwrite the newly signed-in account's state.
+            guard usesAccountFiles else { loaded = true; return true }
+            do {
+                let legacy = try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: Self.defaultFileURL))
+                guard legacy.serverHost == serverHost, legacy.userId == userId else {
+                    loaded = true
+                    return true
+                }
+                snapshot = legacy
+                dirty = true
+            } catch CocoaError.fileReadNoSuchFile {
+                loaded = true
+                return true
+            } catch { return false }
+        } catch {
+            // Locked, unreadable or malformed is not an empty library. Retry
+            // later without overwriting the existing account's snapshot.
+            return false
+        }
         loaded = true
-        guard let data = try? Data(contentsOf: fileURL),
-              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
-              snapshot.serverHost == serverHost, snapshot.userId == userId
-        else { return }
+        guard snapshot.serverHost == serverHost, snapshot.userId == userId else { return true }
         entries = snapshot.entries
+        backlogCheckpoint = snapshot.backlogCheckpoint
         editedRemoteIds = Set(snapshot.editedRemoteIds ?? [])
         for (localId, entry) in entries {
             if let remoteId = entry.primaryRemoteId {
                 remoteToLocal[remoteId] = localId
             }
         }
+        return true
     }
 
-    func flush() {
+    @discardableResult
+    func flush() -> Bool {
         flushTask?.cancel()
         flushTask = nil
-        guard dirty else { return }
+        guard dirty else { return true }
+        guard loaded else { return false }
         let snapshot = Snapshot(
             serverHost: serverHost,
             userId: userId,
             entries: entries,
-            editedRemoteIds: editedRemoteIds.isEmpty ? nil : Array(editedRemoteIds)
+            editedRemoteIds: editedRemoteIds.isEmpty ? nil : Array(editedRemoteIds),
+            backlogCheckpoint: backlogCheckpoint
         )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return false }
         let directory = fileURL.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: fileURL, options: .atomic)
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             dirty = false
+            return true
         } catch {
-            return
+            return false
         }
+    }
+
+    /// Keep the same boundary across interrupted runs. Only a fully reconciled
+    /// snapshot may advance it; otherwise recent photos would become backlog
+    /// after every launch. Save before starting resource work.
+    func ensureBacklogCheckpoint(at date: Date) -> Date {
+        if let backlogCheckpoint { return backlogCheckpoint }
+        backlogCheckpoint = date
+        markDirty()
+        flush()
+        return date
+    }
+
+    func advanceBacklogCheckpoint(to date: Date, completed assets: [DeviceAsset]) {
+        guard assets.allSatisfy({ asset in
+            guard let entry = entries[asset.localIdentifier],
+                  entry.matches(modificationDate: asset.modificationDate) else { return false }
+            return entry.isBackedUp || entry.unsupported
+        }) else { return }
+        guard backlogCheckpoint.map({ date > $0 }) ?? true else { return }
+        backlogCheckpoint = date
+        markDirty()
+        flush()
     }
 
     private func markDirty() {
@@ -151,6 +219,10 @@ actor BackupIndex {
 
     func entry(for localId: String) -> BackupEntry? {
         entries[localId]
+    }
+
+    func libraryStatus(for assets: [DeviceAsset]) -> BackupLibraryStatus {
+        BackupLibraryStatus(assets: assets, entries: entries)
     }
 
     func allEntries() -> [String: BackupEntry] {
@@ -200,6 +272,28 @@ actor BackupIndex {
         entries[localId] = entry
         remoteToLocal[remoteId] = localId
         markDirty()
+    }
+
+    /// A receipt can restore a lost/coalesced hash entry, but may never attach
+    /// an older upload to newer bytes. Caller verifies the PhotoKit revision.
+    func applyReceipt(_ receipt: BackgroundUploader.Completion) -> Bool {
+        guard loaded, let source = receipt.ticket.source else { return false }
+        let localId = receipt.ticket.localId
+        if let current = entries[localId] {
+            guard current.modificationDate == source.modificationDate,
+                  current.isLivePhoto == source.isLivePhoto,
+                  current.primaryChecksum == source.primaryChecksum,
+                  current.motionChecksum == source.motionChecksum else { return true }
+        } else {
+            entries[localId] = source
+            if let remoteId = source.primaryRemoteId { remoteToLocal[remoteId] = localId }
+        }
+        if receipt.ticket.isMotion {
+            setMotionRemoteId(localId: localId, receipt.remoteId)
+        } else {
+            setPrimaryRemoteId(localId: localId, receipt.remoteId)
+        }
+        return flush()
     }
 
     func clearPrimaryRemoteId(localId: String) {

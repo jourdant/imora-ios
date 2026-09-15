@@ -980,6 +980,7 @@ nonisolated final class ImmichClient: Sendable {
     func uploadAsset(
         _ upload: AssetUploadRequest,
         account: String,
+        source: BackupEntry,
         lease: ProcessLease? = nil,
         onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> AssetUploadResult {
@@ -1023,7 +1024,8 @@ nonisolated final class ImmichClient: Sendable {
             account: account,
             localId: upload.deviceAssetId,
             isMotion: upload.isMotion,
-            bodyPath: bodyURL.path
+            bodyPath: bodyURL.path,
+            source: source
         )
         let data = try await BackgroundUploader.shared.upload(
             request,

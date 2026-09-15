@@ -2,7 +2,8 @@ import Foundation
 import os
 
 /// every asset upload goes through one background url session, so a transfer
-/// handed to the system finishes even after the app is suspended or killed.
+/// handed to the system can continue after suspension or system termination.
+/// A user force-quit cancels transfers and requires a subsequent app launch.
 ///
 /// while the app is alive an upload behaves like any async call. when it is
 /// not, the delegate still fires - on relaunch if need be - and the completion
@@ -18,9 +19,12 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         let localId: String
         let isMotion: Bool
         let bodyPath: String
+        var version: Int? = 1
+        var id: UUID? = UUID()
+        var source: BackupEntry? = nil
     }
 
-    struct Completion: Sendable {
+    struct Completion: Codable, Sendable {
         let ticket: Ticket
         let remoteId: String
     }
@@ -43,11 +47,10 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
     private var continuations: [Int: CheckedContinuation<Data, any Error>] = [:]
     private var buffers: [Int: Data] = [:]
     private var progressHandlers: [Int: @Sendable (Double) -> Void] = [:]
-    private var orphanHandler: (@Sendable (Completion) -> Void)?
+    private var orphanHandler: (@Sendable (Completion) async -> Bool)?
     private var backgroundCompletion: LaunchCompletion?
-    /// completions that arrived before anything was listening, e.g. during a
-    /// relaunch where the delegate beat the signed-in account.
-    private var pendingOrphans: [Completion] = []
+    private var finishedEventsAwaitingHandler = false
+    private let journal = UploadJournal()
 
     private override init() {
         super.init()
@@ -76,20 +79,51 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
 
     // MARK: - handlers
 
-    func setOrphanHandler(_ handler: (@Sendable (Completion) -> Void)?) {
-        let queued = lock.withLock { () -> [Completion] in
-            orphanHandler = handler
-            guard handler != nil else { return [] }
-            defer { pendingOrphans = [] }
-            return pendingOrphans
+    func setOrphanHandler(_ handler: (@Sendable (Completion) async -> Bool)?) {
+        lock.withLock { orphanHandler = handler }
+        Task { await replayReceipts() }
+    }
+
+    /// Deletion is an acknowledgement: the consumer has committed the index,
+    /// or verified that this receipt belongs to an obsolete asset revision.
+    @concurrent
+    func replayReceipts() async {
+        guard let handler = lock.withLock({ orphanHandler }) else { return }
+        for completion in journal.receipts() {
+            if await handler(completion) { journal.acknowledge(completion.ticket) }
         }
-        for completion in queued { handler?(completion) }
+    }
+
+    /// Adopt system-owned work before preparing another copy. This wait is
+    /// cancellable; cancelling a waiter does not cancel somebody else's task.
+    @concurrent
+    func waitForExisting(account: String, localId: String) async throws {
+        while true {
+            try Task.checkCancellation()
+            let tasks = await session.allTasks
+            let exists = tasks.contains {
+                guard let ticket = Self.decode($0.taskDescription) else { return false }
+                return ticket.account == account && ticket.localId == localId
+            }
+            if !exists { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        await replayReceipts()
+        try Task.checkCancellation()
     }
 
     /// stored by the app delegate when the system relaunches us to deliver
     /// finished transfers; calling it is what lets the app suspend again.
     func setBackgroundCompletionHandler(_ handler: LaunchCompletion) {
-        lock.withLock { backgroundCompletion = handler }
+        let alreadyFinished = lock.withLock {
+            if finishedEventsAwaitingHandler {
+                finishedEventsAwaitingHandler = false
+                return true
+            }
+            backgroundCompletion = handler
+            return false
+        }
+        if alreadyFinished { finishBackgroundEvents(handler) }
     }
 
     // MARK: - uploading
@@ -103,6 +137,9 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         lease: ProcessLease? = nil,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> Data {
+        try Task.checkCancellation()
+        // Persist the source revision before iOS can send a single byte.
+        try journal.prepare(ticket)
         let task = session.uploadTask(with: request, fromFile: bodyURL)
         task.taskDescription = Self.encode(ticket)
         let id = task.taskIdentifier
@@ -114,7 +151,7 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
                     continuations[id] = continuation
                     progressHandlers[id] = onProgress
                 }
-                task.resume()
+                if Task.isCancelled { task.cancel() } else { task.resume() }
                 lease?.release()
             }
         } onCancel: { [weak self] in
@@ -159,6 +196,10 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.withLock { buffers[dataTask.taskIdentifier, default: Data()].append(data) }
+        if let ticket = Self.decode(dataTask.taskDescription) {
+            do { try journal.appendResponse(data, ticket: ticket) }
+            catch { backupLog.error("upload response could not be saved: \(error)") }
+        }
     }
 
     func urlSession(
@@ -178,66 +219,63 @@ nonisolated final class BackgroundUploader: NSObject, URLSessionDataDelegate, @u
         let ticket = Self.decode(task.taskDescription)
         let (continuation, data) = lock.withLock { () -> (CheckedContinuation<Data, any Error>?, Data) in
             let continuation = continuations.removeValue(forKey: id)
-            let data = buffers.removeValue(forKey: id) ?? Data()
+            let buffered = buffers.removeValue(forKey: id) ?? Data()
+            let persisted = ticket.flatMap { journal.response(for: $0) }
+            let data = (persisted?.count ?? 0) >= buffered.count ? (persisted ?? buffered) : buffered
             progressHandlers[id] = nil
             return (continuation, data)
         }
-        if let ticket {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: ticket.bodyPath))
-        }
-
         let status = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+        var deliveryError = error
+        if let ticket {
+            do {
+                if error == nil, (200..<300).contains(status),
+                   let result = try? JSONDecoder().decode(AssetUploadResult.self, from: data) {
+                    // The delegate queue writes this before acknowledging events
+                    // to UIKit, even if the account/index is not ready yet.
+                    try journal.complete(Completion(ticket: ticket, remoteId: result.id))
+                } else {
+                    try journal.recordFailure(ticket, status: status, error: error)
+                }
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: ticket.bodyPath))
+            } catch {
+                // Keep the prepared ticket and body for checksum reconciliation.
+                // Never pretend a failed durable commit succeeded locally.
+                deliveryError = error
+                backupLog.error("upload receipt could not be saved: \(error)")
+            }
+        }
         if let continuation {
-            if let error {
-                continuation.resume(throwing: error)
+            if let deliveryError {
+                continuation.resume(throwing: deliveryError)
             } else if (200..<300).contains(status) {
                 continuation.resume(returning: data)
             } else {
                 continuation.resume(throwing: ImmichError.http(status, Self.message(from: data)))
             }
-            return
         }
-
-        // nobody is waiting: this finished while the app was away. a failure
-        // needs no repair - the next run re-uploads it - but a success has to
-        // reach the index or the bytes would be sent twice.
-        guard let ticket, error == nil, (200..<300).contains(status),
-              let result = try? JSONDecoder().decode(AssetUploadResult.self, from: data)
-        else { return }
-        deliverOrphan(Completion(ticket: ticket, remoteId: result.id))
+        Task { await replayReceipts() }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         let completion = lock.withLock {
             defer { backgroundCompletion = nil }
+            if backgroundCompletion == nil { finishedEventsAwaitingHandler = true }
             return backgroundCompletion
         }
-        // the system expects this on the main thread before it suspends us.
-        // what just finished is only half the job: recording it, exporting the
-        // next assets and handing those over all happen after this, and the
-        // app may be suspended the moment the system hears it is done. a short
-        // lease covers the gap until that work holds one of its own.
-        guard let completion else { return }
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated {
-                ProcessLease.take("upload follow-up", for: .seconds(10))
-                completion.run()
-            }
+        if let completion { finishBackgroundEvents(completion) }
+    }
+
+    private func finishBackgroundEvents(_ completion: LaunchCompletion) {
+        // All delegate events preceding this callback have durable receipts.
+        // Apply/flush now if possible; unavailable accounts retain the journal.
+        Task {
+            await replayReceipts()
+            await MainActor.run { completion.run() }
         }
     }
 
     // MARK: - helpers
-
-    private func deliverOrphan(_ completion: Completion) {
-        let handler = lock.withLock { () -> (@Sendable (Completion) -> Void)? in
-            guard let orphanHandler else {
-                pendingOrphans.append(completion)
-                return nil
-            }
-            return orphanHandler
-        }
-        handler?(completion)
-    }
 
     private static func encode(_ ticket: Ticket) -> String? {
         guard let data = try? JSONEncoder().encode(ticket) else { return nil }

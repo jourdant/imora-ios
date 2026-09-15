@@ -11,6 +11,9 @@ struct ImoraApp: App {
         // is still presented.
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         ContinuedProcessing.registerAll()
+        BackupProcessing.shared.register()
+        BackupProcessing.shared.session = session
+        session.backup?.scheduleRecovery()
         // builds the background sessions and attaches their delegates, so
         // uploads that finished while the app was gone - backup runs and
         // share-sheet drops alike - are delivered on this launch.
@@ -82,8 +85,6 @@ struct RootView: View {
                 // returning to the foreground picks up photos taken meanwhile
                 // and reconnects the realtime channel, which resyncs grids.
                 session.backup?.startIfIdle()
-                // a backup that lost its progress ui to a device lock gets it back.
-                ContinuedProcessing.backup.restore()
                 session.realtime?.setActive(true)
                 // the socket is down while backgrounded, so the inbox fetch is
                 // what surfaces anything raised in the meantime.
@@ -96,6 +97,7 @@ struct RootView: View {
                     Task { await session.lockedFolder?.refreshStatus() }
                 }
             case .background:
+                session.backup?.scheduleRecovery()
                 session.realtime?.setActive(false)
                 session.lockedFolder?.lock()
                 Task { await session.backup?.flushPendingIndexChanges() }

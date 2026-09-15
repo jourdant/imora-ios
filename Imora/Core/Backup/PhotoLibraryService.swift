@@ -271,22 +271,32 @@ nonisolated enum PhotoLibraryService {
     /// checksum representation. streams via requestData, downloading from
     /// icloud when needed.
     @concurrent
-    static func hash(localIdentifier: String, includeMotion: Bool) async throws -> (primary: String, motion: String?) {
+    static func hash(
+        localIdentifier: String,
+        includeMotion: Bool,
+        onICloudDownload: (@Sendable () -> Void)? = nil
+    ) async throws -> (primary: String, motion: String?) {
         guard let asset = fetchPHAsset(localIdentifier) else { throw PhotoLibraryError.assetMissing }
         guard let primary = primaryResource(for: asset) else { throw PhotoLibraryError.resourceMissing }
-        let primaryHash = try await sha1Base64(of: primary)
+        let primaryHash = try await sha1Base64(of: primary, onICloudDownload: onICloudDownload)
         var motionHash: String?
         if includeMotion {
             guard let motion = motionResource(for: asset) else { throw PhotoLibraryError.resourceMissing }
-            motionHash = try await sha1Base64(of: motion)
+            motionHash = try await sha1Base64(of: motion, onICloudDownload: onICloudDownload)
         }
         return (primaryHash, motionHash)
     }
 
-    private static func sha1Base64(of resource: PHAssetResource) async throws -> String {
+    private static func sha1Base64(
+        of resource: PHAssetResource,
+        onICloudDownload: (@Sendable () -> Void)?
+    ) async throws -> String {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
         let box = DataRequestBox()
+        options.progressHandler = { _ in
+            box.reportICloudDownload(onICloudDownload)
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let requestID = PHAssetResourceManager.default().requestData(for: resource, options: options) { data in
@@ -492,6 +502,7 @@ private nonisolated final class DataRequestBox: @unchecked Sendable {
         var requestID: PHAssetResourceDataRequestID?
         var cancelled = false
         var writeError: NSError?
+        var reportedICloudDownload = false
     }
 
     private let lock: OSAllocatedUnfairLock<State>
@@ -517,6 +528,19 @@ private nonisolated final class DataRequestBox: @unchecked Sendable {
                 state.hasher.update(data: data)
             }
         }
+    }
+
+    /// PhotoKit calls the resource progress handler only when it has to fetch
+    /// bytes from iCloud. Report once per resource rather than waking the main
+    /// actor for every download tick.
+    func reportICloudDownload(_ handler: (@Sendable () -> Void)?) {
+        guard let handler else { return }
+        let shouldReport = lock.withLock { state in
+            guard !state.reportedICloudDownload else { return false }
+            state.reportedICloudDownload = true
+            return true
+        }
+        if shouldReport { handler() }
     }
 
     func digest() -> String {
